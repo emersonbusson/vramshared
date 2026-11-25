@@ -11,11 +11,16 @@
 //!
 
 use std::io::{Read, Write};
+use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 mod socket_stream;
 
 #[cfg(any(target_os = "linux", test))]
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const LISTEN_STOP_POLL_SLICE: Duration = Duration::from_millis(250);
 
 #[cfg(any(target_os = "linux", test))]
 fn bounded_connect_timeout(timeout: Duration) -> Duration {
@@ -135,13 +140,31 @@ pub fn connect_vsock(
 /// Listen for one guest-side AF_VSOCK connection and return the accepted
 /// stream. The host connector initiates; the guest remains the protocol client.
 pub fn listen_vsock(port: u32, timeout: Duration) -> Result<Box<dyn VsockStreamTrait>, VsockError> {
+    let never_stop = AtomicBool::new(false);
+    listen_vsock_cancellable(port, Some(timeout), &never_stop, None, || {})
+}
+
+/// Listen continuously on a guest-side `AF_VSOCK` port until a host peer
+/// connects, `timeout` elapses (when `Some`), or `stop` becomes `true`.
+///
+/// Keeping one bound socket across short poll slices eliminates the closed-port
+/// blind window between retry cycles while guaranteeing prompt shutdown when
+/// `stop` is raised. If `idle_after` elapses once without a peer, `on_idle` is
+/// called once so callers can record a single state transition without log spam.
+pub fn listen_vsock_cancellable(
+    port: u32,
+    timeout: Option<Duration>,
+    stop: &AtomicBool,
+    idle_after: Option<Duration>,
+    on_idle: impl FnMut(),
+) -> Result<Box<dyn VsockStreamTrait>, VsockError> {
     #[cfg(target_os = "linux")]
     {
-        listen_vsock_linux(port, timeout)
+        listen_vsock_linux(port, timeout, stop, idle_after, on_idle)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (port, timeout);
+        let _ = (port, timeout, stop, idle_after, on_idle);
         Err(VsockError::Unsupported)
     }
 }
@@ -149,21 +172,37 @@ pub fn listen_vsock(port: u32, timeout: Duration) -> Result<Box<dyn VsockStreamT
 #[cfg(target_os = "linux")]
 fn listen_vsock_linux(
     port: u32,
-    timeout: Duration,
+    timeout: Option<Duration>,
+    stop: &AtomicBool,
+    idle_after: Option<Duration>,
+    mut on_idle: impl FnMut(),
 ) -> Result<Box<dyn VsockStreamTrait>, VsockError> {
-    use std::os::unix::io::FromRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     if port == 0 {
         return Err(VsockError::ConnectFailed(
             "vsock port must be nonzero".into(),
         ));
     }
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
+    if stop.load(Ordering::Acquire) {
+        return Err(VsockError::AcceptTimeout);
+    }
+    // SAFETY: socket takes scalar arguments and returns a fresh descriptor on success.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_VSOCK,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if raw < 0 {
         return Err(VsockError::ConnectFailed(
             std::io::Error::last_os_error().to_string(),
         ));
     }
+    // SAFETY: the successful socket call transferred sole descriptor ownership.
+    let listener = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fd = listener.as_raw_fd();
     let addr = libc::sockaddr_vm {
         svm_family: libc::AF_VSOCK as libc::sa_family_t,
         svm_reserved1: 0,
@@ -180,54 +219,97 @@ fn listen_vsock_linux(
     } != 0
     {
         let error = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
         return Err(VsockError::ConnectFailed(format!(
             "vsock bind failed: {error}"
         )));
     }
-    if unsafe { libc::listen(fd, 1) } != 0 {
+    if unsafe { libc::listen(fd, 4) } != 0 {
         let error = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
         return Err(VsockError::ConnectFailed(format!(
             "vsock listen failed: {error}"
         )));
     }
-    let mut descriptor = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout_ms = timeout
-        .as_secs()
-        .saturating_mul(1_000)
-        .saturating_add(u64::from(timeout.subsec_nanos().div_ceil(1_000_000)))
-        .min(i32::MAX as u64) as i32;
-    let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-    if ready <= 0 {
-        let error = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return if ready == 0 {
-            Err(VsockError::ConnectTimeout)
-        } else {
-            Err(VsockError::ConnectFailed(format!(
-                "vsock accept poll failed: {error}"
-            )))
+    let started = Instant::now();
+    let mut idle_notified = false;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err(VsockError::AcceptTimeout);
+        }
+        let elapsed = started.elapsed();
+        if !idle_notified && idle_after.is_some_and(|after| elapsed >= after) {
+            idle_notified = true;
+            on_idle();
+        }
+        let mut slice = match timeout {
+            Some(limit) => {
+                let remaining = limit.saturating_sub(elapsed);
+                if remaining.is_zero() {
+                    return Err(VsockError::ConnectTimeout);
+                }
+                remaining.min(LISTEN_STOP_POLL_SLICE)
+            }
+            None => LISTEN_STOP_POLL_SLICE,
         };
+        if !idle_notified && let Some(after) = idle_after {
+            let until_idle = after.saturating_sub(elapsed);
+            if !until_idle.is_zero() {
+                slice = slice.min(until_idle);
+            }
+        }
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = slice
+            .as_secs()
+            .saturating_mul(1_000)
+            .saturating_add(u64::from(slice.subsec_nanos().div_ceil(1_000_000)))
+            .clamp(1, i32::MAX as u64) as i32;
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready > 0 {
+            if stop.load(Ordering::Acquire) {
+                return Err(VsockError::AcceptTimeout);
+            }
+            if let Some(stream) = accept_vsock_linux(&listener)? {
+                return Ok(Box::new(UnixVsockStream(stream)));
+            }
+        }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(VsockError::ConnectFailed(format!(
+                "vsock accept poll failed: {error}"
+            )));
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn accept_vsock_linux(
+    listener: &std::os::fd::OwnedFd,
+) -> Result<Option<std::os::unix::net::UnixStream>, VsockError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: the borrowed listener stays open and null address arguments omit peer output.
     let client = unsafe {
         libc::accept4(
-            fd,
+            listener.as_raw_fd(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             libc::SOCK_CLOEXEC,
         )
     };
-    let accept_error = std::io::Error::last_os_error();
-    unsafe { libc::close(fd) };
     if client < 0 {
-        return Err(VsockError::ConnectFailed(format!(
-            "vsock accept failed: {accept_error}"
-        )));
+        let error = std::io::Error::last_os_error();
+        return match error.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => Ok(None),
+            _ => Err(VsockError::ConnectFailed(format!(
+                "vsock accept failed: {error}"
+            ))),
+        };
     }
     // SAFETY: `accept4` returned a fresh owned descriptor. `UnixStream` only
     // supplies stream I/O and timeout operations for the connected AF_VSOCK fd.
@@ -235,7 +317,7 @@ fn listen_vsock_linux(
     stream
         .set_nonblocking(false)
         .map_err(|error| VsockError::ConnectFailed(error.to_string()))?;
-    Ok(Box::new(UnixVsockStream(stream)))
+    Ok(Some(stream))
 }
 
 #[cfg(target_os = "linux")]

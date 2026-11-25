@@ -196,47 +196,13 @@ for file in "$cron_template"; do
   }
 done
 require_text "$host_gate_unit" 'Slice=ramshared-control.slice'
-require_text "$host_gate_unit" 'ExecStartPre=-/opt/ramshared/current/bin/ramshared ensure-origin'
-require_text "$host_gate_unit" 'ExecStartPre=-/opt/ramshared/current/bin/ramshared ensure-guardian'
-require_text "$host_gate_unit" 'ExecStart=/opt/ramshared/current/scripts/safety/ramshared-host-gate.sh'
-# verified test case / DT-19: both prepare lines are preparation for the gate that
-# verifies identity and proof freshness. Each must be declared before the gate
-# it prepares for, and each must stay best-effort (`-`) so a failed prepare
-# never skips the gate or preserves a stale lease. A bare `ExecStartPre=`
-# without the `-` would rank a preparation above verification — the exact
-# inversion this unit exists to avoid.
-gate_line=$(grep -nF 'ExecStart=' "$host_gate_unit" | head -n 1 | cut -d: -f1)
-prepare_count=0
-hardware_line=
-while IFS= read -r prepare; do
-  [[ -n $prepare ]] || continue
-  prepare_line=${prepare%%:*}
-  prepare_text=${prepare#*:}
-  case $prepare_text in
-    ExecStartPre=-*) ;;
-    ExecStartPre=*/scripts/safety/hardware-health.sh)
-      [[ -z $hardware_line ]] || {
-        printf 'host-gate declares more than one hardware classifier\n' >&2; exit 1;
-      }
-      hardware_line=$prepare_line
-      ;;
-    *)
-      printf 'only the hardware classifier may be a non-best-effort prepare: %s\n' "$prepare_text" >&2
-      exit 1
-      ;;
-  esac
-  if [[ -z $prepare_line || -z $gate_line || $prepare_line -ge $gate_line ]]; then
-    printf 'host-gate prepare line must precede the gate: %s\n' "$prepare_text" >&2
-    exit 1
-  fi
-  prepare_count=$((prepare_count + 1))
-done < <(grep -nF 'ExecStartPre=' "$host_gate_unit")
-if [[ $prepare_count -lt 3 ]]; then
-  printf 'host-gate unit must classify hardware, attach the origin, and start the guardian\n' >&2
-  exit 1
-fi
-if [[ -z $hardware_line || $hardware_line != "$(grep -nF 'ExecStartPre=' "$host_gate_unit" | head -n 1 | cut -d: -f1)" ]]; then
-  printf 'the hardware classifier must be the first ExecStartPre\n' >&2
+# DT-4/DT-14: the main process must return the classifier's refusal before
+# any best-effort preparation. The gate still runs after a failed preparation.
+start_prefix="ExecStart=/bin/sh -ec '"
+host_gate_start=$(grep -F "$start_prefix" "$host_gate_unit")
+require_text "$host_gate_unit" "${start_prefix}/opt/ramshared/current/scripts/safety/hardware-health.sh; /opt/ramshared/current/bin/ramshared ensure-origin || :; /opt/ramshared/current/bin/ramshared ensure-guardian || :; exec /opt/ramshared/current/scripts/safety/ramshared-host-gate.sh'"
+if grep -Eq '^(ExecStartPre|ExecCondition)=' "$host_gate_unit"; then
+  printf 'host-gate preparation must run in the main process after classification\n' >&2
   exit 1
 fi
 printf '%s\n' 'PASS host_gate_unit_attaches_the_sealed_origin_before_verifying_it'
@@ -305,7 +271,7 @@ done
 for text in \
   'config["guardian_policy"]["poll_seconds"] + config["guardian_policy"]["guest_command_timeout_seconds"]' \
   'proof_classify_status == 10' \
-  'invariant check'; do
+  'guardian_proof_wait_deadline=$((SECONDS + guardian_proof_budget_sec))'; do
   grep -Fq "$text" "$host_gate_script" || {
     printf 'guest host-gate importer lacks the classified bounded proof wait: %s\n' "$text" >&2; exit 1;
   }
@@ -317,6 +283,36 @@ fi
 
 guardian_fixture=$(mktemp -d)
 trap 'rm -rf -- "$guardian_fixture"' EXIT
+# Exercise the exact ExecStart command with fixture executables instead of
+# the installed release. The classifier alone runs on refusal.
+fixture_release="$guardian_fixture/boot-release"
+mkdir -p "$fixture_release/scripts/safety" "$fixture_release/bin"
+cat >"$fixture_release/scripts/safety/hardware-health.sh" <<'SH'
+#!/bin/sh
+printf '%s\n' classify
+exit "$HOST_GATE_TEST_CLASSIFIER_EXIT"
+SH
+cat >"$fixture_release/bin/ramshared" <<'SH'
+#!/bin/sh
+printf '%s\n' "$1"
+exit 1
+SH
+cat >"$fixture_release/scripts/safety/ramshared-host-gate.sh" <<'SH'
+#!/bin/sh
+printf '%s\n' gate
+exit 2
+SH
+chmod +x "$fixture_release/scripts/safety/"*.sh "$fixture_release/bin/ramshared"
+start_body=${host_gate_start#"$start_prefix"}
+start_body=${start_body%\'}
+start_body=${start_body//\/opt\/ramshared\/current/$fixture_release}
+status=0
+observed=$(HOST_GATE_TEST_CLASSIFIER_EXIT=78 /bin/sh -ec "$start_body") || status=$?
+[[ $status == 78 && $observed == classify ]]
+status=0
+observed=$(HOST_GATE_TEST_CLASSIFIER_EXIT=0 /bin/sh -ec "$start_body") || status=$?
+[[ $status == 2 && $observed == $'classify\nensure-origin\nensure-guardian\ngate' ]]
+printf '%s\n' 'PASS host_gate_main_process_preserves_hardware_and_transient_exit_status'
 mkdir -p "$guardian_fixture/windows/safe-mode" "$guardian_fixture/windows/guardian-state" \
   "$guardian_fixture/run/ramshared"
 

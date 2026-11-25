@@ -2194,7 +2194,7 @@ impl UnitHost for StatefulUnitHost {
     fn sync_selected_release(&mut self) -> Result<(), CustomerError> {
         let mut st = self.state.borrow_mut();
         st.events.push("sync-release".into());
-        if st.fail_sync {
+        if std::mem::take(&mut st.fail_sync) {
             return Err(fs_error(
                 CustomerReason::RecoveryRequired,
                 "NBD_INSTALL_REASON=RELEASE_SYNC_FAILED",
@@ -2701,4 +2701,244 @@ fn seamless_activation_and_active_auto_update_lifecycle() {
         );
         assert!(!shared_c.borrow().active_managed_swap);
     }
+}
+
+#[test]
+fn attended_install_recognizes_active_upgrade_preserves_config_and_reactivates_tiers() {
+    let base =
+        std::env::temp_dir().join(format!("ramshared-attended-upgrade-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("etc")).unwrap();
+    std::fs::create_dir_all(base.join("systemd")).unwrap();
+    std::fs::create_dir_all(base.join("sink")).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(base.join("etc"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _fix = Fixture(base.clone());
+
+    let home = base.join("gnupg");
+    let keyring = base.join("etc/release-keyring.gpg");
+    let _agent = create_signing_key(&home, &keyring);
+    let sink_str = base.join("sink").to_str().unwrap().to_owned();
+    let mut mem = || live_test_memory();
+
+    let env = test_env(&base);
+    std::fs::write(
+        &env.default_policy,
+        format!(
+            "enabled=1\nlower_sink={sink_str}\nbundle_root={}\nrelease_keyring={}\n",
+            env.default_bundle_root.display(),
+            keyring.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&env.default_policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let ver1 = "v0.15.0-20-gaaaa1111";
+    let ver2 = "v0.15.0-21-gbbbb2222";
+    let ver3 = "v0.15.0-22-gcccc3333";
+    let b1 = env.default_bundle_root.join("pkg-1/release");
+    let sha1 = build_signed_bundle(&home, &b1, ver1, b"u-v1");
+    let b2 = env.default_bundle_root.join("pkg-2/release");
+    let sha2 = build_signed_bundle(&home, &b2, ver2, b"u-v2");
+    let b3 = env.default_bundle_root.join("pkg-3/release");
+    let sha3 = build_signed_bundle(&home, &b3, ver3, b"u-v3");
+
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(SharedSystemdState {
+        drain_safe: false,
+        drain_reason: "host_memory_exceeds_headroom".into(),
+        ..Default::default()
+    }));
+    let mut units = StatefulUnitHost {
+        state: shared.clone(),
+    };
+    let boot = StatefulBootHost {
+        state: shared.clone(),
+    };
+    let mut lifecycle = StatefulLifecycleHost {
+        state: shared.clone(),
+    };
+
+    // 1. Initial attended install with `--enroll-default` activates all units/tiers.
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    assert_eq!(
+        run_with_lifecycle(
+            &[
+                "--approve-nbd-product-install".into(),
+                ver1.into(),
+                "--approve-manifest-sha256".into(),
+                sha1,
+                "--lower-sink".into(),
+                sink_str.clone(),
+                "--posture".into(),
+                "writeback".into(),
+                "--enroll-default".into(),
+                "--bundle-root".into(),
+                b1.to_str().unwrap().into(),
+            ],
+            &env,
+            &mut units,
+            &boot,
+            &mut lifecycle,
+            &mut mem,
+            &mut out,
+            &mut err,
+        ),
+        0,
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(shared.borrow().active_managed_swap);
+    assert_eq!(shared.borrow().active.get(CASCADE_UNIT), Some(&true));
+
+    // 2. Attended upgrade while drain is unsafe fails closed (exit 4) with zero mutations.
+    out.clear();
+    err.clear();
+    assert_eq!(
+        run_with_lifecycle(
+            &[
+                "--approve-nbd-product-install".into(),
+                ver2.into(),
+                "--approve-manifest-sha256".into(),
+                sha2.clone(),
+                "--lower-sink".into(),
+                sink_str.clone(),
+                "--posture".into(),
+                "writeback".into(),
+                "--bundle-root".into(),
+                b2.to_str().unwrap().into(),
+            ],
+            &env,
+            &mut units,
+            &boot,
+            &mut lifecycle,
+            &mut mem,
+            &mut out,
+            &mut err,
+        ),
+        4
+    );
+    assert!(
+        String::from_utf8_lossy(&err).contains("DRAIN_UNSAFE"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(
+        read_release_version(&env.selector_path()).as_deref(),
+        Some(ver1)
+    );
+    assert!(shared.borrow().active_managed_swap);
+
+    // 3. When drain is safe, attended upgrade (without repeating `--enroll-default`)
+    // automatically quiesces, preserves boot enrollment, applies ver2, and reactivates all tiers.
+    shared.borrow_mut().drain_safe = true;
+    shared.borrow_mut().drain_reason = "safe".into();
+    shared.borrow_mut().events.clear();
+    out.clear();
+    err.clear();
+    assert_eq!(
+        run_with_lifecycle(
+            &[
+                "--approve-nbd-product-install".into(),
+                ver2.into(),
+                "--approve-manifest-sha256".into(),
+                "0".repeat(64),
+                "--lower-sink".into(),
+                sink_str.clone(),
+                "--posture".into(),
+                "writeback".into(),
+                "--bundle-root".into(),
+                b2.to_str().unwrap().into(),
+            ],
+            &env,
+            &mut units,
+            &boot,
+            &mut lifecycle,
+            &mut mem,
+            &mut out,
+            &mut err,
+        ),
+        4
+    );
+    assert!(
+        String::from_utf8_lossy(&err).contains("APPROVED_MANIFEST_SHA256_MISMATCH"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(shared.borrow().events.is_empty());
+    assert!(shared.borrow().active_managed_swap);
+
+    out.clear();
+    err.clear();
+    assert_eq!(
+        run_with_lifecycle(
+            &[
+                "--approve-nbd-product-install".into(),
+                ver2.into(),
+                "--approve-manifest-sha256".into(),
+                sha2,
+                "--lower-sink".into(),
+                sink_str.clone(),
+                "--posture".into(),
+                "writeback".into(),
+                "--bundle-root".into(),
+                b2.to_str().unwrap().into(),
+            ],
+            &env,
+            &mut units,
+            &boot,
+            &mut lifecycle,
+            &mut mem,
+            &mut out,
+            &mut err,
+        ),
+        0,
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    let out_s = String::from_utf8_lossy(&out);
+    assert!(out_s.contains("NBD_INSTALL_STATE=INSTALLED"), "{out_s}");
+    assert!(out_s.contains("NBD_INSTALL_ENABLED=1"), "{out_s}");
+    assert!(out_s.contains("NBD_INSTALL_ACTIVATION=ACTIVE"), "{out_s}");
+    assert_eq!(
+        read_release_version(&env.selector_path()).as_deref(),
+        Some(ver2)
+    );
+    assert!(shared.borrow().active_managed_swap);
+    assert_eq!(shared.borrow().active.get(CASCADE_UNIT), Some(&true));
+
+    // 4. Failed attended upgrade restores prior release and reactivates all units/tiers.
+    shared.borrow_mut().fail_sync = true;
+    out.clear();
+    err.clear();
+    assert_eq!(
+        run_with_lifecycle(
+            &[
+                "--approve-nbd-product-install".into(),
+                ver3.into(),
+                "--approve-manifest-sha256".into(),
+                sha3,
+                "--lower-sink".into(),
+                sink_str,
+                "--posture".into(),
+                "writeback".into(),
+                "--bundle-root".into(),
+                b3.to_str().unwrap().into(),
+            ],
+            &env,
+            &mut units,
+            &boot,
+            &mut lifecycle,
+            &mut mem,
+            &mut out,
+            &mut err,
+        ),
+        5
+    );
+    assert_eq!(
+        read_release_version(&env.selector_path()).as_deref(),
+        Some(ver2)
+    );
+    assert!(shared.borrow().active_managed_swap);
+    assert_eq!(shared.borrow().active.get(CASCADE_UNIT), Some(&true));
 }

@@ -631,11 +631,22 @@ mod tests {
         assert!(cache.cached.is_none());
 
         // Live WSL2 host-memory smoke: returns a fresh observation on WSL2 with PowerShell present.
+        // Retry briefly in case parallel workspace test load slows a single PowerShell interop launch.
         if probe_platform().platform == Some(PlatformKind::Wsl2)
             && Path::new(POWERSHELL_BIN).is_file()
         {
             let mut live_cache = WslInstallHostMemoryCache::new();
-            let obs = live_cache.observe_install_memory().unwrap();
+            let mut obs = None;
+            for _ in 0..3 {
+                if let Some(sample) = live_cache.observe_install_memory() {
+                    obs = Some(sample);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let obs = obs.unwrap_or_else(|| {
+                panic!("fresh WSL2 host memory observation missing after bounded retries")
+            });
             assert_eq!(obs.platform, Some(PlatformKind::Wsl2));
             assert!(obs.cgroups.as_ref().is_some_and(|g| !g.is_empty()));
         }

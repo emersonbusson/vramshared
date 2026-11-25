@@ -42,6 +42,9 @@ pub fn diagnostic() -> String {
         format!("native GPU observation unavailable; correspondence remains unproved{detail}")
     }
 }
+pub fn set_idle(idle: bool) {
+    OWNER.set_idle(idle);
+}
 pub fn stop_and_wait() -> Result<(), String> {
     OWNER.stop_and_wait()
 }

@@ -18,6 +18,9 @@ pub fn observation() -> Option<VmIdentityReport> {
 pub fn diagnostic() -> Option<String> {
     OWNER.diagnostic()
 }
+pub fn set_paused(paused: bool) {
+    OWNER.set_paused(paused);
+}
 pub fn stop_and_wait() -> Result<(), String> {
     OWNER.stop_and_wait()
 }

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const POLL: Duration = Duration::from_millis(10);
 const QUERY_BUDGET: Duration = Duration::from_millis((GPU_BUDGET_MAX_AGE_MS * 2) / 5);
 const REFRESH_CADENCE: Duration = Duration::from_millis(GPU_BUDGET_MAX_AGE_MS / 5);
+const IDLE_REFRESH_CADENCE: Duration = Duration::from_millis(GPU_BUDGET_MAX_AGE_MS / 2);
 #[derive(Clone)]
 pub enum ProbeKind {
     Gpu,
@@ -29,6 +30,8 @@ pub struct NativeSampler<R> {
     task: Mutex<Option<OwnedThread>>,
     stopped: AtomicBool,
     stop_requested: AtomicBool,
+    paused: AtomicBool,
+    idle: AtomicBool,
     last_failure: Mutex<Option<String>>,
 }
 impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
@@ -39,7 +42,26 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
             task: Mutex::new(None),
             stopped: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            idle: AtomicBool::new(false),
             last_failure: Mutex::new(None),
+        }
+    }
+    /// Pause new probe spawns while the consumer holds an active session and does not
+    /// need periodic re-enumeration (e.g. VM discovery during an established vsock lease).
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+    /// Hint whether the consumer is idle (disconnected) so the sampler can use a
+    /// gentler refresh interval while staying strictly inside `GPU_BUDGET_MAX_AGE_MS`.
+    pub fn set_idle(&self, idle: bool) {
+        self.idle.store(idle, Ordering::Release);
+    }
+    fn refresh_cadence(&self) -> Duration {
+        if self.idle.load(Ordering::Acquire) {
+            IDLE_REFRESH_CADENCE
+        } else {
+            REFRESH_CADENCE
         }
     }
     fn owner(&self) -> &Mutex<ProbeSupervisor<NativeProcess, R>> {
@@ -88,6 +110,8 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
     }
     fn run(&self, executable: PathBuf, kind: ProbeKind, stop: &StopSignal) {
         let mut next = Instant::now();
+        let mut was_paused = false;
+        let mut was_idle = false;
         loop {
             let (snapshot, exit_loop) = {
                 let mut custody = self
@@ -98,11 +122,18 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
                 if stopping {
                     custody.cancel();
                 }
+                let paused = self.paused.load(Ordering::Acquire);
+                let idle = self.idle.load(Ordering::Acquire);
+                if (was_paused && !paused) || (was_idle && !idle) {
+                    next = Instant::now();
+                }
+                was_paused = paused;
+                was_idle = idle;
                 let mut exit_loop = false;
                 if !custody.busy() {
                     if stopping {
                         exit_loop = true;
-                    } else {
+                    } else if !paused {
                         let now = Instant::now();
                         if now >= next {
                             let admission = custody.start(
@@ -123,7 +154,7 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
                             if let Err(error) = admission {
                                 self.record_failure(Some(error));
                             }
-                            next = now + REFRESH_CADENCE;
+                            next = now + self.refresh_cadence();
                         }
                     }
                 }

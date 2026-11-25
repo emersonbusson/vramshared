@@ -8,7 +8,7 @@
 use super::super::lifecycle::ConfiguredPermit;
 use super::super::{HostSamples, StopSignal, VsockMode, serve_connection_with_stop};
 use super::{ControlPlaneTask, LeasePolicy, LeaseServerError, VsockConfig};
-use crate::vm_id_resolve::{parse_guid, resolve_connect_candidate, verify_connected_route_peer};
+use crate::vm_id_resolve::{parse_guid, resolve_connect_candidates, verify_connected_route_peer};
 use crate::vm_identity::VmOsClassification;
 use ramshared_ipc::vsock::{
     VsockError, VsockListener, VsockStreamTrait, connect_hyperv, linux_service_guid, listen_hyperv,
@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const SINGLE_ROUTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MULTI_ROUTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 enum Endpoint {
     Listen(VsockListener),
     Connect {
@@ -26,33 +29,52 @@ enum Endpoint {
     },
 }
 impl Endpoint {
-    fn connect(&self) -> Result<(Box<dyn VsockStreamTrait>, &'static str), LeaseServerError> {
+    fn connect_route(
+        vm_id: [u8; 16],
+        port: u32,
+        timeout: Duration,
+    ) -> Result<Box<dyn VsockStreamTrait>, LeaseServerError> {
+        let stream = connect_hyperv(vm_id, linux_service_guid(port), timeout)
+            .map_err(LeaseServerError::Vsock)?;
+        let observed = stream.native_peer().map_err(LeaseServerError::Io)?;
+        verify_connected_route_peer(vm_id, port, observed)?;
+        Ok(stream)
+    }
+
+    fn resolve_targets(&self) -> Result<Vec<([u8; 16], &'static str, Duration)>, LeaseServerError> {
         match self {
-            Self::Listen(listener) => listener
-                .accept(Duration::from_secs(1))
-                .map(|stream| (stream, "listen"))
-                .map_err(LeaseServerError::Vsock),
-            Self::Connect { explicit, port } => {
-                let (vm_id, route_kind) = match explicit {
-                    Some(id) => (*id, "explicit"),
-                    None => {
-                        let candidate = resolve_connect_candidate()?;
-                        let kind = match candidate.os_classification {
-                            VmOsClassification::Linux => "native_linux",
-                            VmOsClassification::Omitted => "endpoint_verified",
-                        };
-                        (candidate.runtime_id, kind)
-                    }
-                };
-                let stream =
-                    connect_hyperv(vm_id, linux_service_guid(*port), Duration::from_secs(5))
-                        .map_err(LeaseServerError::Vsock)?;
-                let observed = stream.native_peer().map_err(LeaseServerError::Io)?;
-                verify_connected_route_peer(vm_id, *port, observed)?;
-                Ok((stream, route_kind))
+            Self::Listen(_) => Ok(Vec::new()),
+            Self::Connect {
+                explicit: Some(id), ..
+            } => Ok(vec![(*id, "explicit", SINGLE_ROUTE_CONNECT_TIMEOUT)]),
+            Self::Connect { explicit: None, .. } => {
+                let candidates = resolve_connect_candidates()?;
+                if candidates.len() == 1 {
+                    let candidate = candidates[0];
+                    let kind = match candidate.os_classification {
+                        VmOsClassification::Linux => "native_linux",
+                        VmOsClassification::Omitted => "endpoint_verified",
+                    };
+                    return Ok(vec![(
+                        candidate.runtime_id,
+                        kind,
+                        SINGLE_ROUTE_CONNECT_TIMEOUT,
+                    )]);
+                }
+                Ok(candidates
+                    .into_iter()
+                    .map(|c| {
+                        (
+                            c.runtime_id,
+                            "multi_vm_authenticated",
+                            MULTI_ROUTE_CONNECT_TIMEOUT,
+                        )
+                    })
+                    .collect())
             }
         }
     }
+
     fn retry_delay(&self) -> Duration {
         match self {
             Self::Listen(_) => Duration::from_millis(250),
@@ -105,6 +127,56 @@ fn await_initial_gpu_observation(stop: &StopSignal) {
     }
 }
 
+fn serve_active_session(
+    stream: &mut Box<dyn VsockStreamTrait>,
+    route_kind: &str,
+    key: &[u8],
+    policy: LeasePolicy,
+    log: &Path,
+    stop: &StopSignal,
+) -> bool {
+    // Pause VM discovery while a lease session is active and run GPU telemetry at
+    // full cadence; restore idle posture when the session closes.
+    crate::vm_identity::sampler::set_paused(true);
+    crate::gpu_identity::sampler::set_idle(false);
+    append_log(log, &format!("session connected (route={route_kind})"));
+    append_log(log, &crate::gpu_identity::sampler::diagnostic());
+    let established = match serve_connection_with_stop(
+        stream,
+        key,
+        policy,
+        unix_time_ms,
+        host_samples,
+        Some(stop),
+    ) {
+        Ok(beats) => {
+            append_log(log, &format!("session closed after {beats} beats"));
+            true
+        }
+        Err(error) => {
+            append_log(log, &format!("session ended: {error}"));
+            !matches!(
+                error,
+                LeaseServerError::Refused(_)
+                    | LeaseServerError::Handshake(_)
+                    | LeaseServerError::Protocol(_)
+                    | LeaseServerError::Frame(_)
+            )
+        }
+    };
+    crate::gpu_identity::sampler::set_idle(true);
+    crate::vm_identity::sampler::set_paused(false);
+    established
+}
+
+fn log_refusal_dedup(log: &Path, last_refusal: &mut Option<String>, error: &LeaseServerError) {
+    let text = error.to_string();
+    if last_refusal.as_deref() != Some(text.as_str()) {
+        append_log(log, &format!("connection attempt refused: {text}"));
+        *last_refusal = Some(text);
+    }
+}
+
 fn run(
     endpoint: Endpoint,
     key: Vec<u8>,
@@ -115,29 +187,57 @@ fn run(
 ) -> std::io::Result<()> {
     let mut metadata = start_metadata(product, &log);
     await_initial_gpu_observation(&stop);
+    crate::gpu_identity::sampler::set_idle(true);
     append_log(&log, "control plane started");
+    let mut last_refusal: Option<String> = None;
     while !stop.is_requested() {
-        match endpoint.connect() {
-            Ok((mut stream, route_kind)) => {
-                append_log(&log, &format!("session connected (route={route_kind})"));
-                append_log(&log, &crate::gpu_identity::sampler::diagnostic());
-                match serve_connection_with_stop(
-                    &mut stream,
-                    &key,
-                    policy,
-                    unix_time_ms,
-                    host_samples,
-                    Some(&stop),
-                ) {
-                    Ok(beats) => append_log(&log, &format!("session closed after {beats} beats")),
-                    Err(error) => append_log(&log, &format!("session ended: {error}")),
-                }
-                if matches!(endpoint, Endpoint::Listen(_)) {
+        match &endpoint {
+            Endpoint::Listen(listener) => match listener.accept(Duration::from_secs(1)) {
+                Ok(mut stream) => {
+                    last_refusal = None;
+                    let _ = serve_active_session(&mut stream, "listen", &key, policy, &log, &stop);
                     continue;
                 }
-            }
-            Err(LeaseServerError::Vsock(VsockError::AcceptTimeout)) => continue,
-            Err(error) => append_log(&log, &format!("connection attempt refused: {error}")),
+                Err(VsockError::AcceptTimeout) => continue,
+                Err(error) => {
+                    log_refusal_dedup(&log, &mut last_refusal, &LeaseServerError::Vsock(error));
+                }
+            },
+            Endpoint::Connect { port, .. } => match endpoint.resolve_targets() {
+                Ok(targets) => {
+                    let mut last_error: Option<LeaseServerError> = None;
+                    let mut authenticated = false;
+                    for (vm_id, route_kind, timeout) in targets {
+                        if stop.is_requested() {
+                            break;
+                        }
+                        match Endpoint::connect_route(vm_id, *port, timeout) {
+                            Ok(mut stream) => {
+                                if serve_active_session(
+                                    &mut stream,
+                                    route_kind,
+                                    &key,
+                                    policy,
+                                    &log,
+                                    &stop,
+                                ) {
+                                    last_refusal = None;
+                                    authenticated = true;
+                                    break;
+                                }
+                            }
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    if !authenticated
+                        && !stop.is_requested()
+                        && let Some(error) = last_error
+                    {
+                        log_refusal_dedup(&log, &mut last_refusal, &error);
+                    }
+                }
+                Err(error) => log_refusal_dedup(&log, &mut last_refusal, &error),
+            },
         }
         stop.wait(endpoint.retry_delay());
     }

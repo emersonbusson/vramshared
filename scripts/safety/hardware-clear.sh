@@ -20,7 +20,7 @@
 # clear an MCE event it cannot review.
 #
 # This script does not re-run the classifier and does not mint a lease. The
-# next `hardware-health.sh` run (the host gate's first ExecStartPre) consumes
+# next `hardware-health.sh` run (the first step of the host gate) consumes
 # the override; the lease stays absent until that run passes.
 set -euo pipefail
 

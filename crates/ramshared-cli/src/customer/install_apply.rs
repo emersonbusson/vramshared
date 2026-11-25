@@ -68,7 +68,7 @@ struct ApplyInputs<'a> {
     posture: Posture,
 }
 
-struct VerifiedCandidate {
+pub(super) struct VerifiedCandidate {
     bundle_dir: PathBuf,
     signature: VerifiedSignature,
     declared: DeclaredBundle,
@@ -590,17 +590,25 @@ fn admit_apply_transaction<'a>(
     ))
 }
 
-pub(super) fn execute_verified_apply(
+pub(super) fn verify_install(
     req: &InstallRequest,
     env: &InstallEnvironment,
     preverified_sig: Option<VerifiedSignature>,
+) -> Result<VerifiedCandidate, CustomerError> {
+    let inputs = validate_apply_inputs(req)?;
+    open_verified_candidate(req, env, &inputs, preverified_sig)
+}
+
+pub(super) fn execute_verified_apply(
+    req: &InstallRequest,
+    env: &InstallEnvironment,
+    candidate: VerifiedCandidate,
     unit_host: &mut dyn UnitHost,
     boot_host: &impl BootPolicyHost,
     memory_obs: &mut dyn FnMut() -> Option<MemoryObservation>,
     stdout: &mut dyn Write,
 ) -> Result<CommittedInstall, CustomerError> {
     let inputs = validate_apply_inputs(req)?;
-    let candidate = open_verified_candidate(req, env, &inputs, preverified_sig)?;
     let requirement = memory_policy();
     let streamed = candidate
         .declared
@@ -680,7 +688,10 @@ pub(super) fn execute_verified_apply(
                 &selector,
                 &stage_root,
             ) {
-                Ok(()) => Err(err),
+                Ok(()) => Err(CustomerError {
+                    state: CustomerState::InstalledOff,
+                    ..err
+                }),
                 Err(recovery_err) => Err(fs_error(
                     CustomerReason::RecoveryRequired,
                     format!("{}; {}", err.detail, recovery_err.detail),

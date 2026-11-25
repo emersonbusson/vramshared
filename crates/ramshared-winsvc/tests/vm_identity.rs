@@ -9,7 +9,8 @@
 use ramshared_ipc::vsock::{VsockPeerIdentity, linux_service_guid};
 use ramshared_winsvc::gpu_identity::ProducerProcess;
 use ramshared_winsvc::vm_id_resolve::{
-    parse_guid, select_connect_candidate, select_guest_vm_guid, verify_connected_route_peer,
+    parse_guid, select_connect_candidate, select_connect_candidates, select_guest_vm_guid,
+    verify_connected_route_peer,
 };
 use ramshared_winsvc::vm_identity::{
     VmIdentity, VmIdentityReport, VmOsClassification, project_systems,
@@ -343,4 +344,55 @@ fn omitted_os_vm_requires_endpoint_proof_and_never_trusts_owner_or_ambiguity() {
     let linux_candidate = select_connect_candidate(&report()).unwrap();
     assert!(!linux_candidate.requires_native_peer_proof());
     assert_eq!(linux_candidate.runtime_id, parse_guid(ID).unwrap());
+}
+
+#[test]
+fn select_connect_candidates_orders_linux_before_omitted_and_refuses_empty() {
+    let wsl_like = serde_json::json!({
+        "Id": "FDA22A19-A1C0-4A30-B93E-A9F2576C2A59",
+        "SystemType": "VirtualMachine",
+        "Owner": "WSL",
+        "RuntimeId": "fda22a19-a1c0-4a30-b93e-a9f2576c2a59",
+        "State": "Running"
+    });
+    let other_omitted = serde_json::json!({
+        "Id": "other-hyperv-vm",
+        "SystemType": "VirtualMachine",
+        "Owner": "Microsoft.Virtualization",
+        "RuntimeId": "11111111-2222-3333-4444-555555555555",
+        "State": "Running"
+    });
+    let explicit_linux: serde_json::Value =
+        serde_json::from_str(&row(ID, "VirtualMachine", "Linux", "Running")).unwrap();
+    let multi = VmIdentityReport {
+        schema_version: 1,
+        producer: ProducerProcess {
+            pid: 42,
+            creation_time_100ns: 77,
+        },
+        started_at_unix_ms: 1000,
+        elapsed_ms: 1,
+        systems: project_systems(
+            &serde_json::to_vec(&vec![wsl_like, other_omitted, explicit_linux]).unwrap(),
+        )
+        .unwrap(),
+    };
+    let candidates = select_connect_candidates(&multi).unwrap();
+    assert_eq!(candidates.len(), 3);
+    assert_eq!(candidates[0].os_classification, VmOsClassification::Linux);
+    assert_eq!(candidates[0].runtime_id, parse_guid(ID).unwrap());
+    assert_eq!(candidates[1].os_classification, VmOsClassification::Omitted);
+    assert_eq!(
+        candidates[1].runtime_id,
+        parse_guid("fda22a19-a1c0-4a30-b93e-a9f2576c2a59").unwrap()
+    );
+    assert_eq!(candidates[2].os_classification, VmOsClassification::Omitted);
+    assert_eq!(
+        candidates[2].runtime_id,
+        parse_guid("11111111-2222-3333-4444-555555555555").unwrap()
+    );
+
+    let mut empty = multi;
+    empty.systems.clear();
+    assert!(select_connect_candidates(&empty).is_err());
 }

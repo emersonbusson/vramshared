@@ -16,7 +16,7 @@ use rustix::process::geteuid;
 
 use super::install_apply::{
     clear_all_package_journals, clear_stage_artifacts, execute_verified_apply,
-    verify_candidate_trust, verify_declared_payload_identity,
+    verify_candidate_trust, verify_declared_payload_identity, verify_install,
 };
 use super::install_args::{
     AutoUpdateMode, InstallMode, InstallRequest, parse_install_args, write_auto_update_status,
@@ -26,10 +26,9 @@ use super::install_fs::{WslInstallHostMemoryCache, fs_error};
 #[cfg(test)]
 use super::install_lifecycle::NoopLifecycleHost;
 use super::install_lifecycle::{
-    ActivationOutcome, LifecycleHost, PrepareUpgradeOutcome, SystemLifecycleHost,
-    activate_installed_units, append_auto_update_log, emit_committed_install,
-    finalize_auto_update_outcome, finish_seamless_auto_update, prepare_seamless_auto_update,
-    should_activate_after_install, write_deferred_output, write_up_to_date_output,
+    LifecycleHost, PrepareUpgradeOutcome, SystemLifecycleHost, append_auto_update_log,
+    finalize_auto_update_outcome, finish_upgrade_lifecycle, prepare_seamless_auto_update,
+    run_attended_apply_with, write_deferred_output, write_up_to_date_output,
 };
 use super::install_units::{MANAGED_UNITS, SystemUnitHost, UnitHost, validate_unit_plan};
 use super::package_prepare::{PreparePaths, resume as resume_prepared};
@@ -215,17 +214,21 @@ fn execute_request(
         }
         InstallMode::Apply => {
             require_root(env)?;
-            let committed =
-                execute_verified_apply(req, env, None, unit_host, boot_host, memory_obs, stdout)?;
-            let activation =
-                if should_activate_after_install(req, committed.enroll_outcome.as_ref()) {
-                    lifecycle.ensure_recommended_config(stdout);
-                    activate_installed_units(lifecycle, false)
-                } else {
-                    ActivationOutcome::Off
-                };
-            emit_committed_install(&committed, &activation, req.json, stdout);
-            Ok(())
+            let verified = verify_install(req, env, None)?;
+            let selector = env.selector_path();
+            run_attended_apply_with(
+                req,
+                &selector,
+                unit_host,
+                boot_host,
+                lifecycle,
+                stdout,
+                |apply_req, u_host, out| {
+                    execute_verified_apply(
+                        apply_req, env, verified, u_host, boot_host, memory_obs, out,
+                    )
+                },
+            )
         }
     }
 }
@@ -563,6 +566,18 @@ fn run_auto_update_apply<B: BootPolicyHost>(
         AutoUpdateDecision::Upgrade(current, posture) => (current, posture),
     };
     require_root(env)?;
+    let mut apply_req = InstallRequest {
+        mode: InstallMode::Apply,
+        approved_version: Some(validated.candidate.clone()),
+        approved_manifest_sha256: Some(validated.manifest_sha256),
+        lower_sink: Some(validated.lower_sink),
+        posture: Some(posture),
+        bundle_root: Some(validated.bundle_dir),
+        running: Some(current.clone()),
+        policy: Some(validated.policy_path.to_path_buf()),
+        ..req.clone()
+    };
+    let verified = verify_install(&apply_req, env, Some(validated.signature))?;
     let quiescence = match prepare_seamless_auto_update(
         runtime.unit_host,
         runtime.boot_host,
@@ -585,29 +600,25 @@ fn run_auto_update_apply<B: BootPolicyHost>(
         &env.auto_update_log,
         &format!("UPDATE from={current} to={}", validated.candidate),
     );
-    let mut apply_req = req.clone();
-    apply_req.mode = InstallMode::Apply;
-    apply_req.approved_version = Some(validated.candidate.clone());
-    apply_req.approved_manifest_sha256 = Some(validated.manifest_sha256);
-    apply_req.lower_sink = Some(validated.lower_sink);
-    apply_req.posture = Some(posture);
-    apply_req.bundle_root = Some(validated.bundle_dir);
-    apply_req.running = Some(current);
     apply_req.enroll_default = quiescence.was_boot_enrolled;
     apply_req.no_enroll = !quiescence.was_boot_enrolled;
-    if apply_req.policy.is_none() {
-        apply_req.policy = Some(validated.policy_path.to_path_buf());
-    }
     let apply_res = execute_verified_apply(
         &apply_req,
         env,
-        Some(validated.signature),
+        verified,
         runtime.unit_host,
         runtime.boot_host,
         runtime.memory_obs,
         stdout,
     );
-    let outcome = finish_seamless_auto_update(&quiescence, runtime.lifecycle, apply_res);
+    let outcome = finish_upgrade_lifecycle(
+        &quiescence,
+        runtime.lifecycle,
+        apply_res,
+        |_| false,
+        false,
+        stdout,
+    );
     finalize_auto_update_outcome(
         &env.auto_update_log,
         &validated.candidate,

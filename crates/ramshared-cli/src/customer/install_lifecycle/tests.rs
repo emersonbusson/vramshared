@@ -371,6 +371,7 @@ fn seamless_auto_update_drains_quiesces_and_reactivates_on_success() {
 fn seamless_auto_update_restores_prior_units_and_tiers_on_apply_failure() {
     let quiescence = UpgradeQuiescenceState {
         was_active: true,
+        was_supervisor_active: true,
         was_boot_enrolled: true,
         was_health_active: true,
         was_health_enabled: true,
@@ -413,6 +414,17 @@ fn seamless_auto_update_restores_prior_units_and_tiers_on_apply_failure() {
         finish_seamless_auto_update::<()>(&quiescence, &mut broken, Err(apply_err2)).unwrap_err();
     assert_eq!(err2.reason, CustomerReason::RecoveryRequired);
     assert!(err2.detail.contains("runtime restore failed"));
+
+    let mut uncertain = FakeLifecycle::default();
+    let rollback_err = fs_error(
+        CustomerReason::RecoveryRequired,
+        "package rollback incomplete",
+        CustomerState::RecoveryRequired,
+    );
+    let err = finish_seamless_auto_update::<()>(&quiescence, &mut uncertain, Err(rollback_err))
+        .unwrap_err();
+    assert_eq!(err.state, CustomerState::RecoveryRequired);
+    assert!(uncertain.events.is_empty());
 }
 
 #[test]
@@ -446,7 +458,7 @@ fn seamless_auto_update_handles_health_only_and_partial_disable_rollback() {
     assert!(q.was_health_enabled);
     health_only.events.clear();
     let (_, act) = finish_seamless_auto_update(&q, &mut health_only, Ok(())).unwrap();
-    assert_eq!(act, ActivationOutcome::Active);
+    assert_eq!(act, ActivationOutcome::Off);
     assert_eq!(
         health_only.events,
         vec![
@@ -472,6 +484,25 @@ fn seamless_auto_update_handles_health_only_and_partial_disable_rollback() {
             format!("disable:{CASCADE_UNIT}"),
             format!("disable:{SUPERVISOR_UNIT}"),
             format!("enable:{CASCADE_UNIT}"),
+        ]
+    );
+
+    let mut failed_stop = FakeLifecycle {
+        live: LiveRuntimeState {
+            supervisor_active: true,
+            health_active: true,
+            ..Default::default()
+        },
+        fail_stop_on: Some(HEALTH_UNIT),
+        ..Default::default()
+    };
+    assert!(prepare_seamless_auto_update(&units, &boot, &mut failed_stop).is_err());
+    assert_eq!(
+        failed_stop.events,
+        [
+            format!("stop:{SUPERVISOR_UNIT}"),
+            format!("stop:{HEALTH_UNIT}"),
+            format!("start:{SUPERVISOR_UNIT}"),
         ]
     );
 
@@ -630,4 +661,59 @@ fn system_lifecycle_host_systemctl_wrapper_and_drain_mapping_fail_closed() {
     assert!(down_err.detail.contains("swapoff refused"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prepare_upgrade_stops_and_restores_supervisor_even_when_cascade_is_inactive() {
+    let units = FakeUnits {
+        states: BTreeMap::new(),
+    };
+    let boot = FakeBoot {
+        enabled: BTreeMap::new(),
+    };
+    let mut lifecycle = FakeLifecycle {
+        live: LiveRuntimeState {
+            supervisor_active: true,
+            ..LiveRuntimeState::default()
+        },
+        ..FakeLifecycle::default()
+    };
+    let quiescence = match prepare_seamless_auto_update(&units, &boot, &mut lifecycle).unwrap() {
+        PrepareUpgradeOutcome::Ready(q) => q,
+        other => panic!("expected Ready, got {other:?}"),
+    };
+    assert!(quiescence.was_supervisor_active);
+    assert!(!quiescence.was_active);
+    assert!(
+        lifecycle
+            .events
+            .contains(&format!("stop:{SUPERVISOR_UNIT}")),
+        "supervisor must be stopped during quiescence even if cascade is down"
+    );
+    lifecycle.events.clear();
+    assert_eq!(
+        finish_seamless_auto_update(&quiescence, &mut lifecycle, Ok(()))
+            .unwrap()
+            .1,
+        ActivationOutcome::Off
+    );
+    assert_eq!(lifecycle.events, [format!("start:{SUPERVISOR_UNIT}")]);
+    lifecycle.events.clear();
+    let err = finish_seamless_auto_update::<()>(
+        &quiescence,
+        &mut lifecycle,
+        Err(fs_error(
+            CustomerReason::IdentityChanged,
+            "simulated apply failure",
+            CustomerState::InstalledOff,
+        )),
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, CustomerReason::IdentityChanged);
+    assert!(
+        lifecycle
+            .events
+            .contains(&format!("start:{SUPERVISOR_UNIT}")),
+        "failed apply must restore previously running supervisor"
+    );
 }

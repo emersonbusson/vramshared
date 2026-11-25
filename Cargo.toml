@@ -33,7 +33,6 @@ edition = "2024"
 rust-version = "1.100.0"
 license = "MIT"
 authors = ["Emerson Busson <emersonbusson@gmail.com>"]
-homepage = "https://github.com/emersonbusson/vramshared"
 repository = "https://github.com/emersonbusson/vramshared"
 # Internal workspace crates are never published to crates.io. Marking them
 # private prevents accidental publication and keeps path dependencies out of
