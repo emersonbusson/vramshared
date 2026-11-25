@@ -1,0 +1,58 @@
+// Author: Emerson Busson
+// Email: emersonbusson@gmail.com
+// GitHub: https://github.com/emersonbusson
+// LinkedIn: https://www.linkedin.com/in/emersonbusson
+// Source: https://github.com/emersonbusson/vramshared
+// File: crates/ramshared-wsl2d/src/lib.rs
+//! ramshared-wsl2d (lib) — state machine (§7) + `VramBackend` connecting
+//! `ramshared-cuda` to `ramshared-block`. The wiring of `/dev/nbdX` (ioctl) and the
+//! residency canary (§9) are integrated in subsequent increments.
+#![deny(unsafe_code)]
+
+pub mod autotier;
+pub mod backend;
+pub mod broker_srv;
+pub mod canary_probe;
+pub mod conn;
+pub mod control_plane;
+pub mod demote_status;
+pub mod frame_writer;
+pub mod governor;
+pub mod gpu_budget;
+pub mod host_catalog;
+pub mod host_gate;
+pub mod host_memory_budget;
+#[cfg(target_os = "linux")]
+pub mod host_storage_match;
+#[cfg(target_os = "linux")]
+pub mod host_storage_state;
+pub mod lease_supervisor;
+pub mod pid_file;
+pub mod reply_budget;
+pub mod residency;
+pub mod state;
+pub mod swap;
+pub mod systemd_notify;
+pub mod telemetry;
+pub mod tier_release;
+pub mod ublk;
+pub mod ublk_control;
+pub mod ublk_queue;
+pub mod ublk_server;
+pub mod uring_smoke;
+
+pub use backend::{RamBackend, SliceView, VramBackend};
+pub use canary_probe::{CANARY_BYTES, CANARY_EVERY, Cadence, CanaryProbe};
+pub use conn::{CHAN_CAP, Job, LiveCount, Reply, WMsg, spawn_acceptor, spawn_reader, spawn_writer};
+pub use demote_status::{
+    DEMOTE_STATUS_PATH, DemoteStatusFile, parse_demote_status, render_demote_status_json,
+    write_demote_status,
+};
+pub use governor::{DynamicHeadroomGovernor, HeadroomZone};
+pub use pid_file::{PID_FILE_PATH, PidFileGuard, live_ramsharedd_pid_at};
+pub use residency::{Canary, DemoteReason, ResidencyConfig, ResidencySampler, Verdict};
+pub use state::State;
+pub use telemetry::{
+    ReconcileFlag, ReconcileInput, SliceIoCounters, TelemetryCore, TelemetrySample, VramGauge,
+    reconcile, vram_outros,
+};

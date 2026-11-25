@@ -1,0 +1,114 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: packaging/arch/PKGBUILD
+# Maintainer: Emerson Busson
+pkgname=ramshared
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Hardware-accelerated VRAM memory tiering & low-level kernel block drivers"
+# AUD-42: only architectures the product has qualified are advertised. A
+# buildable-but-unqualified arch must not appear here, or an aarch64 user
+# installs a package the support matrix does not stand behind.
+arch=('x86_64')
+url="https://github.com/emersonbusson/vramshared"
+license=('GPL2')
+# gnupg provides gpgv for the scheduled release-signature gate.
+depends=('systemd' 'glibc' 'gnupg')
+optdepends=(
+    'cuda: NVIDIA GPU hardware DMA acceleration'
+    'vulkan-icd-loader: Vulkan GPU cache provider for compatible adapters'
+)
+install=ramshared.install
+source=("$pkgname-$pkgver.tar.gz::https://github.com/emersonbusson/vramshared/archive/refs/tags/v$pkgver.tar.gz")
+# AUD-42: `sha256sums=('SKIP')` is an unverified download. The release
+# archive digest is pinned at release time by the operator/CI that publishes
+# the tag; a missing pin fails the build rather than silently skipping it.
+_source_sha256="${RAMSHARED_SOURCE_SHA256:?set RAMSHARED_SOURCE_SHA256 to the pinned digest of the v${pkgver} source archive}"
+sha256sums=("${_source_sha256}")
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver" 2>/dev/null || cd "$srcdir"
+    if command -v cargo >/dev/null 2>&1; then
+        cargo build --release --locked -p ramshared-cli -p ramshared-wsl2d
+    fi
+}
+
+# stage_arch_member <root> <kind> <role> <mode> <source>
+#
+# Maps one declared payload member onto the Arch layout. Role-carries-
+# subdirectory: a role that already names a subdirectory is the path under its
+# kind's root, so `ramshared/package-lifecycle-hook.sh` stages at
+# /usr/lib/ramshared/package-lifecycle-hook.sh — the exact path
+# packaging/arch/ramshared.install pins in pre_remove. A bare role keeps the
+# kind's default subdirectory.
+stage_arch_member() {
+    local root="$1" kind="$2" role="$3" mode="$4" source="$5" dest
+    case "$kind" in
+        generated)
+            # Arch builds from source under makepkg and records its identity in
+            # the package metadata (pkgver/pkgrel) instead of a staged file.
+            return 0
+            ;;
+        bin)
+            dest="$pkgdir/usr/bin/$role"
+            ;;
+        script | library | config)
+            case "$role" in
+                */*) dest="$pkgdir/usr/lib/$role" ;;
+                *) dest="$pkgdir/usr/share/ramshared/scripts/$role" ;;
+            esac
+            ;;
+        config-example)
+            case "$role" in
+                */*) dest="$pkgdir/etc/$role" ;;
+                *) dest="$pkgdir/etc/ramshared/$role" ;;
+            esac
+            ;;
+        unit | unit-template | dropin)
+            dest="$pkgdir/usr/lib/systemd/system/$role"
+            ;;
+        rule)
+            dest="$pkgdir/usr/lib/udev/rules.d/$role"
+            ;;
+        # A tmpfiles/sysusers role carries its destination subdirectory, the
+        # same shape as a drop-in role (`docker.service.d/10-ramshared-control.conf`).
+        tmpfiles | sysusers)
+            dest="$pkgdir/usr/lib/$role"
+            ;;
+        doc)
+            dest="$pkgdir/usr/share/doc/$pkgname/$role"
+            ;;
+        *)
+            echo "payload member $role has no Arch destination for kind $kind" >&2
+            return 1
+            ;;
+    esac
+    install -D -m "$mode" "$root/$source" "$dest"
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver" 2>/dev/null || cd "$srcdir"
+    local root="$PWD"
+
+    # One declaration, one inclusion list (customer-installation DT-8). This
+    # PKGBUILD maps each member's `kind` onto the Arch layout; it never
+    # re-derives *which* product members exist. The table is the same one the
+    # Debian, bundle and RPM builders stage from.
+    # shellcheck source=scripts/package/package-payload-manifest.sh
+    source "$root/scripts/package/package-payload-manifest.sh"
+    local payload_summary
+    if ! payload_summary=$(ramshared_payload_validate_declaration "$root"); then
+        echo "ERROR: the product payload declaration is not valid" >&2
+        return 1
+    fi
+    echo "==> Payload declaration: $payload_summary"
+
+    local kind role mode source formats reason
+    while IFS='|' read -r kind role mode source formats reason; do
+        [[ -n "$kind" ]] || continue
+        stage_arch_member "$root" "$kind" "$role" "$mode" "$source"
+    done < <(ramshared_payload_members_for arch)
+}

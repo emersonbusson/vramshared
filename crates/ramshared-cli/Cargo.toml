@@ -1,0 +1,38 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-cli/Cargo.toml
+[package]
+name = "ramshared-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ramshared"
+path = "src/main.rs"
+
+[dependencies]
+ramshared-block = { path = "../ramshared-block" }
+ramshared-exec = { path = "../ramshared-exec" }
+ramshared-tier = { path = "../ramshared-tier" }
+ramshared-config = { path = "../ramshared-config" }
+ramshared-cuda = { path = "../ramshared-cuda" }
+ramshared-vram = { path = "../ramshared-vram" }
+ramshared-ipc = { path = "../ramshared-ipc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "process", "net", "system"] }
+libc = "0.2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

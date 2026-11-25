@@ -1,0 +1,810 @@
+// Author: Emerson Busson
+// Email: emersonbusson@gmail.com
+// GitHub: https://github.com/emersonbusson
+// LinkedIn: https://www.linkedin.com/in/emersonbusson
+// Source: https://github.com/emersonbusson/vramshared
+// File: crates/ramshared-broker/src/arbiter.rs
+//! **Pure** arbiter policy (no IO; injected clock) — RF-B2, RF-B3, RNF-3 and the
+//! counterfactual of PRD §14 with floor (DT-23).
+//!
+//! `tick` does not mutate `SliceMap`: returns [`Action`]s that the core (ITEM-8) applies. One decision of
+//! movement per tick (at most 1 `MoveSlice` **or** `RevertMove`); under `pending_lease` the rebalancing
+//! steps (2/4) and round-robin (5) are suppressed (R9) — reservation is the core applying
+//! `GrantLease`→`lease()`. Revocation order by **owner's psi** (proxy; the pure `tick` does not have
+//! `used_kb` per slice — see SPEC ITEM-4).
+
+use std::cmp::Ordering;
+use std::time::{Duration, Instant};
+
+use crate::model::{PsiSample, Slice, SliceId, SliceState, TenantId};
+
+/// Arbiter parameters. Defaults calibrated by P0 (P0-RESULTS §5).
+#[derive(Clone, Copy, Debug)]
+pub struct ArbiterConfig {
+    /// Differential of `some.avg10` to move.
+    pub delta_psi: f32,
+    /// Consecutive ticks above delta before moving (hysteresis).
+    pub streak: u32,
+    /// Cooldown after normal movement.
+    pub cooldown: Duration,
+    /// "Under pressure" (never-zero) and floor of counterfactual (DT-23).
+    pub psi_floor: f32,
+    /// Counterfactual window.
+    pub cf_window: Duration,
+    /// Worsening factor of the drained one that triggers the revert.
+    pub cf_factor: f32,
+    /// Long cooldown post-revert.
+    pub cf_cooldown: Duration,
+}
+
+impl Default for ArbiterConfig {
+    fn default() -> Self {
+        Self {
+            delta_psi: 10.0,                       // P0: was 15; idle tenant ~1.2 vs WSL2 load 14
+            streak: 5,                             // 5 ticks (tick=2s → 10s)
+            cooldown: Duration::from_secs(60),     // PRD §14
+            psi_floor: 5.0,                        // idle <5, load ≥14
+            cf_window: Duration::from_secs(60),    // PRD §14
+            cf_factor: 2.0,                        // PRD §14 (>2× em 60s)
+            cf_cooldown: Duration::from_secs(300), // PRD §14
+        }
+    }
+}
+
+/// View of a **present** tenant (the core filters out absent ones, DT-20).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArbiterError {
+    LeaseConflict,
+    LeaseExpired,
+    NotOwner,
+}
+
+impl std::fmt::Display for ArbiterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArbiterError::LeaseConflict => write!(
+                f,
+                "Lease conflict: active lease already exists or cannot be satisfied"
+            ),
+            ArbiterError::LeaseExpired => {
+                write!(f, "Lease expired: requested lease exceeded maximum TTL")
+            }
+            ArbiterError::NotOwner => {
+                write!(f, "Not owner: tenant does not own the requested resources")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArbiterError {}
+
+pub struct TenantView {
+    pub id: TenantId,
+    /// Last pressure sample, or `None` when this tenant has never reported
+    /// one. A tenant is not measured idle until it has said so: absence is
+    /// not a reading of zero pressure. Arbitration treats an unmeasured
+    /// tenant as carrying no evidence in either direction — it is never the
+    /// donor a move is licensed from and never the receiver that claims one.
+    pub psi: Option<PsiSample>,
+    pub slices: u16,
+}
+
+/// Action that the core (ITEM-8) applies to the `SliceMap` and the agents.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    /// Slice `Free` → `Active(to)` (round-robin, DT-6).
+    AssignFree { slice: SliceId, to: TenantId },
+    /// Rebalance: moves the slice from `from` to `to` (RF-B2).
+    MoveSlice {
+        slice: SliceId,
+        from: TenantId,
+        to: TenantId,
+    },
+    /// Counterfactual §14 (DT-23): returns the slice from `from` (current) to `to` (original owner).
+    RevertMove {
+        slice: SliceId,
+        from: TenantId,
+        to: TenantId,
+    },
+    /// Revokes an `Active` slice from `from` to satisfy a lease (RF-B3).
+    RevokeForLease { slice: SliceId, from: TenantId },
+    /// Grants the lease when there are enough slices (only once).
+    GrantLease {
+        holder: TenantId,
+        slices: Vec<SliceId>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoveRecord {
+    slice: SliceId,
+    from: TenantId,
+    to: TenantId,
+    at: Instant,
+    /// The donor's measured pressure when the move was taken, or `None` if
+    /// it was never measured. The counterfactual is a licence to revert and
+    /// needs a baseline to compare against: with no measurement there is no
+    /// evidence of worsening, so there is nothing to revert on.
+    from_psi_at_move: Option<f32>,
+}
+
+/// Arbiter with minimal state (hysteresis, last move, round-robin cursor, next lease).
+pub struct Arbiter {
+    cfg: ArbiterConfig,
+    streak: u32,
+    last_move: Option<MoveRecord>,
+    cooldown_until: Option<Instant>,
+    rr_cursor: usize,
+}
+
+/// The measured pressure of `id`, or `None` when there is no measurement.
+///
+/// `None` covers both an absent tenant and a present one that has never
+/// reported. Neither establishes a pressure figure, and neither may be read
+/// as one.
+fn owner_psi(tenants: &[TenantView], id: TenantId) -> Option<f32> {
+    tenants
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.psi)
+        .map(|sample| sample.avg10)
+}
+
+fn first_active_of(slices: &[Slice], owner: TenantId) -> Option<SliceId> {
+    slices
+        .iter()
+        .find(|s| s.state == SliceState::Active && s.tenant == Some(owner))
+        .map(|s| s.id)
+}
+
+fn by_psi(a: f32, b: f32) -> Ordering {
+    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+}
+
+/// Order optional pressure with the unmeasured **last**.
+///
+/// This is the "least pressured first" order used for lease revocation. A
+/// tenant whose pressure was never measured is not established to be least
+/// pressured, so it must not win that place: only measured figures compete,
+/// and an absence is taken from after they are exhausted.
+fn by_psi_unmeasured_last(a: Option<f32>, b: Option<f32>) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => by_psi(x, y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+impl Arbiter {
+    pub fn new(cfg: ArbiterConfig) -> Self {
+        Self {
+            cfg,
+            streak: 0,
+            last_move: None,
+            cooldown_until: None,
+            rr_cursor: 0,
+        }
+    }
+
+    fn cooldown_active(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|u| now < u)
+    }
+
+    /// (most pressured receiver, least pressured donor with ≥1 slice, differential).
+    ///
+    /// Both ends must carry a measurement. A tenant that has never reported
+    /// pressure is not established to be under it, so it cannot claim a slice
+    /// as receiver; and it is not established to be free of it, so it cannot
+    /// be the donor a move is licensed from. Selecting an unmeasured tenant
+    /// as donor would take slices away from a tenant nobody has observed —
+    /// which is what a fabricated `0.0` used to do.
+    fn pressure_pair<'a>(
+        &self,
+        tenants: &'a [TenantView],
+    ) -> Option<(&'a TenantView, &'a TenantView, f32)> {
+        let mut measured: Vec<(f32, &'a TenantView)> = tenants
+            .iter()
+            .filter_map(|t| t.psi.map(|sample| (sample.avg10, t)))
+            .collect();
+        if measured.len() < 2 {
+            return None;
+        }
+        measured.sort_by(|a, b| by_psi(a.0, b.0));
+
+        let (receiver_psi, receiver) = *measured.last()?;
+        let (donor_psi, donor) = measured
+            .iter()
+            .copied()
+            .find(|(_, t)| t.slices >= 1 && t.id != receiver.id)?;
+        Some((receiver, donor, receiver_psi - donor_psi))
+    }
+
+    /// One decision per tick. `now` injected (testable). Contract (DT-20): `tenants` only the
+    /// present ones; `slices` only Free/Leased or of present owner — no Action will target an absent one.
+    pub fn tick(
+        &mut self,
+        now: Instant,
+        tenants: &[TenantView],
+        slices: &[Slice],
+        pending_lease: Option<(TenantId, u64)>,
+    ) -> Result<Vec<Action>, ArbiterError> {
+        let mut actions = Vec::new();
+        let slice_len = slices.first().map_or(0, |s| s.len);
+
+        // (1) Pending LEASE has priority; suppresses rebalancing (2/4) and round-robin (5) — R9.
+        if let Some((holder, bytes)) = pending_lease {
+            if slice_len == 0 || bytes == 0 {
+                return Ok(actions);
+            }
+            let need = bytes.div_ceil(slice_len) as usize;
+            let leased: Vec<SliceId> = slices
+                .iter()
+                .filter(|s| s.state == SliceState::Leased)
+                .map(|s| s.id)
+                .collect();
+
+            if !leased.is_empty()
+                && leased.iter().any(|&s| {
+                    slices.iter().find(|sl| sl.id == s).and_then(|sl| sl.tenant) != Some(holder)
+                })
+            {
+                return Err(ArbiterError::LeaseConflict);
+            }
+
+            let free: Vec<SliceId> = slices
+                .iter()
+                .filter(|s| s.state == SliceState::Free)
+                .map(|s| s.id)
+                .collect();
+            let available = leased.len() + free.len();
+            if available < need {
+                // Revokes Active from the least pressured first (proxy by owner's psi; DT-8: the
+                // lease drains beyond never-zero). `lease` id stable until grant (does not increment).
+                let deficit = need - available;
+                let mut active: Vec<(SliceId, TenantId, Option<f32>)> = slices
+                    .iter()
+                    .filter(|s| s.state == SliceState::Active)
+                    .filter_map(|s| s.tenant.map(|t| (s.id, t, owner_psi(tenants, t))))
+                    .collect();
+                active.sort_by(|a, b| by_psi_unmeasured_last(a.2, b.2).then(a.0.cmp(&b.0)));
+                actions.extend(
+                    active
+                        .into_iter()
+                        .take(deficit)
+                        .map(|(slice, from, _)| Action::RevokeForLease { slice, from }),
+                );
+                return Ok(actions);
+            }
+
+            let grant: Vec<SliceId> = leased
+                .iter()
+                .chain(free.iter())
+                .take(need)
+                .copied()
+                .collect();
+            actions.push(Action::GrantLease {
+                holder,
+                slices: grant,
+            });
+            return Ok(actions);
+        }
+
+        // (2) COUNTERFACTUAL (safety; before cooldown). There is no counterfactual of a revert.
+        let mut moved = false;
+        if let Some(rec) = self.last_move {
+            if now.duration_since(rec.at) > self.cfg.cf_window {
+                self.last_move = None; // window expired
+            } else if let Some(from_now) = owner_psi(tenants, rec.from)
+                && let Some(at_move) = rec.from_psi_at_move
+                && from_now > self.cfg.cf_factor * at_move
+                && from_now > self.cfg.psi_floor
+            {
+                actions.push(Action::RevertMove {
+                    slice: rec.slice,
+                    from: rec.to,
+                    to: rec.from,
+                });
+                self.last_move = None;
+                self.cooldown_until = Some(now + self.cfg.cf_cooldown);
+                self.streak = 0;
+                moved = true;
+            }
+        }
+
+        // Hysteresis: streak counts differential > delta regardless of the movement gate.
+        let pair = self.pressure_pair(tenants);
+        let over = pair.is_some_and(|(_, _, d)| d > self.cfg.delta_psi);
+        if over {
+            self.streak += 1;
+        } else {
+            self.streak = 0;
+        }
+
+        // (3)+(4) DIFFERENTIAL: only if no revert, streak met, no cooldown, and no Free
+        // (Free slices go to round-robin in step 5; moving is for the all-assigned case).
+        let has_free = slices.iter().any(|s| s.state == SliceState::Free);
+
+        let differential_eligible =
+            !moved && self.streak >= self.cfg.streak && !self.cooldown_active(now) && !has_free;
+
+        if differential_eligible && let Some((receiver, donor, _)) = pair {
+            // never-zero (RF-B2/DT-8): does not drain a donor UNDER PRESSURE to zero slices.
+            // A veto on observed pressure: an unmeasured donor does not fire
+            // it, but `pressure_pair` never returns an unmeasured donor in
+            // the first place, so this cannot read absence as safety.
+            let donor_pressured = donor
+                .psi
+                .is_some_and(|sample| sample.avg10 > self.cfg.psi_floor);
+            let can_move = !(donor_pressured && donor.slices <= 1);
+
+            if can_move && let Some(slice) = first_active_of(slices, donor.id) {
+                actions.push(Action::MoveSlice {
+                    slice,
+                    from: donor.id,
+                    to: receiver.id,
+                });
+                self.last_move = Some(MoveRecord {
+                    slice,
+                    from: donor.id,
+                    to: receiver.id,
+                    at: now,
+                    from_psi_at_move: donor.psi.map(|sample| sample.avg10),
+                });
+                self.cooldown_until = Some(now + self.cfg.cooldown);
+                self.streak = 0;
+            }
+        }
+
+        // (5) ROUND-ROBIN of Free slices among the present ones (DT-6).
+        if tenants.is_empty() {
+            return Ok(actions);
+        }
+
+        for s in slices.iter().filter(|s| s.state == SliceState::Free) {
+            let to = tenants[self.rr_cursor % tenants.len()].id;
+            self.rr_cursor = self.rr_cursor.wrapping_add(1);
+            actions.push(Action::AssignFree { slice: s.id, to });
+        }
+
+        Ok(actions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn cfg() -> ArbiterConfig {
+        ArbiterConfig::default()
+    }
+
+    fn tv(id: TenantId, avg10: f32, slices: u16) -> TenantView {
+        TenantView {
+            id,
+            psi: Some(PsiSample {
+                avg10,
+                avg60: avg10,
+                stall_us: 0,
+            }),
+            slices,
+        }
+    }
+
+    /// A tenant that has never reported pressure. Not a measured idle.
+    fn tv_unmeasured(id: TenantId, slices: u16) -> TenantView {
+        TenantView {
+            id,
+            psi: None,
+            slices,
+        }
+    }
+
+    fn slice(id: SliceId, tenant: Option<TenantId>, state: SliceState) -> Slice {
+        Slice {
+            id,
+            offset: u64::from(id) * 64,
+            len: 64,
+            tenant,
+            state,
+        }
+    }
+
+    fn count_moves(a: &[Action]) -> usize {
+        a.iter()
+            .filter(|x| matches!(x, Action::MoveSlice { .. } | Action::RevertMove { .. }))
+            .count()
+    }
+
+    #[test]
+    fn hysteresis_moves_only_after_streak() {
+        let mut c = cfg();
+        c.streak = 3;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        // no Free: s0 of donor(1, psi 0), s1 of receiver(2, psi 20)
+        let tenants = [tv(1, 0.0, 1), tv(2, 20.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &tenants, &slices, None).unwrap()),
+            0
+        ); // streak 1
+        assert_eq!(
+            count_moves(&arb.tick(t0, &tenants, &slices, None).unwrap()),
+            0
+        ); // streak 2
+        let a = arb.tick(t0, &tenants, &slices, None).unwrap(); // streak 3 → move
+        assert_eq!(
+            a.iter()
+                .find(|x| matches!(x, Action::MoveSlice { .. }))
+                .cloned(),
+            Some(Action::MoveSlice {
+                slice: 0,
+                from: 1,
+                to: 2
+            })
+        );
+    }
+
+    #[test]
+    fn cooldown_blocks_second_move() {
+        let mut c = cfg();
+        c.streak = 1;
+        c.cooldown = Duration::from_secs(60);
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        let tenants = [tv(1, 0.0, 1), tv(2, 20.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &tenants, &slices, None).unwrap()),
+            1
+        ); // move
+        // within cooldown: does not move
+        assert_eq!(
+            count_moves(
+                &arb.tick(t0 + Duration::from_secs(2), &tenants, &slices, None)
+                    .unwrap()
+            ),
+            0
+        );
+        // after cooldown: moves again
+        assert_eq!(
+            count_moves(
+                &arb.tick(t0 + Duration::from_secs(61), &tenants, &slices, None)
+                    .unwrap()
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn never_zero_protects_pressured_donor_with_one_slice() {
+        let mut c = cfg();
+        c.streak = 1;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        // donor(1) UNDER PRESSURE (8 > floor 5) with 1 slice; receiver(2) psi 20.
+        let tenants = [tv(1, 8.0, 1), tv(2, 20.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &tenants, &slices, None).unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn counterfactual_reverts_when_drained_tenant_worsens_2x_above_floor() {
+        let mut c = cfg();
+        c.streak = 1;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        // move s0 from A(1, psi 2) to B(2, psi 20)
+        let t_move = [tv(1, 2.0, 1), tv(2, 20.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &t_move, &slices, None).unwrap()),
+            1
+        );
+        // 10s later: A worsens to 6 (>2×2=4 AND >floor 5) → revert
+        let t_after = [tv(1, 6.0, 0), tv(2, 5.0, 2)];
+        let a = arb
+            .tick(t0 + Duration::from_secs(10), &t_after, &slices, None)
+            .unwrap();
+        assert_eq!(
+            a.iter()
+                .find(|x| matches!(x, Action::RevertMove { .. }))
+                .cloned(),
+            Some(Action::RevertMove {
+                slice: 0,
+                from: 2,
+                to: 1
+            })
+        );
+    }
+
+    #[test]
+    fn counterfactual_does_not_revert_for_noise_below_floor() {
+        // DT-23: worsens 2× but below psi_floor is not real pressure → does not revert.
+        let mut c = cfg();
+        c.streak = 1;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        let t_move = [tv(1, 2.0, 1), tv(2, 20.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &t_move, &slices, None).unwrap()),
+            1
+        );
+        // A goes to 4.5: >2×2=4, but <floor 5 → does NOT revert
+        let t_after = [tv(1, 4.5, 0), tv(2, 5.0, 2)];
+        let a = arb
+            .tick(t0 + Duration::from_secs(10), &t_after, &slices, None)
+            .unwrap();
+        assert_eq!(count_moves(&a), 0);
+    }
+
+    #[test]
+    fn lease_revokes_beyond_never_zero() {
+        // DT-8: lease request drains Active even leaving tenant at zero.
+        let mut arb = Arbiter::new(cfg());
+        let t0 = Instant::now();
+        // both pressured (never-zero would protect in rebalancing, but lease ignores it).
+        let tenants = [tv(1, 9.0, 1), tv(9, 9.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        let a = arb.tick(t0, &tenants, &slices, Some((9, 64))).unwrap(); // need=1
+        assert_eq!(
+            a.iter()
+                .filter(|x| matches!(x, Action::RevokeForLease { .. }))
+                .count(),
+            1
+        );
+        assert!(!a.iter().any(|x| matches!(x, Action::AssignFree { .. }))); // round-robin suppressed
+    }
+
+    #[test]
+    fn lease_grants_free_slice_without_round_robin() {
+        // R2: Free slice is granted to the lease, not round-robinned.
+        let mut arb = Arbiter::new(cfg());
+        let t0 = Instant::now();
+        let tenants = [tv(1, 0.0, 0), tv(9, 0.0, 0)];
+        let slices = [slice(0, None, SliceState::Free)];
+        let a = arb.tick(t0, &tenants, &slices, Some((9, 64))).unwrap(); // need=1, 1 Free
+        assert_eq!(
+            a.iter()
+                .find(|x| matches!(x, Action::GrantLease { .. }))
+                .cloned(),
+            Some(Action::GrantLease {
+                holder: 9,
+                slices: vec![0]
+            })
+        );
+        assert!(!a.iter().any(|x| matches!(x, Action::AssignFree { .. })));
+    }
+
+    #[test]
+    fn lease_holds_free_slice_while_revoking_to_complete() {
+        // need=2, 1 Free + 1 Active → revokes 1, does NOT grant yet, does NOT round-robin the Free (R2).
+        let mut arb = Arbiter::new(cfg());
+        let t0 = Instant::now();
+        let tenants = [tv(1, 1.0, 1), tv(9, 0.0, 0)];
+        let slices = [
+            slice(0, None, SliceState::Free),
+            slice(1, Some(1), SliceState::Active),
+        ];
+        let a = arb.tick(t0, &tenants, &slices, Some((9, 128))).unwrap(); // need=2
+        assert_eq!(
+            a.iter()
+                .filter(|x| matches!(x, Action::RevokeForLease { .. }))
+                .count(),
+            1
+        );
+        assert!(!a.iter().any(|x| matches!(x, Action::GrantLease { .. })));
+        assert!(!a.iter().any(|x| matches!(x, Action::AssignFree { .. })));
+    }
+
+    #[test]
+    fn round_robin_distributes_free_slices_among_present_tenants() {
+        let mut arb = Arbiter::new(cfg());
+        let t0 = Instant::now();
+        let tenants = [tv(1, 0.0, 0), tv(9, 0.0, 0)];
+        let slices = [
+            slice(0, None, SliceState::Free),
+            slice(1, None, SliceState::Free),
+        ];
+        let a = arb.tick(t0, &tenants, &slices, None).unwrap();
+        let assigns: Vec<&Action> = a
+            .iter()
+            .filter(|x| matches!(x, Action::AssignFree { .. }))
+            .collect();
+        assert_eq!(assigns.len(), 2);
+        // round-robin: s0→t1, s1→t2 (cursor advances)
+        assert_eq!(assigns[0], &Action::AssignFree { slice: 0, to: 1 });
+        assert_eq!(assigns[1], &Action::AssignFree { slice: 1, to: 9 });
+    }
+
+    #[test]
+    fn lease_returns_empty_actions_when_slice_len_is_zero_or_need_is_zero() {
+        let mut arb = Arbiter::new(cfg());
+        let t0 = Instant::now();
+        let tenants = [tv(9, 0.0, 0)];
+        let slices = [Slice {
+            id: 0,
+            offset: 0,
+            len: 0,
+            tenant: None,
+            state: SliceState::Free,
+        }];
+        let a = arb.tick(t0, &tenants, &slices, Some((9, 64))).unwrap();
+        assert!(a.is_empty());
+
+        let slices2 = [slice(0, None, SliceState::Free)];
+        let a2 = arb.tick(t0, &tenants, &slices2, Some((9, 0))).unwrap();
+        assert!(a2.is_empty());
+    }
+
+    #[test]
+    fn no_differential_does_not_move() {
+        let mut c = cfg();
+        c.streak = 1;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        // differential 2 < delta 10
+        let tenants = [tv(1, 1.0, 1), tv(2, 3.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &tenants, &slices, None).unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn a_never_measured_tenant_is_neither_donor_nor_receiver() {
+        // A tenant that has never reported pressure is not established to be
+        // free of it, so it cannot be the donor a move is licensed from, and
+        // not established to be under it, so it cannot claim a slice as
+        // receiver. The fold this replaces seeded `PsiSample::default()`,
+        // whose avg10 of 0.0 made an unmeasured tenant the preferred donor
+        // and put it first in the revoke order.
+        let mut c = cfg();
+        c.streak = 1;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+
+        // Tenant 3 has never reported. It holds a slice and sits at what a
+        // fabricated 0.0 would call "least pressured".
+        let tenants = [tv(1, 2.0, 1), tv(2, 20.0, 1), tv_unmeasured(3, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+            slice(2, Some(3), SliceState::Active),
+        ];
+        let actions = arb.tick(t0, &tenants, &slices, None).unwrap();
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::MoveSlice { from: 3, .. })),
+            "an unmeasured tenant must not be the donor: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::MoveSlice { to: 3, .. })),
+            "an unmeasured tenant must not be the receiver: {actions:?}"
+        );
+        // The measured pair is untouched and still differential: the move is
+        // taken from the measured donor instead.
+        assert_eq!(
+            actions
+                .iter()
+                .find(|a| matches!(a, Action::MoveSlice { .. }))
+                .cloned(),
+            Some(Action::MoveSlice {
+                slice: 0,
+                from: 1,
+                to: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_differential_needs_two_measured_tenants() {
+        // One measurement and one absence is not a measured differential.
+        let mut c = cfg();
+        c.streak = 1;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        let tenants = [tv(1, 0.0, 1), tv_unmeasured(2, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &tenants, &slices, None).unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn lease_revocation_takes_the_unmeasured_last() {
+        // Revocation order is "least pressured first". A tenant whose
+        // pressure was never measured is not established to be least
+        // pressured, so it is taken from after every measured figure.
+        let mut arb = Arbiter::new(cfg());
+        let t0 = Instant::now();
+        let tenants = [tv(1, 1.0, 1), tv_unmeasured(2, 1), tv(3, 9.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+            slice(2, Some(3), SliceState::Active),
+        ];
+        // need=2 forces two revocations; both must come from measured tenants.
+        let a = arb.tick(t0, &tenants, &slices, Some((9, 128))).unwrap();
+        let revoked_from: Vec<TenantId> = a
+            .iter()
+            .filter_map(|x| match x {
+                Action::RevokeForLease { from, .. } => Some(*from),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(revoked_from.len(), 2, "need=2 revokes two: {a:?}");
+        assert!(
+            !revoked_from.contains(&2),
+            "the unmeasured tenant must not be revoked first: {revoked_from:?}"
+        );
+    }
+
+    #[test]
+    fn the_counterfactual_does_not_revert_on_an_unmeasured_now() {
+        // Reverting is a licence to undo a move, and it needs evidence of
+        // worsening. An unreadable pressure sample is not that evidence: it
+        // is no reading at all.
+        let mut c = cfg();
+        c.streak = 1;
+        let mut arb = Arbiter::new(c);
+        let t0 = Instant::now();
+        let t_move = [tv(1, 2.0, 1), tv(2, 20.0, 1)];
+        let slices = [
+            slice(0, Some(1), SliceState::Active),
+            slice(1, Some(2), SliceState::Active),
+        ];
+        assert_eq!(
+            count_moves(&arb.tick(t0, &t_move, &slices, None).unwrap()),
+            1
+        );
+        // The drained tenant stops reporting. That is not a 2x worsening.
+        let t_after = [tv_unmeasured(1, 0), tv(2, 5.0, 2)];
+        let a = arb
+            .tick(t0 + Duration::from_secs(10), &t_after, &slices, None)
+            .unwrap();
+        assert_eq!(
+            a.iter()
+                .filter(|x| matches!(x, Action::RevertMove { .. }))
+                .count(),
+            0,
+            "absence must not license a revert: {a:?}"
+        );
+    }
+}

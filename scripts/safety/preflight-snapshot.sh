@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/preflight-snapshot.sh
+# preflight-snapshot.sh — Baseline "known good state" BEFORE a risky daemon start
+# (VRAM/ublk on live host). Saves to durable Windows storage so that,
+# if the machine freezes, we can diff against the last good state — and ARMS the
+# postmortem collector (creates the .armed marker) so that the next boot knows we did
+# something risky and collects forensics even if no kernel BUG is captured (the case of
+# crash #2, which left almost no trace).
+#
+# Uso: preflight-snapshot.sh ["cmdline exata que vai rodar"]
+# So LE estado + escreve arquivo. Nao toca GPU/ublk/swap. Seguro.
+set -uo pipefail
+NVSMI="$(command -v nvidia-smi 2>/dev/null || true)"; [ -x "$NVSMI" ] || NVSMI="/usr/lib/wsl/lib/nvidia-smi"
+
+FORENSICS_DIR="${RAMSHARED_FORENSICS_DIR:-/mnt/c/wsl-forensics}"
+REPO="${RAMSHARED_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
+CMDLINE_ABOUT_TO_RUN="${1:-<nao informado>}"
+
+mkdir -p "$FORENSICS_DIR" 2>/dev/null || { FORENSICS_DIR="$HOME/wsl-forensics"; mkdir -p "$FORENSICS_DIR"; }
+
+TS="$(date +%Y%m%d-%H%M%S)"
+SNAP="$FORENSICS_DIR/snapshot-${TS}.md"
+
+{
+  echo "# RamShared preflight snapshot — $(date '+%Y-%m-%d %H:%M:%S %z')"
+  echo
+  echo "**Cmdline prestes a rodar:** \`${CMDLINE_ABOUT_TO_RUN}\`"
+  echo
+  echo "## Kernel / plataforma"
+  echo '```'
+  echo "uname: $(uname -r)"
+  echo "cmdline: $(cat /proc/cmdline 2>/dev/null)"
+  echo "uptime: $(uptime -p 2>/dev/null) (desde $(uptime -s 2>/dev/null))"
+  echo '```'
+  echo "## Git (o binario testado deve casar com este commit)"
+  echo '```'
+  git -C "$REPO" log --oneline -1 2>/dev/null || echo "(sem git)"
+  echo "dirty: $(git -C "$REPO" status --porcelain 2>/dev/null | wc -l) arquivo(s) modificado(s)"
+  echo '```'
+  echo "## GPU (nvidia-smi)"
+  echo '```'
+  "$NVSMI" --query-gpu=name,memory.used,memory.free,memory.total --format=csv 2>&1 || echo "(nvidia-smi indisponivel)"
+  echo '```'
+  echo "## Memoria / swap"
+  echo '```'
+  free -h 2>&1
+  echo "---"; cat /proc/swaps 2>&1
+  echo "---"; grep -E "^(MemFree|MemAvailable|SwapFree|SwapTotal):" /proc/meminfo 2>&1
+  echo '```'
+  echo "## ublk / device"
+  echo '```'
+  ls -la /dev/ublk* 2>&1 || echo "(sem /dev/ublk*)"
+  echo '```'
+  echo "## .wslconfig (qual kernel/limites o WSL2 vai usar)"
+  echo '```'
+  cat /mnt/c/Users/*/.wslconfig 2>/dev/null || echo "(nao encontrado)"
+  echo '```'
+  echo "## dmesg (baseline, ultimas 15)"
+  echo '```'
+  (sudo -n dmesg 2>/dev/null || dmesg 2>/dev/null || echo "(dmesg precisa de root)") | tail -15
+  echo '```'
+} > "$SNAP" 2>&1
+
+# ARMS the postmortem collector: if the boot ends after this without a clean teardown,
+# postmortem --auto will collect even without a kernel BUG (covers crash #2 case).
+touch "$FORENSICS_DIR/.armed" 2>/dev/null
+
+echo "preflight-snapshot: baseline em $SNAP"
+echo "preflight-snapshot: coletor ARMADO (.armed criado em $FORENSICS_DIR)"

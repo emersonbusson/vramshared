@@ -1,0 +1,427 @@
+// Author: Emerson Busson
+// Email: emersonbusson@gmail.com
+// GitHub: https://github.com/emersonbusson
+// LinkedIn: https://www.linkedin.com/in/emersonbusson
+// Source: https://github.com/emersonbusson/vramshared
+// File: crates/ramshared-wsl2d/src/residency.rs
+//! Canary-based detection of WDDM eviction (SPEC §9). **Pure decision**: fed
+//! with samples (latency / integrity / free), decides DEMOTE based on triggers from
+//! §9.3. Real CUDA sampling and tier `swapoff` live in the daemon loop —
+//! here lies only the logic (testable without GPU/root), similar to `ramshared-tier`.
+
+/// Trigger parameters (§9.3). Calibration (DT-31): WDDM eviction spikes ~330× baseline
+/// (Phase 0), BUT serve latency under heavy LOAD reaches ~17× (measured on e2e cross-host
+/// multi-tenant). `8×` gave false positives and dropped the swap under the very load it was supposed to support.
+/// `64×` has margins on both sides (>>17× load, <<330× eviction); the **content probe
+/// §9.4** is the AUTHORITATIVE eviction detector (latency is just a fast, coarse hint).
+#[derive(Clone, Copy, Debug)]
+pub struct ResidencyConfig {
+    /// (a) latency > `latency_mult` × baseline.
+    pub latency_mult: u64,
+    /// ...for `consecutive` consecutive samples.
+    pub consecutive: u32,
+    /// (c) `cuMemGetInfo` free below this floor → host reclaiming VRAM.
+    pub free_floor_bytes: u64,
+}
+
+impl Default for ResidencyConfig {
+    fn default() -> Self {
+        Self {
+            latency_mult: 64, // DT-31: 8× gave false positives under load (~17×); 64× < eviction (330×)
+            consecutive: 3,
+            // DT-3: "GPU critically full" floor. Conservative and tunable; with the
+            // hysteresis of `ResidencySampler` (DT-9) the risk of false positives drops.
+            free_floor_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl ResidencyConfig {
+    pub fn validate_limits(
+        &self,
+        system_total_bytes: u64,
+        cgroup_max_bytes: Option<u64>,
+    ) -> std::io::Result<()> {
+        let max_limit = cgroup_max_bytes.unwrap_or(u64::MAX).min(system_total_bytes);
+
+        if self.free_floor_bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "free_floor_bytes cannot be zero",
+            ));
+        }
+
+        if self.free_floor_bytes > max_limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "free_floor_bytes ({}) exceeds physical memory limit ({})",
+                    self.free_floor_bytes, max_limit
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DemoteReason {
+    Latency,
+    Corruption,
+    FreeFloor,
+    GpuLost,
+    IoErrorBurst,
+}
+
+impl DemoteReason {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Latency => "Latency",
+            Self::Corruption => "Corruption",
+            Self::FreeFloor => "FreeFloor",
+            Self::GpuLost => "GpuLost",
+            Self::IoErrorBurst => "IoErrorBurst",
+        }
+    }
+}
+
+impl std::fmt::Display for DemoteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Verdict {
+    Ok,
+    Demote(DemoteReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyError {
+    ProcfsMissing,
+    MalformedMetric,
+}
+
+impl std::fmt::Display for ResidencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcfsMissing => write!(f, "procfs missing (-ENOENT)"),
+            Self::MalformedMetric => write!(f, "malformed metric (-EINVAL)"),
+        }
+    }
+}
+
+impl std::error::Error for ResidencyError {}
+
+pub fn parse_cgroup_metric(content: Option<&str>) -> Result<u64, ResidencyError> {
+    let s = content.ok_or(ResidencyError::ProcfsMissing)?;
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| ResidencyError::MalformedMetric)
+}
+
+/// Canary state: baseline (median right after `VramAllocated`) + streak of
+/// consecutive samples above the latency threshold.
+pub struct Canary {
+    cfg: ResidencyConfig,
+    baseline_us: u64,
+    over_count: u32,
+}
+
+impl Canary {
+    pub fn new(cfg: ResidencyConfig, baseline_us: u64) -> Self {
+        Self {
+            cfg,
+            baseline_us,
+            over_count: 0,
+        }
+    }
+
+    /// Feeds a sample. `content_ok=false` = corrupted canary (b);
+    /// `free_bytes` = free `cuMemGetInfo` (c); `latency_us` = round-trip of
+    /// the canary (a). SPEC §9.3.
+    pub fn sample(&mut self, latency_us: u64, content_ok: bool, free_bytes: u64) -> Verdict {
+        if !content_ok {
+            return Verdict::Demote(DemoteReason::Corruption);
+        }
+        if free_bytes < self.cfg.free_floor_bytes {
+            return Verdict::Demote(DemoteReason::FreeFloor);
+        }
+        let threshold = self.baseline_us.saturating_mul(self.cfg.latency_mult);
+        if latency_us > threshold {
+            self.over_count += 1;
+            if self.over_count >= self.cfg.consecutive {
+                return Verdict::Demote(DemoteReason::Latency);
+            }
+        } else {
+            self.over_count = 0; // a good sample resets the streak (anti-false-positive)
+        }
+        Verdict::Ok
+    }
+
+    pub fn over_count(&self) -> u32 {
+        self.over_count
+    }
+}
+
+/// Sampler of the dedicated probe (§9.4) with hysteresis. Different from [`Canary`]
+/// (per-request latency), this receives content + free and decides:
+/// - confirmed corruption (`content = Some(false)`) ⇒ **immediate** DEMOTE (rare,
+///   unequivocal; DT-9);
+/// - free below floor **OR** degraded sample (probe/`mem_info` error) ⇒
+///   increments `bad_streak`; only demotes on `bad_streak >= consecutive` (DT-9/DT-11);
+/// - good sample resets the streak.
+///
+pub struct ResidencySampler {
+    cfg: ResidencyConfig,
+    bad_streak: u32,
+}
+
+impl ResidencySampler {
+    pub fn new(cfg: ResidencyConfig) -> Self {
+        Self { cfg, bad_streak: 0 }
+    }
+
+    /// Feeds a probe sample in cadence.
+    /// - `content`: `Some(true)` = ok, `Some(false)` = corruption (immediate),
+    ///   `None` = probe error (degraded, DT-11).
+    /// - `free`: `Some(bytes)` or `None` (mem_info error, degraded, DT-11).
+    pub fn sample(&mut self, content: Option<bool>, free: Option<u64>) -> Verdict {
+        // Corruption is the only immediate trigger: rare and unambiguous.
+        if content == Some(false) {
+            return Verdict::Demote(DemoteReason::Corruption);
+        }
+        // Weak/transient signal: low free, probe error, or mem_info error.
+        let degraded = content.is_none()
+            || free.is_none()
+            || free.is_some_and(|f| f < self.cfg.free_floor_bytes);
+        if degraded {
+            self.bad_streak += 1;
+            if self.bad_streak >= self.cfg.consecutive {
+                return Verdict::Demote(DemoteReason::FreeFloor);
+            }
+        } else {
+            self.bad_streak = 0; // good sample resets the streak (anti-false-positive)
+        }
+        Verdict::Ok
+    }
+
+    pub fn bad_streak(&self) -> u32 {
+        self.bad_streak
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn validate_limits_rejects_zero() {
+        let cfg = ResidencyConfig {
+            free_floor_bytes: 0,
+            ..Default::default()
+        };
+        assert!(
+            matches!(cfg.validate_limits(1024, None), Err(err) if err.kind() == std::io::ErrorKind::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn validate_limits_rejects_exceeding_bounds() {
+        let cfg = ResidencyConfig {
+            free_floor_bytes: 2048,
+            ..Default::default()
+        };
+        // Exceeds system total
+        assert!(
+            matches!(cfg.validate_limits(1024, None), Err(err) if err.kind() == std::io::ErrorKind::InvalidInput)
+        );
+
+        // Exceeds cgroup max
+        assert!(
+            matches!(cfg.validate_limits(4096, Some(1024)), Err(err) if err.kind() == std::io::ErrorKind::InvalidInput)
+        );
+    }
+
+    use super::*;
+
+    fn canary() -> Canary {
+        Canary::new(ResidencyConfig::default(), 4000) // baseline 4 ms → threshold 256 ms (64×, DT-31)
+    }
+
+    #[test]
+    fn latency_demote_needs_consecutive() {
+        let mut c = canary();
+        // the spike measured in Phase 0 (1.18 s) is far above the threshold
+        assert_eq!(c.sample(1_183_094, true, u64::MAX), Verdict::Ok); // 1
+        assert_eq!(c.sample(1_183_094, true, u64::MAX), Verdict::Ok); // 2
+        assert_eq!(
+            c.sample(1_183_094, true, u64::MAX),
+            Verdict::Demote(DemoteReason::Latency)
+        ); // 3 consecutive
+    }
+
+    #[test]
+    fn good_sample_resets_streak() {
+        let mut c = canary();
+        c.sample(500_000, true, u64::MAX); // over the 256 ms threshold (1)
+        c.sample(500_000, true, u64::MAX); // over (2)
+        assert_eq!(c.sample(3000, true, u64::MAX), Verdict::Ok); // good → resets
+        assert_eq!(c.over_count(), 0);
+        assert_eq!(c.sample(500_000, true, u64::MAX), Verdict::Ok); // restarts from 1
+    }
+
+    #[test]
+    fn load_spike_below_threshold_stays_ok() {
+        // Regression DT-31: LOAD spike ~17× baseline (not eviction) must NOT demote.
+        // With 8× this triggered and dropped the swap under load (e2e multi-tenant bug); with 64×, it remains Ok.
+        let mut c = canary(); // baseline 4 ms → limiar 256 ms
+        for _ in 0..10 {
+            assert_eq!(c.sample(4000 * 17, true, u64::MAX), Verdict::Ok); // 68 ms = 17× < 256 ms
+        }
+    }
+
+    #[test]
+    fn corruption_demotes_immediately() {
+        let mut c = canary();
+        assert_eq!(
+            c.sample(1000, false, u64::MAX),
+            Verdict::Demote(DemoteReason::Corruption)
+        );
+    }
+
+    #[test]
+    fn free_floor_demotes() {
+        let cfg = ResidencyConfig {
+            free_floor_bytes: 1 << 30,
+            ..Default::default()
+        };
+        let mut c = Canary::new(cfg, 4000);
+        assert_eq!(
+            c.sample(1000, true, 256 * 1024 * 1024),
+            Verdict::Demote(DemoteReason::FreeFloor)
+        );
+    }
+
+    #[test]
+    fn normal_latency_stays_ok() {
+        let mut c = canary();
+        for _ in 0..100 {
+            assert_eq!(c.sample(3500, true, u64::MAX), Verdict::Ok);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+
+    fn sampler() -> ResidencySampler {
+        // default: consecutive=3, free_floor_bytes=64 MiB (DT-3).
+        ResidencySampler::new(ResidencyConfig::default())
+    }
+
+    // Invariant: corruption returns wrong data
+    // despite "data-safe" → guard that demotes immediately, without streak.
+    #[test]
+    fn corruption_is_immediate() {
+        let mut s = sampler();
+        assert_eq!(
+            s.sample(Some(false), Some(u64::MAX)),
+            Verdict::Demote(DemoteReason::Corruption)
+        );
+        assert_eq!(s.bad_streak(), 0); // corruption does not pass through streak
+    }
+
+    // Invariant: 1 low free reading is noise; only
+    // `consecutive` low readings configure GPU-wide pressure (DT-10).
+    #[test]
+    fn free_floor_needs_consecutive() {
+        let mut s = sampler();
+        let low = Some(8 * 1024 * 1024); // below the 64 MiB floor
+        assert_eq!(s.sample(Some(true), low), Verdict::Ok); // 1
+        assert_eq!(s.sample(Some(true), low), Verdict::Ok); // 2
+        assert_eq!(
+            s.sample(Some(true), low),
+            Verdict::Demote(DemoteReason::FreeFloor)
+        ); // 3 consecutive
+    }
+
+    // Invariant: an isolated CUDA/`mem_info` error is not
+    // loss of residency (DT-11) — counts towards the streak, does not demote alone.
+    #[test]
+    fn transient_error_needs_consecutive() {
+        let mut s = sampler();
+        assert_eq!(s.sample(None, Some(u64::MAX)), Verdict::Ok); // 1 (probe error)
+        assert_eq!(s.sample(Some(true), None), Verdict::Ok); // 2 (mem_info error)
+        assert_eq!(
+            s.sample(None, None),
+            Verdict::Demote(DemoteReason::FreeFloor)
+        ); // 3 degraded
+    }
+
+    #[test]
+    fn good_sample_resets_streak() {
+        let mut s = sampler();
+        let low = Some(8 * 1024 * 1024);
+        s.sample(Some(true), low); // degraded (1)
+        s.sample(Some(true), low); // degraded (2)
+        assert_eq!(s.bad_streak(), 2);
+        assert_eq!(s.sample(Some(true), Some(u64::MAX)), Verdict::Ok); // good → resets
+        assert_eq!(s.bad_streak(), 0);
+        // restarts from 1: 2 degraded are not enough to demote
+        assert_eq!(s.sample(Some(true), low), Verdict::Ok); // 1
+        assert_eq!(s.sample(Some(true), low), Verdict::Ok); // 2
+        assert_eq!(s.bad_streak(), 2);
+    }
+
+    #[test]
+    fn parse_cgroup_metric_missing() {
+        assert_eq!(
+            parse_cgroup_metric(None),
+            Err(ResidencyError::ProcfsMissing)
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_metric_malformed() {
+        assert_eq!(
+            parse_cgroup_metric(Some("")),
+            Err(ResidencyError::MalformedMetric)
+        );
+        assert_eq!(
+            parse_cgroup_metric(Some("abc")),
+            Err(ResidencyError::MalformedMetric)
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_metric_valid() {
+        assert_eq!(parse_cgroup_metric(Some("1234")), Ok(1234));
+    }
+
+    #[test]
+    fn residency_error_display() {
+        assert_eq!(
+            ResidencyError::ProcfsMissing.to_string(),
+            "procfs missing (-ENOENT)"
+        );
+        assert_eq!(
+            ResidencyError::MalformedMetric.to_string(),
+            "malformed metric (-EINVAL)"
+        );
+    }
+
+    #[test]
+    fn demote_reason_display_and_as_str() {
+        assert_eq!(DemoteReason::Latency.as_str(), "Latency");
+        assert_eq!(DemoteReason::Corruption.as_str(), "Corruption");
+        assert_eq!(DemoteReason::FreeFloor.as_str(), "FreeFloor");
+        assert_eq!(DemoteReason::GpuLost.as_str(), "GpuLost");
+        assert_eq!(DemoteReason::IoErrorBurst.as_str(), "IoErrorBurst");
+
+        assert_eq!(DemoteReason::GpuLost.to_string(), "GpuLost");
+        assert_eq!(DemoteReason::IoErrorBurst.to_string(), "IoErrorBurst");
+    }
+}

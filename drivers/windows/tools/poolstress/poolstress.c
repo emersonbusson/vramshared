@@ -1,0 +1,209 @@
+// Author: Emerson Busson
+// Email: emersonbusson@gmail.com
+// GitHub: https://github.com/emersonbusson
+// LinkedIn: https://www.linkedin.com/in/emersonbusson
+// Source: https://github.com/emersonbusson/vramshared
+// File: drivers/windows/tools/poolstress/poolstress.c
+/* SPDX-License-Identifier: MIT */
+/*
+ * poolstress.sys — VM-only test driver for kernel-page residency drills.
+ * SPEC ITEM-8 / DT-11 / DT-21. NEVER ship on host (RNF-6).
+ *
+ * IOCTLs:
+ *   ALLOC(n_gb)  — ExAllocatePool2(POOL_FLAG_PAGED) + BCryptGenRandom + touch
+ *   READBACK     — read all pages (force page-in)
+ *   FREE         — free pool
+ */
+#include <ntddk.h>
+#include <bcrypt.h>
+
+#define POOLSTRESS_DEVICE_NAME L"\\Device\\RamSharedPoolStress"
+#define POOLSTRESS_LINK_NAME   L"\\DosDevices\\RamSharedPoolStress"
+
+#define IOCTL_POOLSTRESS_ALLOC \
+	CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_POOLSTRESS_READBACK \
+	CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_POOLSTRESS_FREE \
+	CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _POOLSTRESS_ALLOC_IN {
+	ULONG NGb;
+} POOLSTRESS_ALLOC_IN;
+
+static PDEVICE_OBJECT g_Device = NULL;
+static PVOID g_Pool = NULL;
+static SIZE_T g_PoolSize = 0;
+static FAST_MUTEX g_Mutex;
+
+static VOID
+PoolstressFill(_Inout_updates_bytes_(bytes) PUCHAR pool, SIZE_T bytes)
+{
+	SIZE_T offset = 0;
+
+	if (pool == NULL || bytes == 0)
+		return;
+	while (offset < bytes) {
+		ULONG i;
+		ULONG chunk = (ULONG)min(bytes - offset, (SIZE_T)(16 * 1024 * 1024));
+		NTSTATUS status;
+
+		if ((SIZE_T)chunk > bytes - offset)
+			return;
+#pragma warning(suppress:6386) /* offset + chunk is bounded above */
+		status = BCryptGenRandom(NULL, pool + offset, chunk,
+					BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+		if (!NT_SUCCESS(status)) {
+			for (i = 0; i < chunk; i++) {
+#pragma warning(suppress:6386) /* i < chunk <= bytes - offset */
+				pool[offset + i] = (UCHAR)((offset + i) * 131u);
+			}
+		}
+		offset += chunk;
+	}
+}
+
+_Function_class_(DRIVER_DISPATCH)
+static NTSTATUS
+PoolstressDispatch(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+	PIO_STACK_LOCATION irpSp;
+	NTSTATUS status = STATUS_SUCCESS;
+	ULONG_PTR info = 0;
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+	irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+	if (irpSp->MajorFunction == IRP_MJ_CREATE || irpSp->MajorFunction == IRP_MJ_CLOSE) {
+		goto complete;
+	}
+
+	if (irpSp->MajorFunction != IRP_MJ_DEVICE_CONTROL) {
+		status = STATUS_INVALID_DEVICE_REQUEST;
+		goto complete;
+	}
+
+	ExAcquireFastMutex(&g_Mutex);
+
+	{
+		ULONG code = irpSp->Parameters.DeviceIoControl.IoControlCode;
+		PVOID buf = Irp->AssociatedIrp.SystemBuffer;
+		ULONG inLen = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+
+		if (code == IOCTL_POOLSTRESS_ALLOC) {
+			POOLSTRESS_ALLOC_IN *in;
+			SIZE_T bytes;
+			SIZE_T i;
+
+			if (inLen < sizeof(POOLSTRESS_ALLOC_IN) || buf == NULL) {
+				status = STATUS_INVALID_PARAMETER;
+				goto out_unlock;
+			}
+			if (g_Pool != NULL) {
+				status = STATUS_DEVICE_BUSY;
+				goto out_unlock;
+			}
+			in = (POOLSTRESS_ALLOC_IN *)buf;
+			if (in->NGb == 0 || in->NGb > 16) {
+				status = STATUS_INVALID_PARAMETER;
+				goto out_unlock;
+			}
+			bytes = (SIZE_T)in->NGb << 30;
+			g_Pool = ExAllocatePool2(POOL_FLAG_PAGED, bytes, 'ssPR');
+			if (!g_Pool) {
+				DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "Poolstress: STATUS_NO_MEMORY - Exhausted allocating %Iu bytes (%lu GB)\n", bytes, in->NGb);
+				status = STATUS_NO_MEMORY;
+				goto out_unlock;
+			}
+			g_PoolSize = bytes;
+			/* Fill every byte in bounded BCrypt calls (DT-21). */
+			PoolstressFill((PUCHAR)g_Pool, bytes);
+			/* Touch every page so pages are resident then pageable. */
+			for (i = 0; i < bytes / PAGE_SIZE; i++) {
+				volatile UCHAR *p = (PUCHAR)g_Pool + i * PAGE_SIZE;
+				*p = *p;
+			}
+		} else if (code == IOCTL_POOLSTRESS_READBACK) {
+			SIZE_T i;
+			volatile UCHAR sum = 0;
+
+			if (!g_Pool) {
+				status = STATUS_INVALID_DEVICE_STATE;
+				goto out_unlock;
+			}
+			for (i = 0; i < g_PoolSize; i += PAGE_SIZE) {
+				sum ^= *((PUCHAR)g_Pool + i);
+			}
+			info = sum;
+		} else if (code == IOCTL_POOLSTRESS_FREE) {
+			if (g_Pool) {
+				ExFreePoolWithTag(g_Pool, 'ssPR');
+				g_Pool = NULL;
+				g_PoolSize = 0;
+			}
+		} else {
+			status = STATUS_INVALID_DEVICE_REQUEST;
+		}
+	}
+
+out_unlock:
+	ExReleaseFastMutex(&g_Mutex);
+
+complete:
+	Irp->IoStatus.Status = status;
+	Irp->IoStatus.Information = info;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return status;
+}
+
+_Function_class_(DRIVER_UNLOAD)
+static VOID
+PoolstressUnload(_In_ PDRIVER_OBJECT DriverObject)
+{
+	UNICODE_STRING link;
+
+	UNREFERENCED_PARAMETER(DriverObject);
+	if (g_Pool) {
+		ExFreePoolWithTag(g_Pool, 'ssPR');
+		g_Pool = NULL;
+		g_PoolSize = 0;
+	}
+	RtlInitUnicodeString(&link, POOLSTRESS_LINK_NAME);
+	IoDeleteSymbolicLink(&link);
+	if (g_Device) {
+		IoDeleteDevice(g_Device);
+		g_Device = NULL;
+	}
+}
+
+NTSTATUS
+DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
+{
+	UNICODE_STRING name, link;
+	NTSTATUS status;
+
+	UNREFERENCED_PARAMETER(RegistryPath);
+	RtlInitUnicodeString(&name, POOLSTRESS_DEVICE_NAME);
+	RtlInitUnicodeString(&link, POOLSTRESS_LINK_NAME);
+
+	ExInitializeFastMutex(&g_Mutex);
+
+	status = IoCreateDevice(DriverObject, 0, &name, FILE_DEVICE_UNKNOWN,
+				FILE_DEVICE_SECURE_OPEN, FALSE, &g_Device);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = IoCreateSymbolicLink(&link, &name);
+	if (!NT_SUCCESS(status)) {
+		IoDeleteDevice(g_Device);
+		g_Device = NULL;
+		return status;
+	}
+
+	DriverObject->MajorFunction[IRP_MJ_CREATE] = PoolstressDispatch;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE] = PoolstressDispatch;
+	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = PoolstressDispatch;
+	DriverObject->DriverUnload = PoolstressUnload;
+	g_Device->Flags &= ~DO_DEVICE_INITIALIZING;
+	return STATUS_SUCCESS;
+}

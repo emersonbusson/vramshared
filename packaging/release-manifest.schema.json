@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/emersonbusson/vramshared/packaging/release-manifest.schema.json",
+  "title": "RamShared release manifest",
+  "description": "Machine-readable declaration of one built RamShared release. A single versioned release manifest feeds every package builder (customer-installation DT-8); packaging differences must not become runtime behavior differences. The authoring source of the member table is scripts/package/package-payload-manifest.sh; this schema is the document contract that table's emission must satisfy. Semantic validation of a concrete document lives in customer/package.rs, not here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "product",
+    "architecture",
+    "source",
+    "build",
+    "contents",
+    "dependencies",
+    "units",
+    "configuration"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "ramshared-release-manifest/v1",
+      "description": "Strict document version. A consumer that does not recognise the value must refuse rather than guess."
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "ramshared" },
+        "version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+          "description": "Product version label. The builder refuses anything outside this alphabet before staging."
+        }
+      }
+    },
+    "architecture": {
+      "type": "string",
+      "enum": ["amd64", "arm64"],
+      "description": "Supported architecture. The payload's ELF e_machine must match this label before anything is executed."
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "branch", "tree_state"],
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Full 40-hex source commit. A short or absent commit is not an identity."
+        },
+        "branch": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._/-]{1,200}$"
+        },
+        "tree_state": {
+          "type": "string",
+          "enum": ["clean", "dirty"],
+          "description": "Whether the built tree matched the commit at build time."
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cli_sha256", "daemon_sha256"],
+      "properties": {
+        "cli_sha256": { "$ref": "#/$defs/sha256" },
+        "daemon_sha256": { "$ref": "#/$defs/sha256" },
+        "source_date_epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reproducible-build timestamp clamp applied to every staged file."
+        }
+      }
+    },
+    "contents": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Every member the release ships, in source-relative declaration order. A member is identified by role, never by a packaging-format install path: each builder maps role to its own destination.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "kind", "mode", "source", "formats", "sha256"],
+        "properties": {
+          "role": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$",
+            "description": "Stable product identity of the member (its basename, or a path under its kind directory). Format-agnostic."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "bin",
+              "script",
+              "library",
+              "config",
+              "config-example",
+              "unit",
+              "unit-template",
+              "dropin",
+              "rule",
+              "tmpfiles",
+              "sysusers",
+              "doc",
+              "generated"
+            ],
+            "description": "Responsibility class. Drives each builder's destination mapping and the unit/configuration declarations below."
+          },
+          "mode": {
+            "type": "string",
+            "pattern": "^0[0-7]{3}$",
+            "description": "Installed octal mode. Executable product scripts are 0755; data is 0644."
+          },
+          "source": {
+            "type": "string",
+            "description": "Repository-relative path of the authoring file. For kind=generated this names the artifact the builder produces, not a repository file."
+          },
+          "formats": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "enum": ["deb", "bundle", "rpm", "arch"] },
+            "description": "Builders that ship this member. A member declared for one format only is a declared packaging difference; a member silently staged outside its declared formats is a contract breach. DEB is the qualified format; the others stay unqualified until their SPEC rows pass."
+          },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "reason": {
+            "type": "string",
+            "description": "Required when formats is not the full shared product set: why this member is format-scoped or absent from a format. An undeclared difference is the defect this manifest exists to prevent."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "kind": { "const": "generated" } },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": { "sha256": { "type": "null" } }
+            }
+          }
+        ]
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime"],
+      "properties": {
+        "runtime": {
+          "type": "array",
+          "description": "Interpreters and libraries the staged helpers actually run under. A dependency nothing in the payload uses is a promise the package does not keep (AUD-41). DT-8 keeps test, pressure and benchmark orchestration out of the runtime payload, so a python helper adds no python dependency.",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "units": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lifecycle", "control_plane", "dropins"],
+      "description": "Unit declarations. lifecycle units own tier activation; control_plane units and dropins are the set manage-control-plane.sh stages transactionally. A package that ships a control-plane unit without its drop-ins installs half a control plane (customer-installation DT-8).",
+      "properties": {
+        "lifecycle": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Units that activate or deactivate memory tiers. Exactly one lifecycle unit contract: no legacy `ramsharedd.service` alongside `ramshared-cascade.service`."
+        },
+        "control_plane": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "dropins": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]+\\.service\\.d/[A-Za-z0-9._-]+$" }
+        },
+        "excluded": {
+          "type": "array",
+          "description": "Named absences. DT-8 excludes tests, pressure and benchmark orchestration from the runtime payload; naming them here is deliberate, and a builder that stages one is the regression.",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["examples", "conffiles", "operator_state"],
+      "properties": {
+        "examples": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Illustrative configuration shipped with the payload. Not live configuration."
+        },
+        "conffiles": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Package-manager conffiles. Empty by default: the sealed origin config is operator state created by the setup transaction and must never be a conffile, or a purge could delete origin data (AUD-41)."
+        },
+        "operator_state": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths the product creates at runtime as operator state. Never staged, never a conffile."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex digest of the shipped bytes. null only for kind=generated, whose bytes do not exist at declaration time."
+    }
+  }
+}

@@ -1,0 +1,20 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-control.slice
+[Unit]
+Description=RamShared protected control plane
+Before=ramshared-workloads.slice
+
+[Slice]
+ManagedOOMPreference=avoid
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+MemoryLow=1G
+MemoryMin=512M
+CPUWeight=1000
+IOWeight=1000

@@ -1,0 +1,652 @@
+// Author: Emerson Busson
+// Email: emersonbusson@gmail.com
+// GitHub: https://github.com/emersonbusson
+// LinkedIn: https://www.linkedin.com/in/emersonbusson
+// Source: https://github.com/emersonbusson/vramshared
+// File: crates/ramshared-cli/src/diagnose.rs
+//! Local diagnostics for broker/daemon JSONL evidence.
+//!
+//! This is intentionally deterministic. It summarizes recorded facts and does
+//! not attribute pressure to a process unless the event stream contains that
+//! attribution explicitly.
+#![forbid(unsafe_code)]
+
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+struct Event {
+    #[serde(default)]
+    t: Option<u64>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    slice: Option<u16>,
+    #[serde(default)]
+    swap_used: Option<u64>,
+    #[serde(default)]
+    alloc_active: Option<u64>,
+    #[serde(default)]
+    page_io_s: Option<u64>,
+    #[serde(default)]
+    vram_alloc_daemon: Option<u64>,
+    #[serde(default)]
+    vram_total_used: Option<u64>,
+    #[serde(default)]
+    vram_outros: Option<u64>,
+    #[serde(default)]
+    canario_demotes: Option<u64>,
+    #[serde(default)]
+    demote_reason: Option<String>,
+    #[serde(default)]
+    reconcile_delta: Option<f64>,
+    #[serde(default)]
+    flag: Option<String>,
+    #[serde(default)]
+    acpi_sleep_state: Option<String>,
+    #[serde(default)]
+    gpu_power_mgmt: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum DiagnoseError {
+    InvalidArgs(String),
+    Io(std::io::Error, std::path::PathBuf),
+    ParseJson(String),
+    Timeout(String),
+    /// A new command surface (`diagnose export`) reporting through the
+    /// customer result/exit model. Its exit code is the PRD mapping.
+    Customer(crate::customer::CustomerError),
+}
+
+impl std::fmt::Display for DiagnoseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgs(msg) => write!(f, "{msg}"),
+            Self::Io(err, path) => write!(f, "read {}: {err}", path.display()),
+            Self::ParseJson(msg) => write!(f, "{msg}"),
+            Self::Timeout(msg) => write!(f, "timeout: {msg}"),
+            Self::Customer(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl DiagnoseError {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::InvalidArgs(_) => 22, // EINVAL
+            Self::Io(err, _) => err.raw_os_error().unwrap_or(5) as u8,
+            Self::ParseJson(_) => 22, // EINVAL for malformed json
+            Self::Timeout(_) => 110,  // ETIMEDOUT
+            Self::Customer(err) => err.exit_code(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Diagnosis {
+    samples: usize,
+    first_t: Option<u64>,
+    last_t: Option<u64>,
+    demotes: u64,
+    max_vram_other: Option<u64>,
+    max_swap_used: Option<u64>,
+    max_page_io_s: Option<u64>,
+    flags: Vec<String>,
+    acpi_sleep_states: Vec<String>,
+    gpu_power_mgmt: Vec<String>,
+    timeline: Vec<String>,
+    recommendations: Vec<String>,
+}
+
+pub fn run_probe_with_timeout<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(
+    name: &str,
+    timeout: std::time::Duration,
+    probe: F,
+) -> Result<T, DiagnoseError> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(probe());
+    });
+    rx.recv_timeout(timeout)
+        .map_err(|_| DiagnoseError::Timeout(format!("probe '{name}' timed out")))
+}
+
+pub fn run(args: &[String]) -> Result<(), DiagnoseError> {
+    match parse_args(args)? {
+        DiagnoseAction::Summarize { path, json } => run_summarize(&path, json),
+        DiagnoseAction::Export { output } => run_export(&output),
+    }
+}
+
+/// What `ramshared diagnose` was asked for. The two forms have different exit
+/// vocabularies on purpose: `--events` is the existing surface and keeps its
+/// errno-style codes, `export` is a new surface and reports through the
+/// customer result/exit model.
+enum DiagnoseAction {
+    Summarize { path: PathBuf, json: bool },
+    Export { output: PathBuf },
+}
+
+fn run_summarize(path: &std::path::Path, json: bool) -> Result<(), DiagnoseError> {
+    let text = fs::read_to_string(path).map_err(|e| DiagnoseError::Io(e, path.to_path_buf()))?;
+    let diagnosis = run_probe_with_timeout(
+        "diagnose_jsonl",
+        std::time::Duration::from_secs(5),
+        move || diagnose_jsonl(&text),
+    )??;
+    if json {
+        println!("{}", render_json(&diagnosis));
+    } else {
+        print_text(&diagnosis);
+    }
+    Ok(())
+}
+
+fn run_export(output: &std::path::Path) -> Result<(), DiagnoseError> {
+    use crate::customer::diagnostics::{DiagnosticLimits, ReadinessDiagnosticSource};
+    use crate::customer::{CustomerCommand, CustomerDependencies, execute_customer};
+
+    // A read-only source of allowlisted readiness observations. Export never
+    // mutates the machine and never opens a device (DT-10).
+    let source = ReadinessDiagnosticSource;
+    execute_customer(
+        CustomerCommand::DiagnoseExport {
+            output: output.to_path_buf(),
+        },
+        &CustomerDependencies {
+            source: &source,
+            limits: DiagnosticLimits::default(),
+            setup: None,
+        },
+    )
+    .map(|outcome| println!("{}", outcome.result.detail))
+    .map_err(DiagnoseError::Customer)
+}
+
+fn parse_args(args: &[String]) -> Result<DiagnoseAction, DiagnoseError> {
+    if args.first().map(String::as_str) == Some("export") {
+        return parse_export_args(&args[1..]);
+    }
+    let mut path = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--events" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    DiagnoseError::InvalidArgs("--events requires a path".to_string())
+                })?;
+                path = Some(PathBuf::from(value));
+            }
+            other => {
+                return Err(DiagnoseError::InvalidArgs(format!(
+                    "unsupported diagnose argument: {other}"
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(DiagnoseAction::Summarize {
+        path: path.ok_or_else(|| {
+            DiagnoseError::InvalidArgs(
+                "usage: ramshared diagnose --events PATH [--json] | ramshared diagnose export --output FILE"
+                    .to_string(),
+            )
+        })?,
+        json,
+    })
+}
+
+fn parse_export_args(args: &[String]) -> Result<DiagnoseAction, DiagnoseError> {
+    use crate::customer::{CustomerError, CustomerReason, CustomerState};
+
+    // `diagnose export` is a new command surface: every refusal it can raise,
+    // including a malformed request, reports through the customer model. The
+    // shared 22/EINVAL codes belong to the existing `diagnose --events` form.
+    let refused = |detail: String| {
+        DiagnoseError::Customer(CustomerError {
+            reason: CustomerReason::UnsupportedSurface,
+            detail,
+            state: CustomerState::InstalledOff,
+        })
+    };
+    let mut output = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| refused("--output requires a path".to_string()))?;
+                output = Some(PathBuf::from(value));
+            }
+            other => {
+                return Err(refused(format!(
+                    "unsupported diagnose export argument: {other}"
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(DiagnoseAction::Export {
+        output: output
+            .ok_or_else(|| refused("usage: ramshared diagnose export --output FILE".to_string()))?,
+    })
+}
+
+fn diagnose_jsonl(text: &str) -> Result<Diagnosis, DiagnoseError> {
+    let mut events = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: Event = serde_json::from_str(line)
+            .map_err(|e| DiagnoseError::ParseJson(format!("line {}: {e}", idx + 1)))?;
+        events.push(event);
+    }
+    Ok(diagnose_events(&events))
+}
+
+fn diagnose_events(events: &[Event]) -> Diagnosis {
+    let mut diagnosis = Diagnosis {
+        samples: events.len(),
+        first_t: events.iter().filter_map(|e| e.t).min(),
+        last_t: events.iter().filter_map(|e| e.t).max(),
+        ..Diagnosis::default()
+    };
+
+    // A demote count is a running total, so a delta is only a delta across
+    // two measurements. `None` means this event did not measure it and a
+    // present `0` is a real zero, so an unmeasured event is not a sample and
+    // **clears** the held one rather than keeping it. Keeping it would let the
+    // next real event difference across a gap its timestamps do not span: the
+    // delta would cover two windows while the timeline named one, which is how
+    // one missing line became a fabricated idle followed by a fabricated spike.
+    let mut previous_demotes: Option<u64> = None;
+    let mut flags = Vec::<String>::new();
+    for event in events {
+        match event.canario_demotes {
+            Some(demotes) => {
+                if let Some(previous) = previous_demotes
+                    && demotes > previous
+                {
+                    let delta = demotes - previous;
+                    diagnosis.demotes = diagnosis.demotes.saturating_add(delta);
+                    let reason = event
+                        .demote_reason
+                        .as_deref()
+                        .unwrap_or("reason not recorded");
+                    diagnosis.timeline.push(format!(
+                        "{} DEMOTE observed: {reason}; process not attributed",
+                        ts(event)
+                    ));
+                }
+                previous_demotes = Some(demotes);
+            }
+            None => previous_demotes = None,
+        }
+
+        if let Some(flag) = event.flag.as_deref()
+            && flag != "none"
+            && !flags.iter().any(|existing| existing == flag)
+        {
+            flags.push(flag.to_string());
+            diagnosis
+                .timeline
+                .push(format!("{} reconciliation flag={flag}", ts(event)));
+        }
+
+        diagnosis.max_vram_other = max_opt(diagnosis.max_vram_other, event.vram_outros);
+        diagnosis.max_swap_used = max_opt(diagnosis.max_swap_used, event.swap_used);
+        diagnosis.max_page_io_s = max_opt(diagnosis.max_page_io_s, event.page_io_s);
+
+        if let Some(tenant) = event.tenant.as_deref() {
+            diagnosis.timeline.push(format!(
+                "{} tenant={tenant} slice={:?}",
+                ts(event),
+                event.slice
+            ));
+        }
+
+        if let Some(state) = event.acpi_sleep_state.as_deref()
+            && !diagnosis.acpi_sleep_states.iter().any(|s| s == state)
+        {
+            diagnosis.acpi_sleep_states.push(state.to_string());
+            diagnosis
+                .timeline
+                .push(format!("{} ACPI sleep state={state}", ts(event)));
+        }
+
+        if let Some(mgmt) = event.gpu_power_mgmt.as_deref()
+            && !diagnosis.gpu_power_mgmt.iter().any(|m| m == mgmt)
+        {
+            diagnosis.gpu_power_mgmt.push(mgmt.to_string());
+            diagnosis
+                .timeline
+                .push(format!("{} GPU power management={mgmt}", ts(event)));
+        }
+    }
+    diagnosis.flags = flags;
+    diagnosis.recommendations = recommendations(&diagnosis);
+    diagnosis
+}
+
+fn recommendations(d: &Diagnosis) -> Vec<String> {
+    let mut recs = Vec::new();
+    if d.samples == 0 {
+        recs.push("No events found. Start ramsharedd with --telemetry-jsonl PATH.".to_string());
+        return recs;
+    }
+    if d.demotes > 0 {
+        recs.push(
+            "DEMOTE occurred. Keep the VRAM tier conservative or lower the lease size before the next workload window.".to_string(),
+        );
+    }
+    if d.flags.iter().any(|f| f == "partial") {
+        recs.push("Telemetry was partial. Verify VRAM gauge and agent PSI inputs.".to_string());
+    }
+    if d.flags.iter().any(|f| f == "stuck_slice") {
+        recs.push("A slice was stuck draining. Keep swapoff-first teardown and inspect the agent responsible for zero confirmation.".to_string());
+    }
+    if d.flags.iter().any(|f| f == "unaccounted") {
+        recs.push("Swap usage exceeded borrowed capacity. Check for unmanaged swap devices or stale tenant state.".to_string());
+    }
+    // An unmeasured page-I/O peak cannot be "high", and it cannot be "fine"
+    // either. `is_some_and` keeps the distinction visible: `unwrap_or(0)` would
+    // write the false model into the gate and only happen to answer the same.
+    if d.max_page_io_s.is_some_and(|page_io_s| page_io_s > 10_000) {
+        recs.push("Page I/O is high. Compare zram, VRAM, and disk tier priorities before increasing VRAM capacity.".to_string());
+    }
+    if d.acpi_sleep_states.iter().any(|s| s == "S3" || s == "S4") {
+        recs.push(
+            "ACPI sleep state observed. Ensure write caches were flushed before suspend."
+                .to_string(),
+        );
+    }
+    if d.gpu_power_mgmt
+        .iter()
+        .any(|m| m == "disabled" || m == "none")
+    {
+        recs.push("GPU power management disabled. High power draw may trigger thermal throttling or PCIe resets.".to_string());
+    }
+    if recs.is_empty() {
+        recs.push("No anomaly detected in the provided event window.".to_string());
+    }
+    recs
+}
+
+fn max_opt(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn ts(event: &Event) -> String {
+    event
+        .t
+        .map(|t| format!("t={t}"))
+        .unwrap_or_else(|| "t=unknown".to_string())
+}
+
+fn print_text(d: &Diagnosis) {
+    println!("RamShared diagnosis");
+    println!("samples: {}", d.samples);
+    println!("window: {:?}..{:?}", d.first_t, d.last_t);
+    println!("demotes: {}", d.demotes);
+    println!(
+        "max: vram_other={} swap_used={} page_io_s={}",
+        opt_num(d.max_vram_other),
+        opt_num(d.max_swap_used),
+        opt_num(d.max_page_io_s)
+    );
+    println!(
+        "flags: {}",
+        if d.flags.is_empty() {
+            "none".into()
+        } else {
+            d.flags.join(",")
+        }
+    );
+    println!(
+        "acpi_sleep_states: {}",
+        if d.acpi_sleep_states.is_empty() {
+            "none".into()
+        } else {
+            d.acpi_sleep_states.join(",")
+        }
+    );
+    println!(
+        "gpu_power_mgmt: {}",
+        if d.gpu_power_mgmt.is_empty() {
+            "none".into()
+        } else {
+            d.gpu_power_mgmt.join(",")
+        }
+    );
+    println!("timeline:");
+    for item in &d.timeline {
+        println!("  - {item}");
+    }
+    println!("recommendations:");
+    for item in &d.recommendations {
+        println!("  - {item}");
+    }
+}
+
+fn opt_num(value: Option<u64>) -> String {
+    value
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn render_json(d: &Diagnosis) -> String {
+    serde_json::json!({
+        "samples": d.samples,
+        "first_t": d.first_t,
+        "last_t": d.last_t,
+        "demotes": d.demotes,
+        "max_vram_other": d.max_vram_other,
+        "max_swap_used": d.max_swap_used,
+        "max_page_io_s": d.max_page_io_s,
+        "flags": d.flags,
+        "acpi_sleep_states": d.acpi_sleep_states,
+        "gpu_power_mgmt": d.gpu_power_mgmt,
+        "timeline": d.timeline,
+        "recommendations": d.recommendations,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnoses_demote_without_process_attribution() {
+        let input = r#"{"t":1,"canario_demotes":0,"flag":"none"}
+{"t":2,"canario_demotes":1,"demote_reason":"free_floor","flag":"eviction","vram_outros":1024}"#;
+        let d = match diagnose_jsonl(input) {
+            Ok(d) => d,
+            Err(e) => panic!("diagnose failed: {e}"),
+        };
+        assert_eq!(d.samples, 2);
+        assert_eq!(d.demotes, 1);
+        assert!(
+            d.timeline
+                .iter()
+                .any(|line| line.contains("process not attributed"))
+        );
+        assert!(
+            d.recommendations
+                .iter()
+                .any(|line| line.contains("DEMOTE occurred"))
+        );
+        let rendered = render_json(&d);
+        assert!(rendered.contains("\"demotes\":1"));
+        print_text(&d);
+    }
+
+    #[test]
+    fn an_unreported_demote_count_is_never_differenced_as_a_measured_zero() {
+        // A running total needs two measurements to make a delta. The first
+        // event measures 5 and the third measures 6, but the middle event did
+        // not measure at all. Differencing 6 against a `0` invented from that
+        // silence would report six demotes instead of the one that happened,
+        // and the frame that read nothing would have reported a fabricated
+        // idle on the way down. Silence clears the held sample; the 5 -> 6
+        // step is real but its window is unknown, so it is not counted.
+        let input = r#"{"t":1,"canario_demotes":5}
+{"t":2,"flag":"partial"}
+{"t":3,"canario_demotes":6}"#;
+        let d = match diagnose_jsonl(input) {
+            Ok(d) => d,
+            Err(e) => panic!("diagnose failed: {e}"),
+        };
+        assert_eq!(
+            d.demotes, 0,
+            "an unreported counter must not produce a delta, in either direction"
+        );
+        assert!(
+            !d.timeline
+                .iter()
+                .any(|line| line.contains("DEMOTE observed")),
+            "a fabricated spike must not reach the timeline: {:?}",
+            d.timeline
+        );
+    }
+
+    #[test]
+    fn a_demote_delta_needs_two_measured_samples() {
+        // Positive: two consecutive measurements of one running total give the
+        // one demote that happened between them.
+        let consecutive = r#"{"t":1,"canario_demotes":5,"demote_reason":"free_floor"}
+{"t":2,"canario_demotes":6,"demote_reason":"free_floor"}"#;
+        let d = match diagnose_jsonl(consecutive) {
+            Ok(d) => d,
+            Err(e) => panic!("diagnose failed: {e}"),
+        };
+        assert_eq!(d.demotes, 1);
+        assert!(
+            d.timeline
+                .iter()
+                .any(|line| line.contains("DEMOTE observed")),
+            "a real demote belongs on the timeline: {:?}",
+            d.timeline
+        );
+
+        // Negative: a single measurement has no previous sample to subtract,
+        // so the run's total so far is not a delta. Reporting 7 here would be
+        // the same first-frame fabrication the rate folds already refuse.
+        let alone = r#"{"t":1,"canario_demotes":7}"#;
+        let d = match diagnose_jsonl(alone) {
+            Ok(d) => d,
+            Err(e) => panic!("diagnose failed: {e}"),
+        };
+        assert_eq!(d.demotes, 0);
+    }
+
+    #[test]
+    fn empty_events_recommend_telemetry() {
+        let d = match diagnose_jsonl("") {
+            Ok(d) => d,
+            Err(e) => panic!("diagnose failed: {e}"),
+        };
+        assert_eq!(d.samples, 0);
+        assert!(d.recommendations[0].contains("--telemetry-jsonl"));
+        print_text(&d);
+    }
+
+    #[test]
+    fn diagnoses_all_flags_and_anomalies() {
+        let input = r#"{"t":10,"flag":"partial","page_io_s":15000,"vram_outros":1024}
+{"t":20,"flag":"stuck_slice","canario_demotes":2,"vram_outros":2048}
+{"t":30,"flag":"unaccounted","swap_used":5000000000,"tenant":"tenant-a","slice":1}"#;
+        let d = match diagnose_jsonl(input) {
+            Ok(d) => d,
+            Err(e) => panic!("diagnose failed: {e}"),
+        };
+        assert_eq!(d.samples, 3);
+        assert!(d.flags.contains(&"partial".to_string()));
+        assert!(d.flags.contains(&"unaccounted".to_string()));
+        assert!(d.flags.contains(&"stuck_slice".to_string()));
+        assert_eq!(d.max_page_io_s, Some(15000));
+        assert!(
+            d.recommendations
+                .iter()
+                .any(|r| r.contains("Page I/O is high"))
+        );
+        assert!(
+            d.recommendations
+                .iter()
+                .any(|r| r.contains("A slice was stuck draining"))
+        );
+        assert!(
+            d.recommendations
+                .iter()
+                .any(|r| r.contains("Swap usage exceeded"))
+        );
+        let json_str = render_json(&d);
+        assert!(json_str.contains("stuck_slice"));
+        print_text(&d);
+    }
+
+    #[test]
+    fn malformed_json_returns_error() {
+        let res = diagnose_jsonl("not json\n");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn diagnostic_probe_timeout_isolation_prevents_hang() {
+        let err = run_probe_with_timeout(
+            "hanging_probe",
+            std::time::Duration::from_millis(10),
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                "done"
+            },
+        );
+
+        assert!(matches!(err, Err(DiagnoseError::Timeout(_))));
+    }
+
+    #[test]
+    fn diagnostic_probe_success_returns_value() {
+        let val = run_probe_with_timeout("fast", std::time::Duration::from_millis(100), || 42);
+        assert!(matches!(val, Ok(42)));
+    }
+
+    #[test]
+    fn diagnoses_power_management_and_acpi_events() {
+        let input = r#"{"t":1,"acpi_sleep_state":"S3","gpu_power_mgmt":"disabled"}
+{"t":2,"acpi_sleep_state":"S4","gpu_power_mgmt":"none"}"#;
+        let d = match diagnose_jsonl(input) {
+            Ok(d) => d,
+            Err(e) => panic!("diagnose failed: {e}"),
+        };
+        assert_eq!(d.samples, 2);
+        assert!(d.acpi_sleep_states.contains(&"S3".to_string()));
+        assert!(d.gpu_power_mgmt.contains(&"disabled".to_string()));
+        assert!(
+            d.recommendations
+                .iter()
+                .any(|r| r.contains("ACPI sleep state observed"))
+        );
+        assert!(
+            d.recommendations
+                .iter()
+                .any(|r| r.contains("GPU power management disabled"))
+        );
+        let json_str = render_json(&d);
+        assert!(json_str.contains("S3"));
+        print_text(&d);
+    }
+}

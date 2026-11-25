@@ -1,0 +1,26 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-exec/Cargo.toml
+[package]
+name = "ramshared-exec"
+description = "Exact, bounded custody for short-lived RamShared production subprocesses"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ramshared_exec"
+path = "src/lib.rs"
+
+[dependencies]
+rustix = { version = "1.1.4", features = ["process", "fs"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

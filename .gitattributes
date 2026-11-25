@@ -1,0 +1,8 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: .gitattributes
+Documentation/architecture/three-tier-cascade.rst*/pair-*.json -diff -text
+docs/upstream/patches/*.patch whitespace=-space-before-tab

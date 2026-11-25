@@ -1,0 +1,34 @@
+#Requires -Version 5.1
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/windows/Test-SdvProbeStatic.ps1
+[CmdletBinding()]
+param([string]$ScriptPath)
+
+$ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
+    $ScriptPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "Invoke-SdvProbe.ps1"
+}
+$src = Get-Content -LiteralPath $ScriptPath -Raw
+$required = @(
+    "NOT_CLAIMED",
+    "sdv.exe_not_on_path",
+    "msbuild_target_sdv_missing",
+    "sdv_retired_from_wdk_vs2022_plus",
+    "/t:sdv",
+    "SDV_CLAIM",
+    "WindowsDriver.Sdv.targets"
+)
+foreach ($t in $required) {
+    if ($src -notmatch [regex]::Escape($t)) {
+        throw "SDV probe missing token: $t"
+    }
+}
+if ($src -match 'SDV_CLAIM=PASS' -and $src -notmatch 'NOT_CLAIMED') {
+    throw "SDV probe must default to NOT_CLAIMED"
+}
+Write-Host "STATIC_SDV_PROBE=PASS"
+exit 0

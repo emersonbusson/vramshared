@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: drivers/block/ramshared/Kconfig
+#
+# RamShared block driver configuration
+#
+
+config BLK_DEV_RAMSHARED
+	tristate "RamShared Hardware-Accelerated VRAM Block Device"
+	depends on BLOCK && PCI && MMU
+	select BLK_MQ_PCI
+	help
+	  This driver provides a high-performance block device backed by
+	  discrete GPU video memory (VRAM) via direct PCIe DMA transfers.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called ramshared.

@@ -1,0 +1,11 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-winbroker/broker.example.toml
+[local_broker]
+schema = 1
+capacity_bytes = 536870912
+allowed_tenant = "windrive-host"
+evidence_path = "C:\\ProgramData\\RamShared\\evidence"

@@ -1,0 +1,26 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-cascade-health.service
+[Unit]
+Description=RamShared cascade health sampler (JSONL append-only)
+Documentation=file:///opt/ramshared/current/README.md
+After=local-fs.target
+
+[Service]
+Type=simple
+Slice=ramshared-control.slice
+User=root
+# Typed read-only observer. It cannot change swap or create pressure.
+ExecStart=/opt/ramshared/current/bin/ramshared monitor --jsonl --output /var/log/ramshared/cascade-health.jsonl --heartbeat /mnt/c/wsl-forensics/ramshared-heartbeat.json --interval-ms 1000
+Restart=on-failure
+RestartSec=10
+# The sampler's product is the JSONL file named by --output; the journal copy
+# duplicates it once per second. Keep failures in the journal, not the feed.
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

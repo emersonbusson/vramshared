@@ -1,0 +1,26 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/cascade.conf.example
+# Sealed NBD cascade configuration for one release.
+#
+# This file is packaged inside /opt/ramshared/releases/<version>. It is not
+# sourced as shell code. Change a setting by publishing and selecting another
+# sealed version; never edit a selected release in place.
+#
+# Machine binding only. Cascade sizing is host policy and is resolved by
+# `cascade-sizing.sh`; this file must never carry VRAM_MIB, ZRAM_MIB or
+# MIN_VRAM_HEADROOM_MIB, or a host silently activates a size its operator
+# never chose.
+
+# The package builder replaces these values together. They bind one
+# machine-specific lower tier by canonical path, directory type, and an exact
+# filesystem identity digest. A live product preflight never accepts an
+# environment override: publish a new sealed release instead.
+NBD_LOWER_SINK=
+NBD_LOWER_SINK_TYPE=directory
+NBD_LOWER_SINK_IDENTITY_SHA256=
+NBD_LOWER_SINK_FS_BLOCK_BYTES=
+NBD_LOWER_SINK_BINDING=unbound

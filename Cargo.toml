@@ -1,0 +1,41 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: Cargo.toml
+[workspace]
+resolver = "3"
+members = [
+    "crates/ramshared-dxg",
+    "crates/ramshared-cli",
+    "crates/ramshared-tier",
+    "crates/ramshared-cuda",
+    "crates/ramshared-block",
+    "crates/ramshared-wsl2d",
+    "crates/ramshared-integrity",
+    "crates/ramshared-uring",
+    "crates/ramshared-broker",
+    "crates/ramshared-config",
+    "crates/ramshared-agent",
+    "crates/ramshared-vram",
+    "crates/ramshared-vulkan",
+    "crates/ramshared-winsvc",
+    "crates/ramshared-winbroker",
+    "crates/ramshared-hostlaunch",
+    "crates/ramshared-ipc",
+    "crates/ramshared-exec",
+]
+
+[workspace.package]
+version = "1.0.0" # x-release-please-version
+edition = "2024"
+rust-version = "1.100.0"
+license = "MIT"
+authors = ["Emerson Busson <emersonbusson@gmail.com>"]
+homepage = "https://github.com/emersonbusson/vramshared"
+repository = "https://github.com/emersonbusson/vramshared"
+# Internal workspace crates are never published to crates.io. Marking them
+# private prevents accidental publication and keeps path dependencies out of
+# external wildcard-dependency policy.
+publish = false

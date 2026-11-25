@@ -1,0 +1,87 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: .github/workflows/kernel-ci.yml
+name: Kernel CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'drivers/block/ramshared/**'
+      - 'scripts/ci/check-kernel-*.sh'
+      - '.github/workflows/kernel-ci.yml'
+  pull_request:
+    paths:
+      - 'drivers/block/ramshared/**'
+      - 'scripts/ci/check-kernel-*.sh'
+      - '.github/workflows/kernel-ci.yml'
+
+permissions: {}
+
+concurrency:
+  group: kernel-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kernel-static:
+    name: kernel static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install static analysis tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq perl curl sparse
+          sudo apt-get install -y -qq "linux-headers-$(uname -r)" || true
+
+      - name: Provision checkpatch.pl
+        run: ./scripts/ci/check-kernel-checkpatch.sh --provision
+
+      - name: Kernel Style Check
+        run: ./scripts/ci/check-kernel-style.sh
+
+      - name: Kernel Sparse Semantic Check
+        run: ./scripts/ci/check-kernel-sparse.sh
+
+      - name: Kernel checkpatch.pl Validation
+        run: ./scripts/ci/check-kernel-checkpatch.sh
+
+      - name: Kernel ABI & Symbol Export Guard
+        run: ./scripts/ci/check-kernel-abi-guard.sh
+
+  kernel-build-matrix:
+    name: kernel build (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            arch: x86_64
+          - compiler: clang
+            arch: x86_64
+          - compiler: aarch64-gcc
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install cross-compilation toolchain
+        if: matrix.compiler == 'aarch64-gcc'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Install clang
+        if: matrix.compiler == 'clang'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang
+
+      - name: Run build matrix (${{ matrix.compiler }} / ${{ matrix.arch }})
+        run: ./scripts/ci/check-kernel-build-matrix.sh "${{ matrix.compiler }}" "${{ matrix.arch }}"

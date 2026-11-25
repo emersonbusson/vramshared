@@ -1,0 +1,79 @@
+RamShared Maintainers
+=====================
+
+Author: Emerson Busson
+Email: emersonbusson@gmail.com
+GitHub: https://github.com/emersonbusson
+LinkedIn: https://www.linkedin.com/in/emersonbusson
+Source: https://github.com/emersonbusson/vramshared
+File: MAINTAINERS
+
+Descriptions of section entries:
+
+	M: Maintainer name and email address
+	W: Web-page with status/info
+	T: SCM tree type and location
+	S: Status (Supported / Maintained / Odd Fixes / Orphan)
+	F: Files and directories wildcard patterns
+
+RAMSHARED CORE AND CLI
+M:	Emerson Busson <emersonbusson@gmail.com>
+W:	https://github.com/emersonbusson/vramshared
+T:	git https://github.com/emersonbusson/vramshared.git
+S:	Maintained
+F:	crates/ramshared-cli/
+F:	crates/ramshared-config/
+F:	crates/ramshared-exec/
+F:	crates/ramshared-integrity/
+F:	crates/ramshared-ipc/
+F:	crates/ramshared-tier/
+
+RAMSHARED LINUX/WSL2 TIERING DAEMON
+M:	Emerson Busson <emersonbusson@gmail.com>
+S:	Maintained
+F:	crates/ramshared-block/
+F:	crates/ramshared-broker/
+F:	crates/ramshared-uring/
+F:	crates/ramshared-wsl2d/
+F:	crates/ramshared-agent/
+
+GPU VRAM PROVIDERS (CUDA, VULKAN, DXG)
+M:	Emerson Busson <emersonbusson@gmail.com>
+S:	Maintained
+F:	crates/ramshared-cuda/
+F:	crates/ramshared-dxg/
+F:	crates/ramshared-vram/
+F:	crates/ramshared-vulkan/
+
+LINUX KERNEL BLOCK DRIVER (EXPERIMENTAL)
+M:	Emerson Busson <emersonbusson@gmail.com>
+S:	Maintained
+F:	drivers/block/ramshared/
+F:	Documentation/block/ramshared.rst
+F:	scripts/ci/check-kernel-*.sh
+
+WINDOWS STORPORT MINIPORT AND BROKER (EXPERIMENTAL)
+M:	Emerson Busson <emersonbusson@gmail.com>
+S:	Maintained
+F:	drivers/windows/
+F:	crates/ramshared-winsvc/
+F:	crates/ramshared-winbroker/
+F:	crates/ramshared-hostlaunch/
+F:	scripts/windows/
+
+PACKAGING, SYSTEMD UNITS, AND SAFETY SCRIPTS
+M:	Emerson Busson <emersonbusson@gmail.com>
+S:	Maintained
+F:	packaging/
+F:	scripts/package/
+F:	scripts/safety/
+F:	scripts/kernel/
+F:	scripts/install*.sh
+
+DOCUMENTATION
+M:	Emerson Busson <emersonbusson@gmail.com>
+S:	Maintained
+F:	Documentation/
+F:	README.md
+F:	SECURITY.md
+F:	CHANGELOG.md

@@ -1,0 +1,26 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-uring/Cargo.toml
+[package]
+name = "ramshared-uring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ramshared_uring"
+path = "src/lib.rs"
+
+[dependencies]
+io-uring = "0.7.12"
+libc = "0.2"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

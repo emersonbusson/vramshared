@@ -1,0 +1,50 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: deny.toml
+# cargo-deny — RamShared workspace supply-chain gate.
+#
+# Every external userspace dependency must pass advisory, license, and source
+# provenance review before entering a production path.
+#
+# Run: cargo audit && cargo deny check
+# Schema: cargo-deny 0.19 (version = 2).
+
+[graph]
+# Check every feature, including feature-gated GPU and I/O dependencies.
+all-features = true
+
+[advisories]
+version = 2
+# RustSec v2 denies yanked crates by default. No advisory ignores are accepted.
+ignore = []
+
+[licenses]
+version = 2
+# Strict allowlist for licenses present in the current graph. A dependency with
+# another license fails closed until reviewed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Keep the dependency surface minimal. Wildcards fail; duplicate versions are
+# visible warnings because transitive graphs may legitimately diverge.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path crates have no published version and are explicitly allowed.
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only; unknown Git and registry sources fail closed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

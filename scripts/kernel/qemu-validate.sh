@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/kernel/qemu-validate.sh
+# qemu-validate.sh — validates a custom WSL2 kernel in an ISOLATED QEMU (does not touch WSL).
+# Before arming .wslconfig, proves: (1) bzImage boots to userspace; (2) `uname -r`
+# matches the expected release; (3) target modules load (insmod in the supplied
+# order). Console uses ttyS0 (CONFIG_SERIAL_8250_CONSOLE=y in config-wsl).
+#
+# usage: qemu-validate.sh <bzImage> <kernelrelease> [mod1.ko mod2.ko ...]
+#   modules in dependency ORDER (for example, zsmalloc.ko BEFORE zram.ko).
+# exit 0 = PASS (kernel release matches and every supplied module loads).
+#
+# Reusable for any kernel build (Phase B+ toolkit). SPEC: docs/runbooks/FASE-B-KERNEL.md
+set -euo pipefail
+
+BZ="${1:?usage: qemu-validate.sh <bzImage> <kernelrelease> [mods...]}"
+REL="${2:?missing kernelrelease}"
+shift 2
+MODS=("$@")
+
+[ -f "$BZ" ] || { echo "bzImage missing: $BZ" >&2; exit 2; }
+command -v qemu-system-x86_64 >/dev/null || { echo "qemu-system-x86_64 missing (apt install qemu-system-x86)" >&2; exit 2; }
+[ -x /bin/busybox ] || { echo "busybox-static missing (apt install busybox-static)" >&2; exit 2; }
+
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+IRD="$WORK/irfs"; mkdir -p "$IRD/bin" "$IRD/modules"
+cp /bin/busybox "$IRD/bin/busybox"
+
+# numbered modules preserve dependency order
+i=0; for m in "${MODS[@]}"; do
+  [ -f "$m" ] || { echo "module missing: $m" >&2; exit 2; }
+  cp "$m" "$IRD/modules/$(printf '%02d' "$i")-$(basename "$m")"; i=$((i+1))
+done
+
+cat > "$IRD/init" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mkdir -p /proc /sys /dev /tmp
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+echo "=====KTEST-BEGIN====="
+echo "KTEST-UNAME=$(/bin/busybox uname -r)"
+for m in /modules/*.ko; do
+  [ -f "$m" ] || continue
+  if /bin/busybox insmod "$m" 2>/tmp/e; then
+    echo "KTEST-INSMOD-OK=$(/bin/busybox basename "$m")"
+  else
+    echo "KTEST-INSMOD-FAIL=$(/bin/busybox basename "$m"): $(/bin/busybox cat /tmp/e)"
+  fi
+done
+[ -e /dev/ublk-control ] && echo "KTEST-UBLK-CONTROL=present" || echo "KTEST-UBLK-CONTROL=absent"
+echo "KTEST-DMESG:"
+/bin/busybox dmesg | /bin/busybox grep -iE "module|ublk|zram|zsmalloc|magic|tainted|invalid|disagrees" | /bin/busybox tail -12
+echo "=====KTEST-END====="
+/bin/busybox poweroff -f
+INIT
+chmod +x "$IRD/init"
+
+( cd "$IRD" && find . | cpio -o -H newc 2>/dev/null | gzip ) > "$WORK/initramfs.gz"
+
+# KVM accelerates; without write permissions on /dev/kvm, falls back to TCG (slower but valid).
+ACCEL=(-machine accel=tcg)
+[ -w /dev/kvm ] && ACCEL=(-enable-kvm -cpu host)
+
+echo "[qemu-validate] booting $BZ (expected release: $REL; accel: ${ACCEL[*]})..."
+timeout 180 qemu-system-x86_64 "${ACCEL[@]}" -m 1024 -nographic -no-reboot \
+  -kernel "$BZ" -initrd "$WORK/initramfs.gz" \
+  -append "console=ttyS0 panic=1 rdinit=/init" > "$WORK/serial.log" 2>&1 || true
+tr -d '\r' < "$WORK/serial.log" > "$WORK/serial.normalized.log"
+mv "$WORK/serial.normalized.log" "$WORK/serial.log"
+
+echo "=========== result ==========="
+grep -E "KTEST-" "$WORK/serial.log" || { echo "no KTEST output — kernel may not have booted"; }
+echo "================================="
+# A supplied module must reach insmod: /tmp exists before stderr redirection.
+# Boot success alone cannot certify the modules supplied for this kernel.
+loaded=$(grep -c '^KTEST-INSMOD-OK=' "$WORK/serial.log" || true)
+if grep -qx "KTEST-UNAME=$REL" "$WORK/serial.log" &&
+   grep -q 'KTEST-END' "$WORK/serial.log" &&
+   ! grep -q '^KTEST-INSMOD-FAIL=' "$WORK/serial.log" &&
+   [ "$loaded" -eq "${#MODS[@]}" ]; then
+  echo "QEMU-VALIDATE: PASS — kernel release and $loaded supplied modules verified."
+  exit 0
+else
+  echo "QEMU-VALIDATE: FAIL — boot, release or supplied module validation failed."
+  echo "--- serial tail ---"; tail -15 "$WORK/serial.log"
+  exit 1
+fi

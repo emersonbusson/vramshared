@@ -1,0 +1,65 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-host-gate.service
+[Unit]
+Description=RamShared durable host safe-mode gate importer
+After=local-fs.target
+Before=ramshared-cascade.service docker.service containerd.service cron.service
+# DT-14: these two keys are [Unit] settings. In [Service] systemd ignores
+# them, which made the restart loop unbounded. The burst is five starts in
+# 300 s; a gate that keeps refusing still ends failed instead of looping.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+Slice=ramshared-control.slice
+# DT-4: hardware classification is the first non-`-` preparation. A refused
+# boot (exit 78) skips the remaining ExecStartPre lines and the gate, so the
+# origin is not mounted and the guardian is not started for a boot that must
+# stay off. DT-14 exempts that exit from restart.
+ExecStartPre=/opt/ramshared/current/scripts/safety/hardware-health.sh
+# verified test case: on a cold WSL2 start the sealed origin VHDX is not attached to
+# the guest. The gate would refuse on the missing device before any cascade
+# code could attach it, so the cascade never reached its own auto-attach.
+# `ensure-origin` is the single bounded attach implementation (idempotent,
+# fail-closed) that the cascade start path also uses.
+#
+# DT-19: on a guest-only restart (Windows up, user still logged on) neither
+# `-AtStartup` nor `-AtLogOn` fires, so the sealed guardian producer sits
+# `Ready` and the gate refuses on a stale proof. `ensure-guardian` is the
+# exact twin: one bounded elevated start of the sealed named task, never a
+# registration and never a proof of its own.
+#
+# The leading `-` on both means a failed preparation does not skip the gate:
+# the gate still runs, still drops any previous lease first, and still refuses
+# on the absent device or the stale proof. Preparation never outranks
+# verification.
+ExecStartPre=-/opt/ramshared/current/bin/ramshared ensure-origin
+ExecStartPre=-/opt/ramshared/current/bin/ramshared ensure-guardian
+ExecStart=/opt/ramshared/current/scripts/safety/ramshared-host-gate.sh
+RemainAfterExit=yes
+
+# A cold boot races the guardian. `ensure-guardian` starts the producer, and
+# the producer publishes this boot's proof on its own schedule; the gate's
+# own G2 wait is bounded by the envelope the sealed configuration declares,
+# and a producer that needs longer than that budget will be refused on the
+# first attempt with a correctly-classified TRANSIENT boot-identity
+# mismatch. The gate keeps that bounded wait and its classification — this
+# is not a retry policy inside it. It is the service admitting that a
+# boot-time race can outlast one attempt, and giving verification a bounded
+# number of further chances.
+#
+# After the burst the unit stays failed. A proof that never arrives is still
+# refused, on the same string and the same authority rules as before.
+Restart=on-failure
+RestartSec=15
+# DT-14: a deterministic hardware refusal (exit 78) must not be retried.
+# Transient refusals keep exit 2 and their bounded retry.
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=multi-user.target

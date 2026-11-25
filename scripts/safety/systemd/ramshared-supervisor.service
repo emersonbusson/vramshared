@@ -1,0 +1,19 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-supervisor.service
+[Unit]
+Description=RamShared control-plane supervisor
+After=local-fs.target
+
+[Service]
+Type=simple
+Slice=ramshared-control.slice
+ExecStart=/opt/ramshared/current/bin/ramshared supervise
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

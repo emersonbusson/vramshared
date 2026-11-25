@@ -1,0 +1,45 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-cascade.service
+[Unit]
+Requires=ramshared-host-gate.service
+After=ramshared-host-gate.service
+Description=RamShared sealed NBD-only cascade (scoped approval required)
+Documentation=file:///opt/ramshared/current/README.md
+After=local-fs.target
+ConditionPathExists=!/var/lib/ramshared/safe-mode.json
+
+[Service]
+# DT-9: `boot` is a gate-then-act armer that exits 0 once the cascade is up.
+# A `Type=simple` main process that exits is "stopped", so systemd would run
+# ExecStop and unmount the cascade it had just armed. `oneshot` +
+# `RemainAfterExit=yes` is what keeps the armed tiers live after `boot`
+# returns: ExecStop runs on `systemctl stop`, never on a successful arm.
+Type=oneshot
+RemainAfterExit=yes
+Slice=ramshared-control.slice
+User=root
+# DT-1: `ramshared boot` is the single native bootstrap verb. It runs the
+# fail-closed gate chain (identity → approval → lease → dirty) then activates.
+# The lease is a host prerequisite the bootstrap verifies and reports (NFR-6),
+# not a silent unit-level skip.
+ExecStart=/opt/ramshared/current/bin/ramshared boot
+# DT-5 / NFR-6: journal the unbounded stop window before swapoff so a long
+# teardown is expected rather than mysterious.
+ExecStop=/bin/sh -c 'echo NBD_STOP_WINDOW=unbounded; exec /opt/ramshared/current/bin/ramshared down'
+# systemd signals only the bootstrap. The bootstrap retries swapoff and
+# detach forever; systemd never escalates to the backend process.
+KillMode=process
+SendSIGKILL=no
+TimeoutStartSec=120
+TimeoutStopSec=infinity
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

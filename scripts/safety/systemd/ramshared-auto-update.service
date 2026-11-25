@@ -1,0 +1,39 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-auto-update.service
+[Unit]
+Description=RamShared sealed release auto-update
+Documentation=file:///opt/ramshared/current/RELEASE_VERSION
+# A sealed install is a transaction against /opt/ramshared/releases and a
+# release-selector move. It is ordered after local-fs so the bundle tree and
+# the policy file are both readable when it runs.
+After=local-fs.target
+RequiresMountsFor=/opt/ramshared
+
+[Service]
+Type=oneshot
+# The script refuses without /etc/ramshared/auto-update.conf, and refuses
+# again unless that file says enabled=1. This unit does not supply the
+# authorization; it only schedules the check.
+ExecStart=/opt/ramshared/current/scripts/safety/auto-update.sh
+Nice=19
+IOSchedulingClass=idle
+# Auto-update verifies OpenPGP trust before any effect. When the cascade is
+# active, it checks canonical `down --plan` drain safety (deferring cleanly
+# when headroom or authenticated host memory is unverified), performs ordered
+# swapoff-first teardown, installs the verified release carrying enrollment
+# forward, and immediately reactivates through the fail-closed host-gate/boot
+# chain. It never forces swapoff, never applies pressure, and never runs drills.
+NoNewPrivileges=false
+PrivateTmp=true
+# The bundle tree lives wherever the operator builds it, commonly under
+# their home directory. `full` protects the system paths this script never
+# writes and leaves that tree readable; `strict` would hide it and the
+# scheduled run would report NO-BUNDLE forever.
+ProtectHome=read-only
+ProtectSystem=full
+ReadWritePaths=/opt/ramshared /var/log/ramshared /etc/ramshared /etc/systemd/system
+TimeoutStartSec=600

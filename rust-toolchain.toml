@@ -1,0 +1,10 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: rust-toolchain.toml
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "llvm-tools-preview", "rustfmt"]
+profile = "minimal"

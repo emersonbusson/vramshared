@@ -1,0 +1,14 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: .gitleaks.toml
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Benchmark fixture metric mistaken for a generic API key"
+regexTarget = "line"
+paths = ['''^tools/ci/check-benchmark-evidence\.test\.mjs$''']
+regexes = ['''^\s*\{ name: 'p99', key: 'nbd_vs_disk_p99_ratio', value: 999 \},\s*$''']

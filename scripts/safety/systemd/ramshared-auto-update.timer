@@ -1,0 +1,21 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-auto-update.timer
+[Unit]
+Description=Check for a newer RamShared sealed release
+Documentation=file:///opt/ramshared/current/RELEASE_VERSION
+
+[Timer]
+# Off-minute on purpose: a fleet of hosts that all check at :00 stampedes
+# the bundle tree for no benefit.
+OnBootSec=5min
+OnUnitActiveSec=23min
+AccuracySec=2min
+Persistent=true
+Unit=ramshared-auto-update.service
+
+[Install]
+WantedBy=timers.target

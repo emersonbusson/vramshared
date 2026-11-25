@@ -1,0 +1,51 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-wsl2d/Cargo.toml
+[package]
+name = "ramshared-wsl2d"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ramshared_wsl2d"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ramsharedd"
+path = "src/main.rs"
+
+[dependencies]
+ramshared-config = { path = "../ramshared-config" }
+ramshared-exec = { path = "../ramshared-exec" }
+ramshared-cuda = { path = "../ramshared-cuda" }
+ramshared-dxg = { path = "../ramshared-dxg" }
+ramshared-vulkan = { path = "../ramshared-vulkan" }
+ramshared-vram = { path = "../ramshared-vram" }
+ramshared-block = { path = "../ramshared-block" }
+ramshared-broker = { path = "../ramshared-broker" }
+ramshared-tier = { path = "../ramshared-tier" }
+ramshared-integrity = { path = "../ramshared-integrity" }
+ramshared-uring = { path = "../ramshared-uring" }
+ramshared-ipc = { path = "../ramshared-ipc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+rustix = { version = "1.1.4", features = ["fs", "process", "net", "time"] }
+# Crash record: `sigaction`/`siginfo_t` layouts for the durable peer crash
+# record. The daemon already declares the few raw symbols it needs; the
+# signal ABI is the one place a hand-rolled layout would be a liability.
+libc = "0.2"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[dev-dependencies]
+ramshared-winsvc = { path = "../ramshared-winsvc" }

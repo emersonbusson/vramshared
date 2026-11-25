@@ -1,0 +1,22 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramsharedd.service
+[Unit]
+Description=RamShared legacy daemon path (disabled staging only)
+Documentation=file://@REPO_PATH@/ARCHITECTURE.md
+# This legacy name must not become an alternate device/lifecycle route.  A
+# future sealed attended transaction, if approved, must publish a distinct unit
+# rather than repurposing this one.
+RefuseManualStart=yes
+ConditionPathExists=/run/ramshared/future-activation-transaction-not-implemented
+
+[Service]
+Type=oneshot
+Slice=ramshared-control.slice
+# Even a dependency-triggered attempt is inert and reports failure: no
+# preflight, module/device operation, daemon, or service activation is run.
+ExecStart=/usr/bin/false
+RemainAfterExit=no

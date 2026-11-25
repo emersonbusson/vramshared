@@ -1,0 +1,16 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/ramshared-cushion.desktop.in
+[Desktop Entry]
+Type=Application
+Name=RamShared Cushion
+Comment=Borrow idle GPU memory when RAM is tight — give it back when the GPU needs it
+Exec=@SCRIPTS_PATH@/cascade-app.sh --gui menu
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=memory;swap;vram;gpu;wsl;
+StartupNotify=true

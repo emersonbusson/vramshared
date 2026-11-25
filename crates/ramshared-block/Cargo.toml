@@ -1,0 +1,28 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-block/Cargo.toml
+[package]
+name = "ramshared-block"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ramshared-vram = { path = "../ramshared-vram" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ramshared-config = { path = "../ramshared-config" }
+# Descriptor-bound Linux origin and emergency backing operations.
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

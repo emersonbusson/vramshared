@@ -1,0 +1,36 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-agent/Cargo.toml
+[package]
+name = "ramshared-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ramshared_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ramshared-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "ramshared-host-agent"
+path = "src/bin/ramshared_host_agent.rs"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[dependencies]
+ramshared-broker = { path = "../ramshared-broker" }
+ramshared-exec = { path = "../ramshared-exec" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

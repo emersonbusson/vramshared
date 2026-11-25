@@ -1,0 +1,1 @@
+{"type":"status_reply","tenants":[{"id":1,"name":"wsl2","psi":{"avg10":1.25,"avg60":0.5,"stall_us":12},"slices":[0,1],"present":true,"bytes_served":4096}],"slices":[{"id":0,"offset":0,"len":64,"tenant":1,"state":"Active"}],"slice_io":[{"id":0,"bytes_served":4096,"io_count":1}],"last_rebalance_secs":42}

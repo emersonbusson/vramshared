@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: packaging/arch/ramshared.install
+set -euo pipefail
+
+post_install() {
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+    fi
+    # AUD-38: installation finishes Installed/Off. No udev trigger and no
+    # auto-activation announcement: a hook that turns a successful install
+    # into activation consent, or that fires device discovery early, is an
+    # implicit lifecycle route beside the sealed cascade unit.
+    echo "RamShared installed (Installed/Off)."
+    echo "Activation is opt-in and requires an attended scoped approval."
+    echo "Run 'sudo ramshared check' to test machine readiness."
+}
+
+post_upgrade() {
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+    fi
+}
+
+pre_remove() {
+    # ALPM invokes pre_remove for removal and passes the old package version.
+    # The canonical hook owns the teardown decision.
+
+    local hook="/usr/lib/ramshared/package-lifecycle-hook.sh"
+    if [[ -x "$hook" ]]; then
+        "$hook" remove
+        return $?
+    fi
+
+    # A missing hook cannot prove that all managed resources are inactive.
+    echo "ramshared: lifecycle hook is missing; refusing to stop the backing daemon without an owned drain" >&2
+    return 1
+}

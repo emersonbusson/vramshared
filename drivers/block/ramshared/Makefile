@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: drivers/block/ramshared/Makefile
+#
+# Makefile for the RamShared in-tree kernel driver.
+#
+
+obj-$(CONFIG_BLK_DEV_RAMSHARED) += ramshared.o
+
+ramshared-y := main.o dma.o queue.o control.o
+
+# Standalone build support
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+default:
+	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_BLK_DEV_RAMSHARED=m modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean

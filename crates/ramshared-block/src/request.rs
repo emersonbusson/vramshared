@@ -1,0 +1,709 @@
+// Author: Emerson Busson
+// Email: emersonbusson@gmail.com
+// GitHub: https://github.com/emersonbusson
+// LinkedIn: https://www.linkedin.com/in/emersonbusson
+// Source: https://github.com/emersonbusson/vramshared
+// File: crates/ramshared-block/src/request.rs
+//! NBD request execution over a `BlockBackend`.
+//! Pure computation + memory I/O — zero syscalls, zero sockets (DT-7/DT-17).
+
+use crate::protocol::{Command, NBD_CMD_FLAG_FUA, Request, SIMPLE_REPLY_LEN, encode_simple_reply};
+
+// errno in simple reply (re-exported from protocol for backward compatibility).
+pub use crate::protocol::{NBD_EACCES, NBD_EINVAL, NBD_EIO, NBD_EPERM, NBD_ERANGE, NBD_OK};
+
+/// Storage backend error (e.g., CUDA failure in the hot path).
+#[derive(Debug)]
+pub struct IoError(pub String);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteOptions {
+    pub fua: bool,
+}
+
+/// Abstract storage backend for the NBD worker.
+/// The trait does NOT expose async — the single worker thread processes requests
+/// synchronously (bounded latency, zero context switching overhead, DT-7).
+pub trait BlockBackend {
+    /// Total device capacity in bytes (must be multiple of block_size).
+    fn size_bytes(&self) -> u64;
+    /// Logical block size (multiple of 512; 4096 in the MVP — SPEC §8).
+    fn block_size(&self) -> u32;
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), IoError>;
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), IoError>;
+    fn write_at_with_options(
+        &mut self,
+        off: u64,
+        data: &[u8],
+        options: WriteOptions,
+    ) -> Result<(), IoError> {
+        self.write_at(off, data)?;
+        if options.fua {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), IoError>;
+}
+
+/// The shared serving contract (SPEC `wsl2-nbd-serving-throughput` DT-3).
+///
+/// Positional I/O takes `&self`, so one backend serves concurrent requests;
+/// each implementation owns its synchronization. `serve()` runs over a shared
+/// backend through the blanket `BlockBackend for &T` impl below, so the
+/// dispatch logic exists once.
+pub trait SharedBlockBackend: Send + Sync {
+    fn size_bytes(&self) -> u64;
+    fn block_size(&self) -> u32;
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), IoError>;
+    fn write_at(&self, off: u64, data: &[u8]) -> Result<(), IoError>;
+    fn write_at_with_options(
+        &self,
+        off: u64,
+        data: &[u8],
+        options: WriteOptions,
+    ) -> Result<(), IoError> {
+        self.write_at(off, data)?;
+        if options.fua {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), IoError>;
+}
+
+/// A shared backend is a block backend: the pool takes `&mut &T` and the
+/// existing `serve()` dispatch runs unchanged.
+impl<T: SharedBlockBackend + ?Sized> BlockBackend for &T {
+    fn size_bytes(&self) -> u64 {
+        (**self).size_bytes()
+    }
+
+    fn block_size(&self) -> u32 {
+        (**self).block_size()
+    }
+
+    fn is_read_only(&self) -> bool {
+        (**self).is_read_only()
+    }
+
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), IoError> {
+        (**self).read_at(off, buf)
+    }
+
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), IoError> {
+        (**self).write_at(off, data)
+    }
+
+    fn write_at_with_options(
+        &mut self,
+        off: u64,
+        data: &[u8],
+        options: WriteOptions,
+    ) -> Result<(), IoError> {
+        (**self).write_at_with_options(off, data, options)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        (**self).flush()
+    }
+}
+
+/// Outcome of the dispatch: reply bytes, read data (if READ) and whether the
+/// client requested disconnect (`NBD_CMD_DISC`).
+pub struct ServeOutcome {
+    pub reply: [u8; SIMPLE_REPLY_LEN],
+    pub read_data: Vec<u8>,
+    pub disconnect: bool,
+}
+
+fn errno_of(r: Result<(), IoError>) -> u32 {
+    match r {
+        Ok(()) => NBD_OK,
+        Err(_) => NBD_EIO,
+    }
+}
+
+/// Validates alignment and range (SPEC §8): unaligned or out of range = EINVAL,
+/// **before** touching the backend.
+fn validate<B: BlockBackend + ?Sized>(req: &Request, backend: &B) -> Result<(), u32> {
+    let bs = backend.block_size() as u64;
+    if bs == 0 {
+        return Err(NBD_EINVAL);
+    }
+    if !req.offset.is_multiple_of(bs) {
+        return Err(NBD_EINVAL);
+    }
+    if !(req.len as u64).is_multiple_of(bs) {
+        return Err(NBD_EINVAL);
+    }
+
+    let Some(end) = req.offset.checked_add(req.len as u64) else {
+        return Err(NBD_ERANGE);
+    };
+    if end > backend.size_bytes() {
+        return Err(NBD_ERANGE);
+    }
+
+    if req.cmd == Command::Write && backend.is_read_only() {
+        return Err(NBD_EACCES);
+    }
+
+    Ok(())
+}
+
+fn validate_command_flags(req: &Request) -> Result<WriteOptions, u32> {
+    match req.cmd {
+        Command::Write if req.flags & !NBD_CMD_FLAG_FUA == 0 => Ok(WriteOptions {
+            fua: req.flags & NBD_CMD_FLAG_FUA != 0,
+        }),
+        Command::Write => Err(NBD_EINVAL),
+        _ if req.flags == 0 => Ok(WriteOptions::default()),
+        _ => Err(NBD_EINVAL),
+    }
+}
+
+/// Dispatches an already parsed request. `payload` is the WRITE data (empty for
+/// others). Does no socket I/O — only logic (testable without root).
+pub fn serve<B: BlockBackend + ?Sized>(
+    req: &Request,
+    payload: &[u8],
+    backend: &mut B,
+) -> ServeOutcome {
+    let reply = |error: u32| encode_simple_reply(error, req.handle);
+    let plain = |error: u32| ServeOutcome {
+        reply: reply(error),
+        read_data: Vec::new(),
+        disconnect: false,
+    };
+
+    let options = match validate_command_flags(req) {
+        Ok(options) => options,
+        Err(error) => return plain(error),
+    };
+
+    match req.cmd {
+        Command::Read => {
+            if let Err(e) = validate(req, backend) {
+                return plain(e);
+            }
+            let mut read_data = vec![0u8; req.len as usize];
+            let err = errno_of(backend.read_at(req.offset, &mut read_data));
+            if err != NBD_OK {
+                read_data.clear();
+            }
+            ServeOutcome {
+                reply: reply(err),
+                read_data,
+                disconnect: false,
+            }
+        }
+        Command::Write => {
+            if payload.len() != req.len as usize {
+                return plain(NBD_EINVAL);
+            }
+            if let Err(e) = validate(req, backend) {
+                return plain(e);
+            }
+            let err = errno_of(backend.write_at_with_options(req.offset, payload, options));
+            plain(err)
+        }
+        Command::Flush => {
+            let err = errno_of(backend.flush());
+            plain(err)
+        }
+        Command::Trim => {
+            if let Err(e) = validate(req, backend) {
+                return plain(e);
+            }
+            plain(NBD_OK)
+        }
+        Command::Disc => ServeOutcome {
+            reply: reply(NBD_OK),
+            read_data: Vec::new(),
+            disconnect: true,
+        },
+        Command::Unknown(_) => plain(NBD_EINVAL),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    struct MemBackend {
+        data: Vec<u8>,
+        bs: u32,
+    }
+
+    impl BlockBackend for MemBackend {
+        fn size_bytes(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn block_size(&self) -> u32 {
+            self.bs
+        }
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), IoError> {
+            let o = off as usize;
+            buf.copy_from_slice(&self.data[o..o + buf.len()]);
+            Ok(())
+        }
+        fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), IoError> {
+            let o = off as usize;
+            self.data[o..o + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    fn req(cmd: Command, offset: u64, len: u32) -> Request {
+        Request {
+            flags: 0,
+            cmd,
+            handle: 0x42,
+            offset,
+            len,
+        }
+    }
+
+    #[test]
+    fn read_write_cycle() {
+        let mut b = MemBackend {
+            data: vec![0u8; 8192],
+            bs: 4096,
+        };
+        let w = serve(&req(Command::Write, 0, 4096), &[0xEF; 4096], &mut b);
+        assert_eq!(
+            u32::from_be_bytes([w.reply[4], w.reply[5], w.reply[6], w.reply[7]]),
+            NBD_OK
+        );
+        let r = serve(&req(Command::Read, 0, 4096), &[], &mut b);
+        assert_eq!(r.read_data, vec![0xEF; 4096]);
+    }
+
+    #[test]
+    fn out_of_range_is_erange_not_corruption() {
+        let mut b = MemBackend {
+            data: vec![0u8; 8192],
+            bs: 4096,
+        };
+        let r = serve(&req(Command::Read, 8192, 4096), &[], &mut b);
+        assert_eq!(
+            u32::from_be_bytes([r.reply[4], r.reply[5], r.reply[6], r.reply[7]]),
+            NBD_ERANGE
+        );
+        assert!(r.read_data.is_empty());
+    }
+
+    struct ReadOnlyBackend;
+
+    impl BlockBackend for ReadOnlyBackend {
+        fn size_bytes(&self) -> u64 {
+            4096
+        }
+        fn block_size(&self) -> u32 {
+            4096
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        fn read_at(&mut self, _off: u64, buf: &mut [u8]) -> Result<(), IoError> {
+            buf.fill(0);
+            Ok(())
+        }
+        fn write_at(&mut self, _off: u64, _data: &[u8]) -> Result<(), IoError> {
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_only_backend_rejects_write_with_eacces() {
+        let mut b = ReadOnlyBackend;
+        let r = serve(&req(Command::Write, 0, 4096), &vec![0u8; 4096], &mut b);
+        assert_eq!(
+            u32::from_be_bytes([r.reply[4], r.reply[5], r.reply[6], r.reply[7]]),
+            NBD_EACCES
+        );
+    }
+
+    #[test]
+    fn unaligned_is_rejected_before_backend() {
+        let mut b = MemBackend {
+            data: vec![0u8; 8192],
+            bs: 4096,
+        };
+        let r = serve(&req(Command::Read, 100, 4096), &[], &mut b);
+        assert_eq!(
+            u32::from_be_bytes([r.reply[4], r.reply[5], r.reply[6], r.reply[7]]),
+            NBD_EINVAL
+        );
+    }
+
+    #[test]
+    fn write_fua_flushes_backend() {
+        struct FlushCountingBackend {
+            writes: usize,
+            flushes: usize,
+        }
+
+        impl BlockBackend for FlushCountingBackend {
+            fn size_bytes(&self) -> u64 {
+                4096
+            }
+            fn block_size(&self) -> u32 {
+                4096
+            }
+            fn read_at(&mut self, _off: u64, _buf: &mut [u8]) -> Result<(), IoError> {
+                Ok(())
+            }
+            fn write_at(&mut self, _off: u64, _data: &[u8]) -> Result<(), IoError> {
+                self.writes += 1;
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<(), IoError> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let mut backend = FlushCountingBackend {
+            writes: 0,
+            flushes: 0,
+        };
+        let mut req = req(Command::Write, 0, 4096);
+        req.flags = NBD_CMD_FLAG_FUA;
+
+        let outcome = serve(&req, &[0xAA; 4096], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                outcome.reply[4],
+                outcome.reply[5],
+                outcome.reply[6],
+                outcome.reply[7]
+            ]),
+            NBD_OK
+        );
+        assert_eq!(backend.writes, 1);
+        assert_eq!(backend.flushes, 1);
+    }
+
+    #[test]
+    fn zero_block_size_is_einval() {
+        let mut b = MemBackend {
+            data: vec![0u8; 4096],
+            bs: 0,
+        };
+        let r = serve(&req(Command::Read, 0, 0), &[], &mut b);
+        assert_eq!(
+            u32::from_be_bytes([r.reply[4], r.reply[5], r.reply[6], r.reply[7]]),
+            NBD_EINVAL
+        );
+    }
+
+    #[test]
+    fn unaligned_length_is_einval() {
+        let mut b = MemBackend {
+            data: vec![0u8; 8192],
+            bs: 4096,
+        };
+        let r = serve(&req(Command::Read, 0, 100), &[], &mut b);
+        assert_eq!(
+            u32::from_be_bytes([r.reply[4], r.reply[5], r.reply[6], r.reply[7]]),
+            NBD_EINVAL
+        );
+    }
+
+    #[test]
+    fn extent_overflow_is_erange() {
+        let mut b = MemBackend {
+            data: vec![0u8; 4096],
+            bs: 4096,
+        };
+        let r = serve(&req(Command::Read, u64::MAX - 4095, 8192), &[], &mut b);
+        assert_eq!(
+            u32::from_be_bytes([r.reply[4], r.reply[5], r.reply[6], r.reply[7]]),
+            NBD_ERANGE
+        );
+    }
+
+    struct FailingBackend;
+
+    impl BlockBackend for FailingBackend {
+        fn size_bytes(&self) -> u64 {
+            4096
+        }
+
+        fn block_size(&self) -> u32 {
+            4096
+        }
+
+        fn read_at(&mut self, _off: u64, _buf: &mut [u8]) -> Result<(), IoError> {
+            Err(IoError("read failure".into()))
+        }
+
+        fn write_at(&mut self, _off: u64, _data: &[u8]) -> Result<(), IoError> {
+            Err(IoError("write failure".into()))
+        }
+
+        fn flush(&mut self) -> Result<(), IoError> {
+            Err(IoError("flush failure".into()))
+        }
+    }
+
+    #[test]
+    fn backend_failures_return_eio_and_clear_failed_read_data() {
+        let mut backend = FailingBackend;
+
+        let read = serve(&req(Command::Read, 0, 4096), &[], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([read.reply[4], read.reply[5], read.reply[6], read.reply[7]]),
+            NBD_EIO
+        );
+        assert!(read.read_data.is_empty());
+
+        let write = serve(&req(Command::Write, 0, 4096), &[0xAA; 4096], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                write.reply[4],
+                write.reply[5],
+                write.reply[6],
+                write.reply[7]
+            ]),
+            NBD_EIO
+        );
+
+        let flush = serve(&req(Command::Flush, 0, 0), &[], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                flush.reply[4],
+                flush.reply[5],
+                flush.reply[6],
+                flush.reply[7]
+            ]),
+            NBD_EIO
+        );
+    }
+
+    #[test]
+    fn unsupported_flags_are_rejected_before_backend_access() {
+        let mut backend = MemBackend {
+            data: vec![0u8; 4096],
+            bs: 4096,
+        };
+        let mut write = req(Command::Write, 0, 4096);
+        write.flags = NBD_CMD_FLAG_FUA | (1 << 1);
+        let rejected_write = serve(&write, &[0xAA; 4096], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                rejected_write.reply[4],
+                rejected_write.reply[5],
+                rejected_write.reply[6],
+                rejected_write.reply[7]
+            ]),
+            NBD_EINVAL
+        );
+        assert_eq!(backend.data, vec![0; 4096]);
+
+        let mut read = req(Command::Read, 0, 4096);
+        read.flags = NBD_CMD_FLAG_FUA;
+        let rejected_read = serve(&read, &[], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                rejected_read.reply[4],
+                rejected_read.reply[5],
+                rejected_read.reply[6],
+                rejected_read.reply[7]
+            ]),
+            NBD_EINVAL
+        );
+    }
+
+    #[test]
+    fn write_requires_payload_matching_declared_length() {
+        let mut backend = MemBackend {
+            data: vec![0u8; 4096],
+            bs: 4096,
+        };
+        let outcome = serve(&req(Command::Write, 0, 4096), &[0xAA; 512], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                outcome.reply[4],
+                outcome.reply[5],
+                outcome.reply[6],
+                outcome.reply[7]
+            ]),
+            NBD_EINVAL
+        );
+        assert_eq!(backend.data, vec![0; 4096]);
+    }
+
+    #[test]
+    fn trim_validates_range_and_disc_disconnects() {
+        let mut backend = MemBackend {
+            data: vec![0u8; 4096],
+            bs: 4096,
+        };
+        let valid_trim = serve(&req(Command::Trim, 0, 4096), &[], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                valid_trim.reply[4],
+                valid_trim.reply[5],
+                valid_trim.reply[6],
+                valid_trim.reply[7]
+            ]),
+            NBD_OK
+        );
+        assert!(!valid_trim.disconnect);
+
+        let invalid_trim = serve(&req(Command::Trim, 4096, 4096), &[], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                invalid_trim.reply[4],
+                invalid_trim.reply[5],
+                invalid_trim.reply[6],
+                invalid_trim.reply[7]
+            ]),
+            NBD_ERANGE
+        );
+
+        let disconnect = serve(&req(Command::Disc, 0, 0), &[], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                disconnect.reply[4],
+                disconnect.reply[5],
+                disconnect.reply[6],
+                disconnect.reply[7]
+            ]),
+            NBD_OK
+        );
+        assert!(disconnect.disconnect);
+
+        let unknown = serve(&req(Command::Unknown(0xffff), 0, 0), &[], &mut backend);
+        assert_eq!(
+            u32::from_be_bytes([
+                unknown.reply[4],
+                unknown.reply[5],
+                unknown.reply[6],
+                unknown.reply[7]
+            ]),
+            NBD_EINVAL
+        );
+        assert!(!unknown.disconnect);
+    }
+
+    /// The trait defaults are part of the serving contract: a backend that
+    /// only implements the required methods must still write through
+    /// `write_at_with_options`, and only `fua` may force a flush.
+    #[test]
+    fn default_write_options_flush_only_for_fua() {
+        struct CountingBackend {
+            writes: usize,
+            flushes: usize,
+        }
+
+        impl BlockBackend for CountingBackend {
+            fn size_bytes(&self) -> u64 {
+                4096
+            }
+            fn block_size(&self) -> u32 {
+                4096
+            }
+            fn read_at(&mut self, _off: u64, _buf: &mut [u8]) -> Result<(), IoError> {
+                Ok(())
+            }
+            fn write_at(&mut self, _off: u64, _data: &[u8]) -> Result<(), IoError> {
+                self.writes += 1;
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<(), IoError> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let mut backend = CountingBackend {
+            writes: 0,
+            flushes: 0,
+        };
+        assert!(!backend.is_read_only(), "the default backend is writable");
+        backend
+            .write_at_with_options(0, b"x", WriteOptions { fua: false })
+            .unwrap();
+        backend
+            .write_at_with_options(0, b"x", WriteOptions { fua: true })
+            .unwrap();
+        assert_eq!(backend.writes, 2);
+        assert_eq!(backend.flushes, 1);
+    }
+
+    /// The shared backend is reachable as a block backend through the blanket
+    /// `&T` impl; its default `write_at_with_options` and `is_read_only` are
+    /// the production serve path, not dead code.
+    #[test]
+    fn shared_backend_blanket_serves_defaults() {
+        struct SharedBackend {
+            data: std::sync::Mutex<Vec<u8>>,
+            writes: std::sync::atomic::AtomicUsize,
+            flushes: std::sync::atomic::AtomicUsize,
+        }
+
+        impl SharedBlockBackend for SharedBackend {
+            fn size_bytes(&self) -> u64 {
+                4096
+            }
+            fn block_size(&self) -> u32 {
+                4096
+            }
+            fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), IoError> {
+                let start = off as usize;
+                buf.copy_from_slice(&self.data.lock().unwrap()[start..start + buf.len()]);
+                Ok(())
+            }
+            fn write_at(&self, off: u64, data: &[u8]) -> Result<(), IoError> {
+                let start = off as usize;
+                self.data.lock().unwrap()[start..start + data.len()].copy_from_slice(data);
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn flush(&self) -> Result<(), IoError> {
+                self.flushes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let shared = SharedBackend {
+            data: std::sync::Mutex::new(vec![0u8; 4096]),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+            flushes: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut backend = &shared;
+        assert!(!backend.is_read_only());
+        backend
+            .write_at_with_options(0, b"y", WriteOptions { fua: false })
+            .unwrap();
+        backend
+            .write_at_with_options(0, b"y", WriteOptions { fua: true })
+            .unwrap();
+        assert_eq!(backend.writes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(backend.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let outcome = serve(&req(Command::Read, 0, 4096), &[], &mut backend);
+        assert_eq!(outcome.read_data.len(), 4096);
+        assert_eq!(outcome.read_data[0], b'y');
+    }
+}

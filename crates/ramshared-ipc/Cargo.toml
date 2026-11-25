@@ -1,0 +1,35 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: crates/ramshared-ipc/Cargo.toml
+[package]
+name = "ramshared-ipc"
+description = "Shared host-guest IPC protocol for RamShared vsock control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ramshared-vram = { path = "../ramshared-vram" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Networking_WinSock",
+    "Win32_System_Hypervisor",
+] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

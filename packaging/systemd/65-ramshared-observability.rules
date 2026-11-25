@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: packaging/systemd/65-ramshared-observability.rules
+# RamShared - Linux Observability, UDisks2, and btop/htop Auto-Discovery Rules
+#
+# Scope (AUD-43): presentation and queue tuning for devices this product
+# *exclusively names*. A name glob over a generic kernel namespace — `ublkb*`,
+# `nbd[0-9]*` — is not a RamShared ownership record. Other applications
+# legitimately create such devices, and a declarative rule cannot tell them
+# apart at `add` time, so those namespaces are deliberately absent here.
+# Ownership-scoped presentation of the product's own ublk/NBD devices is the
+# effect of the owner that created them (exact device, at attach time), never
+# a name glob in a rule file.
+#
+# Presentation metadata stays out of the authorization path: nothing here
+# gates admission, swap activation or an effect. It only labels a device the
+# product already owns by name.
+
+# In-Tree RamShared Kernel Block Driver (/dev/ramshared*)
+#
+# `ramshared[0-9]*` is created by this product's own kernel driver, so the
+# name predicate is an ownership record. Each owned device gets its own
+# alias: two devices never fight over one symlink target.
+KERNEL=="ramshared[0-9]*", SUBSYSTEM=="block", ACTION=="add|change", \
+    ENV{ID_VENDOR}="RamShared", \
+    ENV{ID_MODEL}="GPU_VRAM_Tier", \
+    ENV{ID_BUS}="pci", \
+    ENV{ID_TYPE}="disk", \
+    ENV{UDISKS_PRESENTATION_NAME}="RamShared GPU VRAM", \
+    ENV{UDISKS_PRESENTATION_ICON_NAME}="drive-harddisk-solidstate", \
+    ENV{UDISKS_SYSTEM}="1", \
+    SYMLINK+="disk/by-id/ramshared-vram-$kernel"
+
+# Synchronous VRAM Block Queue Tuning (Zero-Seek, None Scheduler)
+#
+# Scoped to the exclusively-owned name above. A queue attribute is a real
+# behaviour change: it is never applied to a device this product did not name.
+ACTION=="add", KERNEL=="ramshared[0-9]*", SUBSYSTEM=="block", \
+    ATTR{queue/rotational}="0", \
+    ATTR{queue/nomerges}="2", \
+    ATTR{queue/read_ahead_kb}="0", \
+    ATTR{queue/add_random}="0", \
+    ATTR{queue/scheduler}="none"

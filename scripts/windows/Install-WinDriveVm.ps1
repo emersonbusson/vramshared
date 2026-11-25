@@ -1,0 +1,128 @@
+#Requires -Version 5.1
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/windows/Install-WinDriveVm.ps1
+<#
+.SYNOPSIS
+  Elevated host: rebuild (optional), sign, deploy INF+sys to win11-drill, start backend.
+#>
+[CmdletBinding()]
+param(
+    [string]$RepoRoot = "C:\ramshared\src",
+    [switch]$SkipBuild,
+    [string]$PfxPath = "C:\ramshared\artifacts\certs\ramshared-test.pfx",
+    [string]$ArtifactRoot = "C:\ramshared\artifacts",
+    [string]$PfxPassword = $env:RAMSHARED_TESTSIGN_PFX_PASSWORD,
+    [string]$VmName = "win11-drill",
+    [string]$GuestUser = "WIN11-DRILL\drilladmin",
+    [string]$GuestPassword = $env:RAMSHARED_DRILL_PASSWORD
+)
+
+$ErrorActionPreference = "Continue"
+$log = Join-Path $ArtifactRoot "install-windrive-vm.log"
+New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null
+Start-Transcript -Path $log -Force
+
+if ([string]::IsNullOrEmpty($PfxPassword)) {
+    throw "Set -PfxPassword or env RAMSHARED_TESTSIGN_PFX_PASSWORD."
+}
+if ([string]::IsNullOrEmpty($GuestPassword)) {
+    throw "Set -GuestPassword or env RAMSHARED_DRILL_PASSWORD."
+}
+
+if (-not $SkipBuild) {
+    & "$RepoRoot\scripts\windows\Build-Drivers.ps1" -RepoRoot $RepoRoot
+    if ($LASTEXITCODE -ne 0 -and -not (Test-Path "$RepoRoot\drivers\windows\ramshared\x64\Release\ramshared.sys")) {
+        throw "build failed"
+    }
+}
+
+$env:RAMSHARED_TESTSIGN_PFX_PASSWORD = $PfxPassword
+& "$RepoRoot\scripts\windows\Sign-Drivers.ps1" -RepoRoot $RepoRoot -PfxPath $PfxPath -PfxPassword $PfxPassword
+
+$pass = ConvertTo-SecureString $GuestPassword -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential($GuestUser, $pass)
+if ((Get-VM $VmName).State -ne "Running") { Start-VM $VmName; Start-Sleep 6 }
+$sess = New-PSSession -VMName $VmName -Credential $cred
+
+# Stage files
+Invoke-Command -Session $sess -ScriptBlock {
+    New-Item -ItemType Directory -Force -Path C:\ramshared\bin, C:\ramshared\package, C:\ramshared\scripts\windows | Out-Null
+}
+Copy-Item "$RepoRoot\drivers\windows\ramshared\x64\Release\ramshared.sys" -Destination C:\ramshared\package\ramshared.sys -ToSession $sess -Force
+Copy-Item "$RepoRoot\drivers\windows\tools\poolstress\x64\Release\poolstress.sys" -Destination C:\ramshared\package\poolstress.sys -ToSession $sess -Force
+Copy-Item "$RepoRoot\drivers\windows\ramshared\ramshared.inf" -Destination C:\ramshared\package\ramshared.inf -ToSession $sess -Force
+Copy-Item "$RepoRoot\scripts\windows\*.ps1" -Destination C:\ramshared\scripts\windows\ -ToSession $sess -Force
+$cer = [IO.Path]::ChangeExtension($PfxPath, ".cer")
+if (Test-Path $cer) {
+    Copy-Item $cer -Destination C:\ramshared\package\ramshared-test.cer -ToSession $sess -Force
+}
+
+$result = Invoke-Command -Session $sess -ScriptBlock {
+    $ErrorActionPreference = "Continue"
+    $o = @()
+    if (Test-Path C:\ramshared\package\ramshared-test.cer) {
+        certutil.exe -f -addstore Root C:\ramshared\package\ramshared-test.cer | Out-Null
+        certutil.exe -f -addstore TrustedPublisher C:\ramshared\package\ramshared-test.cer | Out-Null
+    }
+
+    # Tear down legacy sc services if present
+    sc.exe stop ramshared 2>$null | Out-Null
+    sc.exe stop poolstress 2>$null | Out-Null
+    sc.exe delete poolstress 2>$null | Out-Null
+    Start-Sleep 2
+
+    # poolstress remains a standalone legacy lab driver. RamShared uses DIRID 13.
+    Copy-Item C:\ramshared\package\poolstress.sys C:\Windows\System32\drivers\poolstress.sys -Force
+
+    # INF install
+    $inf = "C:\ramshared\package\ramshared.inf"
+    $pn = pnputil /add-driver $inf /install 2>&1 | Out-String
+    $o += "PNPUTIL=$pn"
+    if ($LASTEXITCODE -ne 0) {
+        throw "driver-store publication failed (pnputil /add-driver exit=$LASTEXITCODE)"
+    }
+
+    # One owner of root-device creation (AUD-46). PnPUtil has no /add-device
+    # verb at any Windows version; the previous call printed usage and moved on.
+    . (Join-Path $PSScriptRoot "RootDevice.ps1")
+    $root = Install-RamSharedLabRootDevice -InfPath $inf
+    $o += "ROOT_DEVICE outcome=$($root.Outcome) count=$($root.DeviceCount) exit=$($root.ExitCode) $($root.Detail)"
+    if ($root.ExitCode -ne 0) {
+        throw "root registration refused: $($root.Detail)"
+    }
+
+    # Fallback: legacy sc for both if INF fails to start
+    sc.exe create poolstress type= kernel start= demand binPath= C:\Windows\System32\drivers\poolstress.sys 2>&1 | Out-Null
+    sc.exe start poolstress 2>&1 | Out-String | ForEach-Object { $o += "START_POOL=$_" }
+
+    # The INF must own service creation and its Driver Store ImagePath.
+    sc.exe start ramshared 2>&1 | Out-String | ForEach-Object { $o += "START_RAM=$_" }
+
+    $o += "Q_RAM=$((sc.exe query ramshared | Out-String))"
+    $o += "Q_POOL=$((sc.exe query poolstress | Out-String))"
+    $o += "DISKS=$((Get-Disk | Select Number,FriendlyName,Size | ConvertTo-Json -Compress))"
+    $o -join "`n"
+}
+Write-Output $result
+
+# Start backend loop in background on guest (30s smoke)
+$job = Invoke-Command -Session $sess -AsJob -ScriptBlock {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ramshared\scripts\windows\Invoke-WinDriveBackend.ps1 -SizeBytes 268435456 -QueueDepth 4 -Seconds 45 2>&1 | Out-String
+}
+Write-Output "BACKEND_JOB=$($job.Id)"
+Wait-Job $job -Timeout 90 | Out-Null
+$backendOut = Receive-Job $job
+Write-Output "BACKEND_OUT=$backendOut"
+
+$disks = Invoke-Command -Session $sess -ScriptBlock {
+    Get-Disk | Select-Object Number, FriendlyName, Size, PartitionStyle, OperationalStatus | ConvertTo-Json -Compress
+}
+Write-Output "DISKS_AFTER=$disks"
+
+Remove-PSSession $sess
+Write-Output "INSTALL_WINDRIVE_DONE"
+Stop-Transcript

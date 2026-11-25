@@ -1,0 +1,48 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: .gitignore
+
+# Rust / Cargo build outputs
+/target/
+
+# Packaging and release staging outputs
+/artifacts/
+/artifacts/packages/
+
+# Windows driver build artifacts
+/drivers/windows/ramshared/x64/
+/drivers/windows/tools/poolstress/x64/
+/scripts/windows/ramshared-host-launch.exe
+
+# Linux kernel module kbuild products
+/drivers/block/ramshared/*.o
+/drivers/block/ramshared/*.ko
+/drivers/block/ramshared/*.mod
+/drivers/block/ramshared/*.mod.c
+/drivers/block/ramshared/*.cmd
+/drivers/block/ramshared/..*.cmd
+/drivers/block/ramshared/Module.symvers
+/drivers/block/ramshared/modules.order
+
+# Runtime logs, local secrets, and temporary files
+*.log
+*.prev.log
+.armed
+.env
+.env.*
+*.env
+*.secret
+*.secrets
+*.local-secret
+.drill-pw
+*.drill-pw
+__pycache__/
+*.pyc
+.pytest_cache/
+/tmp/
+/temp/
+.vscode/
+.idea/
