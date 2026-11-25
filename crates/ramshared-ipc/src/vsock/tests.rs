@@ -93,6 +93,56 @@ fn vsock_listen_finishes_within_deadline() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn vsock_listen_cancellable_stops_promptly_and_fires_idle_once() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let already_stopped = AtomicBool::new(true);
+    assert!(matches!(
+        listen_vsock_cancellable(50003, None, &already_stopped, None, || {}),
+        Err(VsockError::AcceptTimeout)
+    ));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_trigger = Arc::clone(&stop);
+    let idle_hits = Arc::new(AtomicUsize::new(0));
+    let idle_hits_cb = Arc::clone(&idle_hits);
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        stop_trigger.store(true, Ordering::Release);
+    });
+    let started = Instant::now();
+    let result = listen_vsock_cancellable(
+        50004,
+        None,
+        &stop,
+        Some(Duration::from_millis(20)),
+        move || {
+            idle_hits_cb.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    stopper.join().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "cancellable listener must stop promptly instead of stalling: {elapsed:?}"
+    );
+    match result {
+        Err(VsockError::AcceptTimeout) => {
+            assert_eq!(
+                idle_hits.load(Ordering::SeqCst),
+                1,
+                "idle transition callback must fire at most once"
+            );
+        }
+        Err(VsockError::ConnectFailed(_)) | Err(VsockError::Unsupported) => {}
+        Err(other) => panic!("unexpected cancellable listen error: {other}"),
+        Ok(_) => panic!("unexpected connection on ephemeral test port"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn vsock_connect_rejects_zero_port_before_socket_io() {
     let result = connect_vsock(2, 0, Duration::from_millis(100));
     assert!(matches!(
@@ -411,6 +461,30 @@ fn unix_vsock_stream_forwards_io_timeouts_and_shutdown() {
     stream.shutdown_both().unwrap();
     let mut trailing = [0; 1];
     assert_eq!(peer.read(&mut trailing).unwrap(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nonblocking_accept_retries_empty_queue_and_returns_blocking_stream() {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let dir = std::env::temp_dir().join(format!("ramshared-vsock-accept-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("listener");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let fd: OwnedFd = listener.into();
+    assert!(accept_vsock_linux(&fd).unwrap().is_none());
+
+    let _client = UnixStream::connect(&path).unwrap();
+    let stream = accept_vsock_linux(&fd).unwrap().unwrap();
+    // SAFETY: the stream owns the descriptor throughout the query.
+    let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
 }
 
 #[cfg(target_os = "linux")]

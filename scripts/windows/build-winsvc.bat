@@ -34,7 +34,9 @@ mkdir C:\ProgramData\RamShared\evidence 2>nul
 copy /Y target\release\ramshared-winsvc.exe C:\ramshared\bin\ramshared-winsvc.exe
 copy /Y target\release\ramshared-winbroker.exe C:\ramshared\bin\ramshared-winbroker.exe
 copy /Y target\release\ramshared-service-sid-probe.exe C:\ramshared\bin\ramshared-service-sid-probe.exe
-copy /Y crates\ramshared-winsvc\winsvc.example.toml C:\ProgramData\RamShared\winsvc.toml
+if not exist C:\ProgramData\RamShared\winsvc.toml (
+  copy crates\ramshared-winsvc\winsvc.example.toml C:\ProgramData\RamShared\winsvc.toml
+)
 echo BUILD_OK
 dir C:\ramshared\bin\ramshared-winsvc.exe
 exit /b 0

@@ -593,3 +593,40 @@ fn ipc_v5_storage_proof_publishes_host_volume_telemetry_and_bounds_free_space() 
         let _ = child.join();
     }
 }
+
+#[test]
+fn compose_cache_admission_with_stop_cancels_blocking_attempt_on_drop() {
+    let sealed = SealedOrigin {
+        logical_capacity_mib: 16,
+        partuuid: "stop-cancel-origin".into(),
+        origin_vhdx: "/dev/null".into(),
+    };
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_attempt = Arc::clone(&entered);
+    let saw_stop = Arc::new(AtomicBool::new(false));
+    let saw_stop_attempt = Arc::clone(&saw_stop);
+    let admission = compose_cache_admission_with_stop(
+        sealed,
+        move |_session, stop| {
+            entered_attempt.store(true, Ordering::Release);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            saw_stop_attempt.store(true, Ordering::Release);
+            None
+        },
+        Duration::from_secs(10),
+    );
+    let wait_entered = std::time::Instant::now() + Duration::from_secs(2);
+    while !entered.load(Ordering::Acquire) && std::time::Instant::now() < wait_entered {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(entered.load(Ordering::Acquire));
+    let drop_started = std::time::Instant::now();
+    drop(admission);
+    assert!(
+        drop_started.elapsed() < Duration::from_secs(1),
+        "dropping admission must cancel the accept loop promptly"
+    );
+    assert!(saw_stop.load(Ordering::Acquire));
+}

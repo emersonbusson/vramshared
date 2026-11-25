@@ -17,11 +17,8 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 Slice=ramshared-control.slice
-# DT-4: hardware classification is the first non-`-` preparation. A refused
-# boot (exit 78) skips the remaining ExecStartPre lines and the gate, so the
-# origin is not mounted and the guardian is not started for a boot that must
-# stay off. DT-14 exempts that exit from restart.
-ExecStartPre=/opt/ramshared/current/scripts/safety/hardware-health.sh
+# DT-4: classify hardware in the main process. A refusal ends the command
+# before any host preparation, and systemd can apply RestartPreventExitStatus.
 # verified test case: on a cold WSL2 start the sealed origin VHDX is not attached to
 # the guest. The gate would refuse on the missing device before any cascade
 # code could attach it, so the cascade never reached its own auto-attach.
@@ -34,13 +31,11 @@ ExecStartPre=/opt/ramshared/current/scripts/safety/hardware-health.sh
 # exact twin: one bounded elevated start of the sealed named task, never a
 # registration and never a proof of its own.
 #
-# The leading `-` on both means a failed preparation does not skip the gate:
+# The best-effort preparations always give way to the gate:
 # the gate still runs, still drops any previous lease first, and still refuses
 # on the absent device or the stale proof. Preparation never outranks
 # verification.
-ExecStartPre=-/opt/ramshared/current/bin/ramshared ensure-origin
-ExecStartPre=-/opt/ramshared/current/bin/ramshared ensure-guardian
-ExecStart=/opt/ramshared/current/scripts/safety/ramshared-host-gate.sh
+ExecStart=/bin/sh -ec '/opt/ramshared/current/scripts/safety/hardware-health.sh; /opt/ramshared/current/bin/ramshared ensure-origin || :; /opt/ramshared/current/bin/ramshared ensure-guardian || :; exec /opt/ramshared/current/scripts/safety/ramshared-host-gate.sh'
 RemainAfterExit=yes
 
 # A cold boot races the guardian. `ensure-guardian` starts the producer, and

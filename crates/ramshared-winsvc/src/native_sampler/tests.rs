@@ -237,4 +237,17 @@ fn refresh_cadence_stays_well_within_budget_max_age_and_retry_is_bounded() {
     assert!(REFRESH_CADENCE < QUERY_BUDGET);
     assert!(REFRESH_CADENCE * 3 <= Duration::from_millis(GPU_BUDGET_MAX_AGE_MS));
     assert!(POLL < REFRESH_CADENCE);
+    assert!(IDLE_REFRESH_CADENCE > REFRESH_CADENCE);
+    assert!(IDLE_REFRESH_CADENCE < Duration::from_millis(GPU_BUDGET_MAX_AGE_MS));
+
+    let sampler = fresh();
+    assert_eq!(sampler.refresh_cadence(), REFRESH_CADENCE);
+    sampler.set_idle(true);
+    assert_eq!(sampler.refresh_cadence(), IDLE_REFRESH_CADENCE);
+    sampler.set_idle(false);
+    assert_eq!(sampler.refresh_cadence(), REFRESH_CADENCE);
+    sampler.set_paused(true);
+    assert!(sampler.paused.load(Ordering::Acquire));
+    sampler.set_paused(false);
+    assert!(!sampler.paused.load(Ordering::Acquire));
 }

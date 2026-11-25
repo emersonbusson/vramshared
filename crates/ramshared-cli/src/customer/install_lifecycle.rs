@@ -48,6 +48,17 @@ pub(super) struct LiveRuntimeState {
     pub(super) active_managed_swap: bool,
 }
 
+impl LiveRuntimeState {
+    pub(super) fn needs_upgrade_quiescence(&self) -> bool {
+        self.cascade_active
+            || self.supervisor_active
+            || self.health_active
+            || self.health_enabled
+            || self.boot_enrolled
+            || self.active_managed_swap
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ActivationOutcome {
     Off,
@@ -58,6 +69,7 @@ pub(super) enum ActivationOutcome {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct UpgradeQuiescenceState {
     pub(super) was_active: bool,
+    pub(super) was_supervisor_active: bool,
     pub(super) was_boot_enrolled: bool,
     pub(super) was_health_active: bool,
     pub(super) was_health_enabled: bool,
@@ -162,28 +174,39 @@ pub(super) fn prepare_seamless_auto_update(
     lifecycle: &mut dyn LifecycleHost,
 ) -> Result<PrepareUpgradeOutcome, CustomerError> {
     let state = lifecycle.observe_live_state(unit_host, boot_host)?;
+    prepare_upgrade_from_state(state, lifecycle)
+}
+
+fn prepare_upgrade_from_state(
+    state: LiveRuntimeState,
+    lifecycle: &mut dyn LifecycleHost,
+) -> Result<PrepareUpgradeOutcome, CustomerError> {
     let is_active = state.cascade_active || state.active_managed_swap;
     if is_active {
         let verdict = lifecycle.evaluate_drain_safety()?;
         if !verdict.safe {
             return Ok(PrepareUpgradeOutcome::Deferred(verdict.reason));
         }
+    }
+
+    let mut stopped = UpgradeQuiescenceState::default();
+    let mut disabled = Vec::new();
+    let prepare_result = (|| -> Result<(), CustomerError> {
         if state.cascade_active {
             lifecycle.stop_unit(CASCADE_UNIT)?;
         }
         if state.active_managed_swap {
             lifecycle.run_ordered_down()?;
         }
+        stopped.was_active = is_active;
         if state.supervisor_active {
             lifecycle.stop_unit(SUPERVISOR_UNIT)?;
+            stopped.was_supervisor_active = true;
         }
-    }
-    if state.health_active {
-        lifecycle.stop_unit(HEALTH_UNIT)?;
-    }
-
-    let mut disabled = Vec::new();
-    let disable_result = (|| -> Result<(), CustomerError> {
+        if state.health_active {
+            lifecycle.stop_unit(HEALTH_UNIT)?;
+            stopped.was_health_active = true;
+        }
         if state.boot_enrolled {
             for unit in DISABLE_ORDER {
                 lifecycle.disable_unit(unit)?;
@@ -196,42 +219,147 @@ pub(super) fn prepare_seamless_auto_update(
         }
         Ok(())
     })();
-    if let Err(err) = disable_result {
+    if let Err(err) = prepare_result {
+        let mut restore_errors = Vec::new();
         for unit in disabled.into_iter().rev() {
-            let _ = lifecycle.enable_unit(unit);
+            if let Err(enable_err) = lifecycle.enable_unit(unit) {
+                restore_errors.push(format!("{unit}: {}", enable_err.detail));
+            }
         }
-        return Err(err);
+        record_activation_error(restore_runtime(&stopped, lifecycle), &mut restore_errors);
+        return Err(with_restore_errors(err, restore_errors));
     }
 
     Ok(PrepareUpgradeOutcome::Ready(UpgradeQuiescenceState {
         was_active: is_active,
+        was_supervisor_active: state.supervisor_active,
         was_boot_enrolled: state.boot_enrolled,
         was_health_active: state.health_active,
         was_health_enabled: state.health_enabled,
     }))
 }
 
+/// Attended `ramshared install` apply coordinator.
+///
+/// Automatically detects an already-installed host with active units, boot
+/// enrollment, or active swap; safely quiesces via canonical drain check,
+/// preserves boot enrollment and `/etc/ramshared/*` configuration across the
+/// upgrade, and restores/activates all 3 tiers afterward.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_attended_apply_with(
+    req: &InstallRequest,
+    selector_path: &Path,
+    unit_host: &mut dyn UnitHost,
+    boot_host: &dyn BootPolicyHost,
+    lifecycle: &mut dyn LifecycleHost,
+    stdout: &mut dyn Write,
+    apply_fn: impl FnOnce(
+        &InstallRequest,
+        &mut dyn UnitHost,
+        &mut dyn Write,
+    ) -> Result<CommittedInstall, CustomerError>,
+) -> Result<(), CustomerError> {
+    let installed = match std::fs::symlink_metadata(selector_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(fs_error(
+                CustomerReason::ObservationUnavailable,
+                format!("could not observe installed release selector: {err}"),
+                CustomerState::InstalledOff,
+            ));
+        }
+    };
+    if installed {
+        let live = lifecycle.observe_live_state(unit_host, boot_host)?;
+        if live.needs_upgrade_quiescence() {
+            let quiescence = match prepare_upgrade_from_state(live, lifecycle)? {
+                PrepareUpgradeOutcome::Ready(q) => q,
+                PrepareUpgradeOutcome::Deferred(reason) => {
+                    return Err(fs_error(
+                        CustomerReason::ActiveSession,
+                        format!("NBD_INSTALL_REASON=DRAIN_UNSAFE ({reason})"),
+                        CustomerState::Active,
+                    ));
+                }
+            };
+            let mut apply_req = req.clone();
+            if !req.enroll_default && !req.no_enroll && quiescence.was_boot_enrolled {
+                apply_req.enroll_default = true;
+            }
+            let apply_res = apply_fn(&apply_req, unit_host, stdout);
+            let (committed, activation) = finish_upgrade_lifecycle(
+                &quiescence,
+                lifecycle,
+                apply_res,
+                |c| should_activate_after_install(req, c.enroll_outcome.as_ref()),
+                req.no_activate,
+                stdout,
+            )?;
+            emit_committed_install(&committed, &activation, req.json, stdout);
+            return Ok(());
+        }
+    }
+    let committed = apply_fn(req, unit_host, stdout)?;
+    let activation = if should_activate_after_install(req, committed.enroll_outcome.as_ref()) {
+        lifecycle.ensure_recommended_config(stdout);
+        activate_installed_units(lifecycle, false)
+    } else {
+        ActivationOutcome::Off
+    };
+    emit_committed_install(&committed, &activation, req.json, stdout);
+    Ok(())
+}
+
 /// Complete or restore runtime state after `execute_verified_apply` finishes
 /// and releases `CustomerTransitionGuard`.
+#[cfg(test)]
 pub(super) fn finish_seamless_auto_update<T>(
     quiescence: &UpgradeQuiescenceState,
     lifecycle: &mut dyn LifecycleHost,
     apply_result: Result<T, CustomerError>,
+) -> Result<(T, ActivationOutcome), CustomerError> {
+    let mut sink = std::io::sink();
+    finish_upgrade_lifecycle(
+        quiescence,
+        lifecycle,
+        apply_result,
+        |_| false,
+        false,
+        &mut sink,
+    )
+}
+
+/// Shared post-apply runtime restoration for both `--auto-update` and attended
+/// in-place upgrades over an already-installed host. Preserves existing
+/// `/etc/ramshared/*` configuration (or seeds safe 3-tier defaults if absent)
+/// and restores/activates all 3 tiers when previously active or newly enrolled.
+pub(super) fn finish_upgrade_lifecycle<T>(
+    quiescence: &UpgradeQuiescenceState,
+    lifecycle: &mut dyn LifecycleHost,
+    apply_result: Result<T, CustomerError>,
+    should_activate_committed: impl FnOnce(&T) -> bool,
+    no_activate: bool,
+    stdout: &mut dyn Write,
 ) -> Result<(T, ActivationOutcome), CustomerError> {
     match apply_result {
         Ok(committed) => {
             if !quiescence.was_boot_enrolled && quiescence.was_health_enabled {
                 lifecycle.enable_unit(HEALTH_UNIT)?;
             }
-            let activation = if quiescence.was_active {
+            let activate_full =
+                !no_activate && (quiescence.was_active || should_activate_committed(&committed));
+            let activation = if activate_full {
+                lifecycle.ensure_recommended_config(stdout);
                 activate_installed_units(lifecycle, false)
-            } else if quiescence.was_health_active {
-                activate_installed_units(lifecycle, true)
-            } else {
+            } else if no_activate {
                 ActivationOutcome::Off
+            } else {
+                restore_runtime(quiescence, lifecycle)
             };
             Ok((committed, activation))
         }
+        Err(apply_err) if apply_err.state == CustomerState::RecoveryRequired => Err(apply_err),
         Err(apply_err) => {
             let mut restore_errors = Vec::new();
             if quiescence.was_boot_enrolled {
@@ -246,33 +374,53 @@ pub(super) fn finish_seamless_auto_update<T>(
             {
                 restore_errors.push(format!("{HEALTH_UNIT}: {}", err.detail));
             }
-            if quiescence.was_active {
-                if let ActivationOutcome::Refused { unit, detail } =
-                    activate_installed_units(lifecycle, false)
-                {
-                    restore_errors.push(format!("restart {unit}: {detail}"));
-                }
-            } else if quiescence.was_health_active
-                && let ActivationOutcome::Refused { unit, detail } =
-                    activate_installed_units(lifecycle, true)
-            {
-                restore_errors.push(format!("restart {unit}: {detail}"));
-            }
-            if restore_errors.is_empty() {
-                Err(apply_err)
-            } else {
-                Err(fs_error(
-                    CustomerReason::RecoveryRequired,
-                    format!(
-                        "{}; runtime restore failed ({})",
-                        apply_err.detail,
-                        restore_errors.join("; ")
-                    ),
-                    CustomerState::RecoveryRequired,
-                ))
-            }
+            record_activation_error(restore_runtime(quiescence, lifecycle), &mut restore_errors);
+            Err(with_restore_errors(apply_err, restore_errors))
         }
     }
+}
+
+fn restore_runtime(
+    state: &UpgradeQuiescenceState,
+    lifecycle: &mut dyn LifecycleHost,
+) -> ActivationOutcome {
+    if state.was_active {
+        return activate_installed_units(lifecycle, false);
+    }
+    let units = [
+        (HEALTH_UNIT, state.was_health_active),
+        (SUPERVISOR_UNIT, state.was_supervisor_active),
+    ];
+    for (unit, was_active) in units {
+        if was_active && let Err(err) = lifecycle.start_unit(unit) {
+            return ActivationOutcome::Refused {
+                unit,
+                detail: err.detail,
+            };
+        }
+    }
+    ActivationOutcome::Off
+}
+
+fn record_activation_error(outcome: ActivationOutcome, errors: &mut Vec<String>) {
+    if let ActivationOutcome::Refused { unit, detail } = outcome {
+        errors.push(format!("restart {unit}: {detail}"));
+    }
+}
+
+fn with_restore_errors(error: CustomerError, restore_errors: Vec<String>) -> CustomerError {
+    if restore_errors.is_empty() {
+        return error;
+    }
+    fs_error(
+        CustomerReason::RecoveryRequired,
+        format!(
+            "{}; runtime restore failed ({})",
+            error.detail,
+            restore_errors.join("; ")
+        ),
+        CustomerState::RecoveryRequired,
+    )
 }
 
 pub(super) fn write_up_to_date_output(

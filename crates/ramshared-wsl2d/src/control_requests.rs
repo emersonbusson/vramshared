@@ -7,6 +7,7 @@
 //! Control-plane vsock lease attempts, daemon instance identity, and reclaim request parsing.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ramshared_block::{CacheState as OriginCacheState, OriginState as DurableOriginState};
@@ -144,6 +145,7 @@ pub(crate) fn read_verified_vsock_config(
 /// `RAMSHARED_VSOCK_PORT` and `RAMSHARED_VSOCK_KEY_FILE` are the operator's
 /// provisioning surface (the key is a root-only file, never a constant).
 /// Any absence or failure returns `None` — never a lease.
+#[cfg(test)]
 pub(crate) fn attempt_vsock_lease(
     sealed: &SealedOrigin,
     authority_mirror: SessionAuthority,
@@ -151,6 +153,22 @@ pub(crate) fn attempt_vsock_lease(
     VsockControlPlane<Box<dyn ramshared_ipc::vsock::VsockStreamTrait>>,
     NegotiatedCadence,
 )> {
+    let never_stop = AtomicBool::new(false);
+    attempt_vsock_lease_cancellable(sealed, authority_mirror, &never_stop)
+}
+
+/// Continuously listen (or connect once) until a Windows peer authenticates or
+/// `stop` is raised. Keeping the guest `AF_VSOCK` listener bound eliminates the
+/// closed-port blind gap between retry windows and avoids log storms while waiting.
+pub(crate) fn attempt_vsock_lease_cancellable(
+    sealed: &SealedOrigin,
+    authority_mirror: SessionAuthority,
+    stop: &AtomicBool,
+) -> Option<(
+    VsockControlPlane<Box<dyn ramshared_ipc::vsock::VsockStreamTrait>>,
+    NegotiatedCadence,
+)> {
+    let idle_authority = authority_mirror.clone();
     attempt_vsock_lease_with(
         sealed,
         authority_mirror,
@@ -158,7 +176,18 @@ pub(crate) fn attempt_vsock_lease(
         |listen_mode, port| {
             const VMADDR_CID_HOST: u32 = 2;
             if listen_mode {
-                ramshared_ipc::vsock::listen_vsock(port, Duration::from_secs(15))
+                ramshared_ipc::vsock::listen_vsock_cancellable(
+                    port,
+                    None,
+                    stop,
+                    Some(Duration::from_secs(5)),
+                    || {
+                        idle_authority.mutate(|slot| slot.enter_origin_only());
+                        eprintln!(
+                            "[ramsharedd] vsock accept window open on port {port}; cache stays refused (origin_only) until host authority connects"
+                        );
+                    },
+                )
             } else {
                 ramshared_ipc::vsock::connect_vsock(VMADDR_CID_HOST, port, Duration::from_secs(5))
             }
@@ -212,6 +241,9 @@ pub(crate) fn attempt_vsock_lease_with(
         || mode.eq_ignore_ascii_case("guest-listen");
     let stream = match open_stream(listen_mode, port) {
         Ok(stream) => stream,
+        Err(ramshared_ipc::vsock::VsockError::AcceptTimeout) if listen_mode => {
+            return None;
+        }
         Err(error) => {
             if listen_mode {
                 eprintln!("[ramsharedd] the vsock accept window failed: {error}");

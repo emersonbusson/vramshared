@@ -92,7 +92,7 @@ install -d -m 0711 "$(dirname -- "$guest_gate")"
 rm -f -- "$lease"
 rm -f -- "$origin_candidate"
 
-# DT-4/DT-5: the classifier is the unit's first ExecStartPre. The gate reads
+# DT-4/DT-5: the classifier runs first in the unit's ExecStart. The gate reads
 # its document instead of re-deriving a verdict, and it never writes `clean`
 # itself. Absence, a malformed document, a foreign boot, a refused verdict, or
 # a `clean` document whose own counts contradict it is a hardware refusal:

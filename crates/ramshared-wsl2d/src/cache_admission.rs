@@ -5,7 +5,7 @@
 // Source: https://github.com/emersonbusson/vramshared
 // File: crates/ramshared-wsl2d/src/cache_admission.rs
 //! Shared cache-authority observations and joined supervisor lifetime.
-use super::{attempt_vsock_lease, spawn_heartbeat, unix_time_ms};
+use super::{attempt_vsock_lease_cancellable, spawn_heartbeat, unix_time_ms};
 use ramshared_wsl2d::{
     control_plane::{NegotiatedCadence, VsockControlPlane},
     host_catalog::SharedHostCatalog,
@@ -34,25 +34,24 @@ use std::time::Duration;
 /// the next I/O.
 pub(super) fn compose_cache_admission(sealed: SealedOrigin) -> ControlPlaneCacheAdmission {
     let attempt_sealed = sealed.clone();
-    compose_cache_admission_with(
+    compose_cache_admission_with_stop(
         sealed,
-        move |session| {
-            attempt_vsock_lease(&attempt_sealed, session).map(|(mut plane, cadence)| {
-                plane.set_root_vhd_observer(ramshared_block::vhd_identity::observe_root_vhd);
-                (plane, cadence)
-            })
+        move |session, stop| {
+            attempt_vsock_lease_cancellable(&attempt_sealed, session, stop).map(
+                |(mut plane, cadence)| {
+                    plane.set_root_vhd_observer(ramshared_block::vhd_identity::observe_root_vhd);
+                    (plane, cadence)
+                },
+            )
         },
         LEASE_RETRY_INTERVAL,
     )
 }
 
-/// The cadence at which the guest re-opens its bounded accept window.
-///
-/// The host is the connector and it retries; the guest used to open the
-/// window once and never again, so a host that dialed after that window (its
-/// first connect can take tens of seconds) never got a lease, and the cache
-/// stayed refused with no way to recover without a daemon restart.
-const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// The cadence at which the guest re-opens its accept window after a lost lease
+/// or handshake failure. Matches the host connector's 2 s retry cadence while
+/// keeping `listen_vsock_cancellable` continuously open while awaiting a peer.
+const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The composition, with the lease attempt injected.
 ///
@@ -63,6 +62,7 @@ const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// the activation still said "daemon did not start". The origin is adopted
 /// before any lease, so origin I/O never depends on this thread, and the
 /// cache stays refused until a lease actually arrives.
+#[cfg(test)]
 pub(super) fn compose_cache_admission_with<F>(
     sealed: SealedOrigin,
     attempt: F,
@@ -71,6 +71,28 @@ pub(super) fn compose_cache_admission_with<F>(
 where
     F: Fn(
             SessionAuthority,
+        ) -> Option<(
+            VsockControlPlane<Box<dyn ramshared_ipc::vsock::VsockStreamTrait>>,
+            NegotiatedCadence,
+        )> + Send
+        + 'static,
+{
+    compose_cache_admission_with_stop(
+        sealed,
+        move |session, _stop| attempt(session),
+        retry_interval,
+    )
+}
+
+pub(super) fn compose_cache_admission_with_stop<F>(
+    sealed: SealedOrigin,
+    attempt: F,
+    retry_interval: Duration,
+) -> ControlPlaneCacheAdmission
+where
+    F: Fn(
+            SessionAuthority,
+            &AtomicBool,
         ) -> Option<(
             VsockControlPlane<Box<dyn ramshared_ipc::vsock::VsockStreamTrait>>,
             NegotiatedCadence,
@@ -86,6 +108,8 @@ where
     let attempt_catalog = host_catalog.clone();
     let host_storage = SharedHostStorage::new();
     let attempt_storage = host_storage.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let attempt_stop = Arc::clone(&stop);
     // A poisoned lock is treated as "no authority": the admission below maps
     // it to a refusal, so the cache stays off rather than the process dying.
     if let Ok(mut slot) = authority.lock() {
@@ -102,7 +126,7 @@ where
         Arc::clone(&lease_seen),
         Arc::clone(&host_memory),
         move |session| {
-            attempt(session).map(|(mut plane, cadence)| {
+            attempt(session, &attempt_stop).map(|(mut plane, cadence)| {
                 plane.attach_host_catalog(attempt_catalog.clone());
                 plane.attach_host_storage(attempt_storage.clone());
                 Granted {
@@ -119,7 +143,6 @@ where
         retry_interval,
         LeaseLog::stderr(),
     );
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lifetime = start_supervisor(stop, move |stop| supervisor.run(stop));
     if lifetime.is_none() {
         lease_lost.store(true, Ordering::Release);

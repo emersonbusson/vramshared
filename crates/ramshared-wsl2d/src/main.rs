@@ -91,7 +91,7 @@ mod worker_supervisor;
 use args::{AppArgs, BackendKind, Transport, daemon_version_requested};
 use cache_admission::{ControlPlaneCacheAdmission, compose_cache_admission};
 use control_requests::{
-    CACHE_TARGET_REQUEST_PATH, RECLAIM_REQUEST_PATH, attempt_vsock_lease,
+    CACHE_TARGET_REQUEST_PATH, RECLAIM_REQUEST_PATH, attempt_vsock_lease_cancellable,
     critical_cache_reclaim_requested_at, daemon_instance_id, origin_cache_runtime_ok,
     require_origin_daemon_identity, unix_time_ms,
 };
@@ -134,7 +134,8 @@ use self::{
         publish_origin_cache_status, published_cached_kib, write_origin_cache_status,
     },
     control_requests::{
-        VsockLeaseInputs, attempt_vsock_lease_with, consume_critical_cache_request,
+        VsockLeaseInputs, attempt_vsock_lease, attempt_vsock_lease_with,
+        consume_critical_cache_request,
     },
     critical_devices::{
         collect_device_and_parent, collect_device_and_parent_with, linux_device_number,
