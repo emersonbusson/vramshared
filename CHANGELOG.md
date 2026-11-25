@@ -11,6 +11,15 @@ File: CHANGELOG.md
 All notable changes to RamShared are documented in this file.
 The project adheres to Semantic Versioning (`MAJOR.MINOR.PATCH`).
 
+## [1.0.1] - 2026-11-24
+
+### Fixed & Security
+
+- Upgraded `rustix` `1.1.4` -> `1.1.6` to resolve `RUSTSEC-2026-0486` (zero-length xattr buffer unsoundness).
+- Made `cascade_io` daemon fixture and `package_trust` failing verifier fixture portable across Ubuntu 26.04 multicall `uutils` coreutils.
+- Updated `scripts/ci/check-kernel-sparse.sh` to invoke `kbuild` (`make C=2`) against modern Linux 7.0+ kernel headers.
+- Provisioned `checkpatch.pl` in guest-safety CI and scoped `.gitleaks.toml` allowlists to synthetic sequential test GPU UUIDs.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added

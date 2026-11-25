@@ -75,6 +75,7 @@ jobs:
       - name: Safety & release ordering fixtures
         run: |
           set -euo pipefail
+          ./scripts/ci/check-kernel-checkpatch.sh --provision
           bash scripts/ci/test-kernel-gate-flags.sh
           bash scripts/ci/test-kernel-gate-honesty.sh
           bash scripts/safety/test-guest-pressure-runtime-guard.sh

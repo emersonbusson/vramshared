@@ -188,14 +188,12 @@ impl TestDir {
     }
 
     fn daemon_program(&self) -> PathBuf {
-        let path = self.path.join("ramsharedd");
-        let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
-        let staged = self.path.join(format!(".ramsharedd.{sequence}.staged"));
-        std::os::unix::fs::symlink("/bin/sleep", &staged)
-            .unwrap_or_else(|error| panic!("stage native daemon fixture {staged:?}: {error}"));
-        fs::rename(&staged, &path)
-            .unwrap_or_else(|error| panic!("publish native daemon fixture {path:?}: {error}"));
-        path
+        // Portable single-process fixture whose `/proc/<pid>/comm` is
+        // `ramsharedd` without symlinking `/bin/sleep` (multicall `uutils`
+        // coreutils rejects unknown `argv[0]` names). Blocking on a piped
+        // stdin keeps one process alive with zero child orphans until
+        // SIGTERM/SIGKILL or drop.
+        self.program("ramsharedd", "#!/bin/sh\nIFS= read -r _\n")
     }
 }
 
@@ -281,7 +279,10 @@ pub(super) fn fixture_process_is_stopped(pid: u32) -> bool {
         })
 }
 
-pub(super) struct FixtureDaemon(pub(super) std::process::Child);
+pub(super) struct FixtureDaemon(
+    pub(super) std::process::Child,
+    Option<std::process::ChildStdin>,
+);
 
 impl FixtureDaemon {
     pub(in crate::cascade::cascade_io) fn id(&self) -> u32 {
@@ -299,6 +300,7 @@ impl FixtureDaemon {
 
 impl Drop for FixtureDaemon {
     fn drop(&mut self) {
+        drop(self.1.take());
         // An already-reaped child must not be signalled again: its pid is
         // back in the free list and `kill` would address whoever reused it.
         if self.0.try_wait().ok().flatten().is_none() {
@@ -310,14 +312,26 @@ impl Drop for FixtureDaemon {
 
 pub(super) fn spawn_fixture_daemon(fixture: &TestDir, term_handler: &str) -> FixtureDaemon {
     let daemon_path = fixture.daemon_program();
-    // Same lifetime contract as [`controlled_child`]: the sleep is far
-    // longer than any body, and [`FixtureDaemon`]'s drop is what ends it.
-    // A short deadline would turn "the daemon is still alive" into a
-    // wall-clock race under full-suite load.
-    let mut child = Command::new(&daemon_path)
-        .arg("3600")
-        .spawn()
-        .unwrap_or_else(|error| panic!("start fixture daemon: {error}"));
+    // Same lifetime contract as [`controlled_child`]: stdin stays open until
+    // [`FixtureDaemon`]'s drop (or an explicit signal), avoiding any wall-clock
+    // race under full-suite load.
+    let mut child = {
+        let mut attempts = 0u8;
+        loop {
+            match Command::new(&daemon_path)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error) if error.raw_os_error() == Some(26) && attempts < 20 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("start fixture daemon: {error}"),
+            }
+        }
+    };
+    let stdin = child.stdin.take();
     let deadline = Instant::now() + Duration::from_millis(250);
     while child
         .try_wait()
@@ -332,6 +346,7 @@ pub(super) fn spawn_fixture_daemon(fixture: &TestDir, term_handler: &str) -> Fix
         .unwrap_or_else(|error| panic!("inspect fixture daemon readiness: {error}"))
         .is_some()
     {
+        drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
         panic!("fixture daemon exited before its startup deadline");
@@ -352,6 +367,7 @@ pub(super) fn spawn_fixture_daemon(fixture: &TestDir, term_handler: &str) -> Fix
                 std::thread::sleep(Duration::from_millis(1));
             }
             if !fixture_process_is_stopped(child.id()) {
+                drop(stdin);
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("fixture daemon did not enter its pidfd-bound stopped state");
@@ -359,7 +375,7 @@ pub(super) fn spawn_fixture_daemon(fixture: &TestDir, term_handler: &str) -> Fix
         }
         handler => panic!("unsupported fixture TERM handler {handler:?}"),
     }
-    FixtureDaemon(child)
+    FixtureDaemon(child, stdin)
 }
 
 pub(super) fn write_daemon_identity_status(paths: &RuntimePaths, pid: u32, instance_id: &str) {
@@ -650,7 +666,7 @@ pub(super) fn controlled_child() -> FixtureDaemon {
     let child = bounded_process::configure_process_group(&mut command)
         .spawn()
         .unwrap_or_else(|error| panic!("spawn controlled child: {error}"));
-    FixtureDaemon(child)
+    FixtureDaemon(child, None)
 }
 
 pub(super) struct UnprovenChild {

@@ -258,8 +258,12 @@ fn sealed_verifier_refuses_failure_and_reaps_timeout() {
     std::fs::write(&input_path, b"input").unwrap();
     let mut input = TrustedFile::open_for_owner(&input_path, 64, fixture.owner()).unwrap();
     let snapshot = input.snapshot().unwrap();
+    let failing_path = fixture.0.join("failing");
+    std::fs::write(&failing_path, b"#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&failing_path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut failing =
-        TrustedFile::open(Path::new("/usr/bin/false"), MAX_TRUST_SNAPSHOT_BYTES).unwrap();
+        TrustedFile::open_for_owner(&failing_path, MAX_TRUST_SNAPSHOT_BYTES, fixture.owner())
+            .unwrap();
     let failing = failing.snapshot().unwrap();
     assert!(
         verify_sealed_gpgv_with(

@@ -68,6 +68,12 @@ if [[ ${#DRIVER_FILES[@]} -gt 0 ]]; then
     NOT_RUN+=("driver-semantic: sparse is not installed")
   elif [[ ! -d "$KDIR/include" ]]; then
     NOT_RUN+=("driver-semantic: no kernel build tree at KDIR/include (KDIR=$KDIR)")
+  elif [[ -f "$KDIR/Makefile" && -z "${RAMSHARED_KERNEL_FILE_LIST:-}" ]]; then
+    if ! make -C "$KDIR" M="$ROOT/drivers/block/ramshared" CONFIG_BLK_DEV_RAMSHARED=m C=2 CHECK="sparse" CF="-Wbitwise -Wsparse-all" modules 2>&1; then
+      ERRORS=$((ERRORS + 1))
+    fi
+    make -C "$KDIR" M="$ROOT/drivers/block/ramshared" clean >/dev/null 2>&1 || true
+    RAN+=("sparse (kbuild C=2) on ${#DRIVER_FILES[@]} driver file(s)")
   else
     for f in "${DRIVER_FILES[@]}"; do
       sparse -Wbitwise -Wsparse-all -D__KERNEL__ -I"$KDIR/include" "$f" 2>&1 \

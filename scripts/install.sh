@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REPO="emersonbusson/vramshared"
-VERSION="${RAMSHARED_VERSION:-v1.0.0}"
+VERSION="${RAMSHARED_VERSION:-v1.0.1}"
 ARCH="amd64"
 
 # Test seam, not a second install path. When RAMSHARED_INSTALL_TEST_ROOT is

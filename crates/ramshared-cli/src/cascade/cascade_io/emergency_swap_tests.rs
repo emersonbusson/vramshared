@@ -705,6 +705,22 @@ fn create_for_platform_dispatches_native_wsl2_and_refuses_unknown() {
     let dir = temp_root("create-platform");
     let status_path = dir.join("cache-status.json");
     let now_ms = 20_000u64;
+    // NativeLinux delegates directly with guest free space (run before starting the 4s WSL2 boot-clock proof so parallel disk I/O cannot expire the WSL2 deadline).
+    let native_root = temp_root("create-native");
+    let native_swap = create_for_platform(
+        &FakeRunner::default(),
+        MIB,
+        Some(PlatformKind::NativeLinux),
+        missing_id,
+        &status_path,
+        Some(now_ms),
+        std::slice::from_ref(&native_root),
+        &|_| Some(4 * GIB),
+        match_obs,
+    );
+    let native_ok = native_swap.is_some();
+    drop(native_swap);
+    cleanup(&native_root);
     let hex_id = ramshared_ipc::storage_proof::format_disk_id_hex(&DISK_ID);
     let (boot_id, boot_ns) = ramshared_ipc::storage_proof::storage_boot_clock().unwrap();
     let deadline =
@@ -760,22 +776,6 @@ fn create_for_platform_dispatches_native_wsl2_and_refuses_unknown() {
         )
         .is_none()
     );
-    // NativeLinux delegates directly with guest free space (test fails on FakeRunner / mkswap on non-ext or creates in temp_root).
-    let native_root = temp_root("create-native");
-    let native_swap = create_for_platform(
-        &FakeRunner::default(),
-        MIB,
-        Some(PlatformKind::NativeLinux),
-        missing_id,
-        &status_path,
-        Some(now_ms),
-        std::slice::from_ref(&native_root),
-        &|_| Some(4 * GIB),
-        match_obs,
-    );
-    let native_ok = native_swap.is_some();
-    drop(native_swap);
-    cleanup(&native_root);
 
     // Wsl2 with valid proof clamps 50 GiB guest free by (3 GiB - 1 GiB reserve) = 2 GiB, allocating safely for 1 GiB shortfall -> 1088 MiB!
     let wsl_swap = create_for_platform(

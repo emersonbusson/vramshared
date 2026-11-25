@@ -7,8 +7,16 @@
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Benchmark fixture metric mistaken for a generic API key"
+condition = "AND"
 regexTarget = "line"
 paths = ['''^tools/ci/check-benchmark-evidence\.test\.mjs$''']
 regexes = ['''^\s*\{ name: 'p99', key: 'nbd_vs_disk_p99_ratio', value: 999 \},\s*$''']
+
+[[allowlists]]
+description = "Synthetic sequential 32-hex test GPU UUID fixtures"
+condition = "AND"
+regexTarget = "line"
+paths = ['''^crates/''']
+regexes = ['''00112233445566778899aabbccddeeff|00112233445566778899AABBCCDDEEFF|ffeeddccbbaa99887766554433221100''']
