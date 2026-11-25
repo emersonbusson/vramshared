@@ -10,23 +10,107 @@ on:
   push:
     tags:
       - 'v[1-9]*'
+  workflow_run:
+    workflows: [CI, Security]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version tag (e.g. v1.0.1)'
+        description: 'Expected version tag (defaults to the version on main)'
         required: false
-        default: 'v1.0.1'
+        type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
+  release-source:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - name: Check Out Candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify Commit, Checks and Version
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          EXPECTED_TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$TRIGGER" != push && "$commit" != "$main" ]]; then
+            echo "The candidate is no longer the tip of main."
+            exit 0
+          fi
+
+          for workflow in ci.yml security.yml; do
+            result=$(gh run list --workflow "$workflow" --event push --branch main \
+              --commit "$commit" --limit 1 --json status,conclusion \
+              --jq '.[0] | select(.status == "completed") | .conclusion')
+            if [[ "$result" != success ]]; then
+              echo "$workflow has not passed for $commit."
+              exit 0
+            fi
+          done
+
+          source scripts/package/package-product-version.sh
+          tag="v$(ramshared_workspace_product_version "$PWD")"
+          if [[ ! "$tag" =~ ^v[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Version is outside the public release format."
+            exit 1
+          fi
+          if [[ "$TRIGGER" == push && "$REF_NAME" != "$tag" ]]; then
+            echo "The pushed tag does not match Cargo.toml."
+            exit 1
+          fi
+
+          if [[ -n "$EXPECTED_TAG" && "$EXPECTED_TAG" != "$tag" ]]; then
+            echo "The requested release does not match Cargo.toml."
+            exit 1
+          fi
+
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+          if grep -Fqx -- "$tag" <<< "$tags"; then
+            echo "$tag already has a release."
+            exit 0
+          fi
+          printf 'commit=%s\ntag=%s\n' "$commit" "$tag" >> "$GITHUB_OUTPUT"
+
   build-packages:
     name: Build Distro Packages (Ubuntu, Fedora, Arch, Bundle)
+    needs: release-source
+    if: needs.release-source.outputs.tag != ''
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.release-source.outputs.tag }}
     steps:
-      - name: Checkout Repository
+      - name: Check Out Verified Commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-source.outputs.commit }}
+          persist-credentials: false
 
       - name: Install Build Dependencies
         run: |
@@ -44,14 +128,14 @@ jobs:
 
       - name: Build Sealed Linux Bundle (.tar.gz)
         env:
-          RAMSHARED_PACKAGE_VERSION: ${{ (github.ref_type == 'tag' && github.ref_name) || inputs.version || 'v1.0.1' }}
+          RAMSHARED_PACKAGE_VERSION: ${{ needs.release-source.outputs.tag }}
         run: ./scripts/package/build-linux-bundle.sh --skip-build
 
       - name: Build Debian/Ubuntu Package (.deb)
-        run: ./scripts/package/build-deb-package.sh "${{ (github.ref_type == 'tag' && github.ref_name) || inputs.version || 'v1.0.1' }}"
+        run: ./scripts/package/build-deb-package.sh "$RELEASE_TAG"
 
       - name: Build Fedora/RHEL Package (.rpm)
-        run: ./scripts/package/build-rpm-package.sh "${{ (github.ref_type == 'tag' && github.ref_name) || inputs.version || 'v1.0.1' }}"
+        run: ./scripts/package/build-rpm-package.sh "$RELEASE_TAG"
 
       - name: Package Arch Linux PKGBUILD Tarball
         run: |
@@ -63,19 +147,63 @@ jobs:
       - name: Generate Checksums
         working-directory: artifacts/packages
         run: |
-          find . -maxdepth 1 -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" \) -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS.txt
+          find . -maxdepth 1 -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" \) -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Upload Package Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distribution-packages
-          path: artifacts/packages/
+          if-no-files-found: error
+          path: |
+            artifacts/packages/*.deb
+            artifacts/packages/*.rpm
+            artifacts/packages/*.tar.gz
+            artifacts/packages/SHA256SUMS.txt
 
-      - name: Attach Assets to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+  publish:
+    needs: [release-source, build-packages]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: release-${{ needs.release-source.outputs.tag }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download Distribution Packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: distribution-packages
+          path: packages
+
+      - name: Publish New Release
+        working-directory: packages
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_COMMIT: ${{ needs.release-source.outputs.commit }}
+          RELEASE_TAG: ${{ needs.release-source.outputs.tag }}
+          TRIGGER: ${{ github.event_name }}
         run: |
-          TARGET_TAG="${{ (github.ref_type == 'tag' && github.ref_name) || inputs.version || 'v1.0.1' }}"
-          find artifacts/packages -maxdepth 1 -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" -o -name "SHA256SUMS.txt" \) -exec gh release upload "$TARGET_TAG" --clobber {} +
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS.txt
+
+          tags=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name')
+          if grep -Fqx -- "$RELEASE_TAG" <<< "$tags"; then
+            echo "$RELEASE_TAG already has a release."
+            exit 0
+          fi
+          if [[ "$TRIGGER" != push ]]; then
+            main=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+            [[ "$main" == "$TARGET_COMMIT" ]] || exit 0
+          fi
+
+          remote_tags=$(gh api --paginate "repos/$GH_REPO/tags?per_page=100" \
+            --jq ".[] | select(.name == \"$RELEASE_TAG\") | .commit.sha")
+          if [[ -n "$remote_tags" && "$remote_tags" != "$TARGET_COMMIT" ]]; then
+            echo "The existing tag points to another commit."
+            exit 1
+          fi
+
+          shopt -s failglob
+          gh release create "$RELEASE_TAG" --target "$TARGET_COMMIT" --generate-notes \
+            ./*.deb ./*.rpm ./*.tar.gz SHA256SUMS.txt
