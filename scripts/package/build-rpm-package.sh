@@ -260,10 +260,10 @@ fi
 # Verify the payload fingerprints recorded by RPM before publishing artifacts.
 for artifact in "${rpm_artifacts[@]}"; do
   payload_digests=$(rpm -qp --queryformat '[%{FILENAMES}\t%{FILEDIGESTS}\n]' "$artifact")
-  for binary in "$CLI_BIN" "$DAEMON_BIN"; do
-    destination="/usr/bin/${binary##*/}"
-    expected=$(sha256sum "$binary")
-    if ! grep -Fxq "$destination"$'\t'"${expected%% *}" <<< "$payload_digests"; then
+  for binary in ramshared:cli_sha256 ramsharedd:daemon_sha256; do
+    destination="/usr/bin/${binary%%:*}"
+    expected=$(_ramshared_package_build_info_field "$IDENTITY" "${binary#*:}")
+    if ! grep -Fxq "$destination"$'\t'"$expected" <<< "$payload_digests"; then
       printf 'ERROR: RPM payload identity mismatch for %s in %s\n' "$destination" "$artifact" >&2
       exit 1
     fi
