@@ -228,7 +228,7 @@ SPEC_EOF
 
 %changelog
 * Sun Sep 27 2026 Emerson Busson - ${RPM_VERSION}-1
-- Official v1.0.1 Linux RPM release for the documented support matrix.
+- Official v1.0.2 Linux RPM release for the documented support matrix.
 SPEC_EOF
 } > "$SPEC_FILE"
 

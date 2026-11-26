@@ -11,6 +11,17 @@ File: CHANGELOG.md
 All notable changes to RamShared are documented in this file.
 The project adheres to Semantic Versioning (`MAJOR.MINOR.PATCH`).
 
+## [1.0.2] - 2026-11-25
+
+### Fixed
+
+- Show the busiest measured NVIDIA engine in the GPU panel, including video
+  encode and decode when NVML supplies them.
+- Keep cache history visible during worker recovery and explain GPU-only
+  telemetry delays without changing the reported swap protection state.
+- Preserve cascade activation across Linux upgrades and start release packaging
+  automatically after CI and Security pass on the release commit.
+
 ## [1.0.1] - 2026-11-24
 
 ### Fixed & Security
