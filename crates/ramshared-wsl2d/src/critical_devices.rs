@@ -321,10 +321,9 @@ mod tests {
         let part_dir = disk_dir.join("sda1");
         std::fs::create_dir_all(&part_dir).expect("create fake partition sysfs");
         std::fs::write(part_dir.join("partition"), b"1").expect("write partition marker");
-        std::os::unix::fs::symlink(&part_dir, sys_block.join("8:1")).expect("symlink partition");
-        let disk_dev = linux_device_number(std::fs::metadata(&root_file).expect("stat").dev());
-        let _ = std::fs::remove_dir_all(sys_block.join(&disk_dev));
-        std::os::unix::fs::symlink(&part_dir, sys_block.join(&disk_dev)).expect("symlink root_dev");
+        let root_device_entry = sys_block.join(&root_dev);
+        std::fs::remove_dir(&root_device_entry).expect("remove whole-disk sysfs node");
+        std::os::unix::fs::symlink(&part_dir, &root_device_entry).expect("symlink root_dev");
         std::fs::write(dev_dir.join("sda"), b"not-a-block").expect("create regular /dev/sda");
         let err = collect_critical_device_numbers_at(
             &root_file,
