@@ -80,8 +80,8 @@ are built from a single payload manifest (`scripts/package/package-payload-manif
 
 ```bash
 ./scripts/package/build-linux-bundle.sh
-./scripts/package/build-deb-package.sh v1.0.1
-./scripts/package/build-rpm-package.sh v1.0.1
+./scripts/package/build-deb-package.sh v1.0.2
+./scripts/package/build-rpm-package.sh v1.0.2
 ```
 
 ## Documentation
