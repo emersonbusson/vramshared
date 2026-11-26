@@ -246,6 +246,8 @@ pub(super) fn sample_utilization_telemetry(sampled_at_unix_ms: u64) -> GpuUtiliz
         schema_version: 1,
         gpu_pct: 37,
         memory_pct: 82,
+        encoder_pct: None,
+        decoder_pct: None,
         sampled_at_unix_ms,
     }
 }

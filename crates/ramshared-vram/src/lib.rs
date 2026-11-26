@@ -755,6 +755,8 @@ mod tests {
             schema_version: 1,
             gpu_pct: 37,
             memory_pct: 82,
+            encoder_pct: None,
+            decoder_pct: None,
             sampled_at_unix_ms: 1_000,
         };
         // Freshness is the same window the budget sample uses: the two are
@@ -783,6 +785,8 @@ mod tests {
             schema_version: 1,
             gpu_pct: 37,
             memory_pct: 82,
+            encoder_pct: None,
+            decoder_pct: None,
             sampled_at_unix_ms: 1_000,
         };
         // Well formed is about the body, never the clock. An aged sample is

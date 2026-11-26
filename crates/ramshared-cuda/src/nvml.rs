@@ -59,10 +59,10 @@ pub struct NvmlUtilization {
 const _: () = assert!(core::mem::size_of::<NvmlMemory>() == 24);
 const _: () = assert!(core::mem::size_of::<NvmlUtilization>() == 8);
 
-/// Device-wide GPU busy percents for one NVML sample.
+/// Device-wide kernel, memory, and optional video busy time from NVML.
 ///
 /// A present value is a measurement: `gpu_pct: 0` means the GPU was observed
-/// idle over the sample window, not that utilization is unknown. Unavailability
+/// had no kernels executing over the sample window. Unavailability
 /// (NVML absent, symbol missing, refusing call, malformed reply) is reported
 /// through [`NvmlError`] and never as a zero sample.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +71,10 @@ pub struct GpuUtilization {
     pub gpu_pct: u8,
     /// Percent of the sample window with device memory traffic (`0..=100`).
     pub memory_pct: u8,
+    /// NVML video encoder busy time, when the driver supplies it.
+    pub encoder_pct: Option<u8>,
+    /// NVML video decoder busy time, when the driver supplies it.
+    pub decoder_pct: Option<u8>,
 }
 
 impl GpuUtilization {
@@ -83,6 +87,8 @@ impl GpuUtilization {
         Ok(Self {
             gpu_pct: percent(raw.gpu, "gpu")?,
             memory_pct: percent(raw.memory, "memory")?,
+            encoder_pct: None,
+            decoder_pct: None,
         })
     }
 }
@@ -107,6 +113,8 @@ type FnNvmlDeviceGetHandleByUuid =
     unsafe extern "C" fn(*const c_char, *mut NvmlDevice) -> NvmlResult;
 type FnNvmlDeviceGetUuid = unsafe extern "C" fn(NvmlDevice, *mut c_char, c_uint) -> NvmlResult;
 type FnNvmlDeviceGetMemoryInfo = unsafe extern "C" fn(NvmlDevice, *mut NvmlMemory) -> NvmlResult;
+type FnNvmlDeviceGetVideoUtilization =
+    unsafe extern "C" fn(NvmlDevice, *mut c_uint, *mut c_uint) -> NvmlResult;
 type FnNvmlDeviceGetUtilizationRates =
     unsafe extern "C" fn(NvmlDevice, *mut NvmlUtilization) -> NvmlResult;
 type FnNvmlErrorString = unsafe extern "C" fn(NvmlResult) -> *const c_char;
@@ -119,6 +127,8 @@ struct NvmlSyms {
     device_get_uuid: FnNvmlDeviceGetUuid,
     device_get_memory_info: FnNvmlDeviceGetMemoryInfo,
     device_get_utilization_rates: FnNvmlDeviceGetUtilizationRates,
+    device_get_encoder_utilization: Option<FnNvmlDeviceGetVideoUtilization>,
+    device_get_decoder_utilization: Option<FnNvmlDeviceGetVideoUtilization>,
     error_string: Option<FnNvmlErrorString>,
 }
 
@@ -183,6 +193,14 @@ impl Nvml {
                     .map_err(map_sym)?,
                 device_get_utilization_rates: load_sym(handle, c"nvmlDeviceGetUtilizationRates")
                     .map_err(map_sym)?,
+                device_get_encoder_utilization: load_sym_opt(
+                    handle,
+                    c"nvmlDeviceGetEncoderUtilization",
+                ),
+                device_get_decoder_utilization: load_sym_opt(
+                    handle,
+                    c"nvmlDeviceGetDecoderUtilization",
+                ),
                 error_string: load_sym_opt(handle, c"nvmlErrorString"),
             }
         };
@@ -258,7 +276,10 @@ impl Nvml {
         // duration of this synchronous call. No aliasing with device.
         let r = unsafe { (self.syms.device_get_utilization_rates)(device, &mut raw) };
         self.check(r, "nvmlDeviceGetUtilizationRates")?;
-        GpuUtilization::from_driver(&raw)
+        let mut sample = GpuUtilization::from_driver(&raw)?;
+        sample.encoder_pct = video_utilization(self.syms.device_get_encoder_utilization, device);
+        sample.decoder_pct = video_utilization(self.syms.device_get_decoder_utilization, device);
+        Ok(sample)
     }
 
     /// Resolves `ordinal` to a non-null device handle, or refuses.
@@ -305,6 +326,19 @@ impl Drop for Nvml {
             (self.syms.shutdown)();
         }
     }
+}
+
+fn video_utilization(
+    read: Option<FnNvmlDeviceGetVideoUtilization>,
+    device: NvmlDevice,
+) -> Option<u8> {
+    let read = read?;
+    let mut utilization = c_uint::MAX;
+    let mut sampling_period_us = 0;
+    // SAFETY: the caller passes a live NVML device handle. Both outputs are
+    // independent, writable stack values with the exact NVML ABI types.
+    let result = unsafe { read(device, &mut utilization, &mut sampling_period_us) };
+    (result == NVML_SUCCESS && utilization <= 100).then_some(utilization as u8)
 }
 
 fn map_sym(error: crate::driver::CudaError) -> NvmlError {
@@ -573,6 +607,8 @@ pub(crate) mod mock {
                 device_get_uuid: uuid_readback,
                 device_get_memory_info: mock_memory,
                 device_get_utilization_rates: mock_utilization,
+                device_get_encoder_utilization: None,
+                device_get_decoder_utilization: None,
                 error_string: None,
             },
         }
@@ -591,6 +627,8 @@ pub(crate) mod mock {
                 device_get_uuid: uuid_readback,
                 device_get_memory_info: mock_memory,
                 device_get_utilization_rates: mock_utilization,
+                device_get_encoder_utilization: None,
+                device_get_decoder_utilization: None,
                 error_string: Some(mock_error_string),
             },
         }
@@ -617,6 +655,51 @@ mod tests {
             mock::set_handle_returns_null(false);
             mock::set_error_string_returns_null(false);
         }
+    }
+
+    #[test]
+    fn video_utilization_reports_valid_counters_independently() {
+        unsafe extern "C" fn encoder(
+            _: NvmlDevice,
+            output: *mut c_uint,
+            period: *mut c_uint,
+        ) -> NvmlResult {
+            // SAFETY: the sampler provides writable out-parameters.
+            unsafe {
+                *output = 0;
+                *period = 100_000;
+            }
+            NVML_SUCCESS
+        }
+
+        unsafe extern "C" fn malformed_decoder(
+            _: NvmlDevice,
+            output: *mut c_uint,
+            _: *mut c_uint,
+        ) -> NvmlResult {
+            // SAFETY: the sampler provides a writable utilization output.
+            unsafe { *output = 101 };
+            NVML_SUCCESS
+        }
+
+        unsafe extern "C" fn unsupported(
+            _: NvmlDevice,
+            _: *mut c_uint,
+            _: *mut c_uint,
+        ) -> NvmlResult {
+            -3
+        }
+
+        let mut nvml = mock::build();
+        nvml.syms.device_get_encoder_utilization = Some(encoder);
+        nvml.syms.device_get_decoder_utilization = Some(malformed_decoder);
+        let sample = nvml.device_utilization(0).unwrap();
+        assert_eq!((sample.encoder_pct, sample.decoder_pct), (Some(0), None));
+
+        nvml.syms.device_get_encoder_utilization = Some(unsupported);
+        nvml.syms.device_get_decoder_utilization = Some(encoder);
+        let sample = nvml.device_utilization(0).unwrap();
+        assert_eq!((sample.encoder_pct, sample.decoder_pct), (None, Some(0)));
     }
 
     #[test]
@@ -739,7 +822,9 @@ mod tests {
             rates,
             GpuUtilization {
                 gpu_pct: 37,
-                memory_pct: 82
+                memory_pct: 82,
+                encoder_pct: None,
+                decoder_pct: None,
             }
         );
 
@@ -750,7 +835,9 @@ mod tests {
             idle,
             GpuUtilization {
                 gpu_pct: 0,
-                memory_pct: 0
+                memory_pct: 0,
+                encoder_pct: None,
+                decoder_pct: None,
             }
         );
     }
@@ -774,7 +861,8 @@ mod tests {
                 sample,
                 Ok(GpuUtilization {
                     gpu_pct: 0,
-                    memory_pct: 0
+                    memory_pct: 0,
+                    ..
                 })
             ),
             "absence must not collapse into a measured idle"
