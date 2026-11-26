@@ -120,6 +120,8 @@ impl<'a> VramProvider for Context<'a> {
         Some(ramshared_vram::GpuUtilizationSnapshot {
             gpu_pct: rates.gpu_pct,
             memory_pct: rates.memory_pct,
+            encoder_pct: rates.encoder_pct,
+            decoder_pct: rates.decoder_pct,
         })
     }
 }
@@ -218,6 +220,8 @@ mod tests {
             Some(ramshared_vram::GpuUtilizationSnapshot {
                 gpu_pct: 0,
                 memory_pct: 0,
+                encoder_pct: None,
+                decoder_pct: None,
             }),
             "a measured idle sample must not be confused with absence"
         );

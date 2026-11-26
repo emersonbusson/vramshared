@@ -46,6 +46,8 @@ fn daemon_publishes_live_worker_telemetry() {
             schema_version: 1,
             gpu_pct: 37,
             memory_pct: 82,
+            encoder_pct: None,
+            decoder_pct: None,
             sampled_at_unix_ms: 1234567890,
         }),
         host_memory: None,

@@ -73,6 +73,8 @@ fn public_utilization_wire_shape_preserves_measured_idle() {
         &GpuUtilizationSnapshot {
             gpu_pct: 0,
             memory_pct: 0,
+            encoder_pct: None,
+            decoder_pct: None,
         },
         1_000,
     );
@@ -159,6 +161,8 @@ fn unavailable_wall_clock_never_licenses_utilization() {
             &GpuUtilizationSnapshot {
                 gpu_pct: 0,
                 memory_pct: 0,
+                encoder_pct: None,
+                decoder_pct: None,
             },
             sampled,
         );
@@ -260,4 +264,42 @@ fn same_luid_different_nodes_are_not_the_same_physical_memory() {
     assert!(!first.matches_physical_adapter(&parse("vulkan", Some(2))));
     assert!(!first.matches_physical_adapter(&parse("cuda", Some(2))));
     assert!(!first.matches_physical_adapter(&parse("vulkan", None)));
+}
+
+#[test]
+fn video_utilization_preserves_legacy_samples() {
+    let old = serde_json::json!({
+        "gpu_utilization": {
+            "schema_version": 1,
+            "gpu_pct": 26,
+            "memory_pct": 21,
+            "sampled_at_unix_ms": 42
+        }
+    });
+    let sample = GpuUtilizationTelemetry::from_published_status(&old).expect("legacy sample");
+    assert_eq!((sample.encoder_pct, sample.decoder_pct), (None, None));
+    assert!(sample.trusted_at(42, GPU_BUDGET_MAX_AGE_MS));
+    assert_eq!(
+        serde_json::to_value(sample).expect("serialized utilization"),
+        old["gpu_utilization"]
+    );
+
+    let video = GpuUtilizationTelemetry {
+        encoder_pct: Some(41),
+        decoder_pct: Some(0),
+        ..sample
+    };
+    let status = serde_json::json!({"gpu_utilization": video});
+    assert_eq!(
+        GpuUtilizationTelemetry::from_published_status(&status),
+        Some(video)
+    );
+    assert!(video.is_well_formed());
+    assert!(
+        !GpuUtilizationTelemetry {
+            decoder_pct: Some(101),
+            ..video
+        }
+        .is_well_formed()
+    );
 }

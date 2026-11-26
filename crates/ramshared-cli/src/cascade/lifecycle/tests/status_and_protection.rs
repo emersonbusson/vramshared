@@ -69,6 +69,8 @@ fn status_json_publishes_gpu_utilization_and_never_invents_idle() {
         schema_version: 1,
         gpu_pct: 0,
         memory_pct: 0,
+        encoder_pct: None,
+        decoder_pct: None,
         sampled_at_unix_ms: 1_000,
     });
     let json = render_status_json(

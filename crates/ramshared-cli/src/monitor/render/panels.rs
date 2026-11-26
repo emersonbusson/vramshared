@@ -496,9 +496,11 @@ pub(in crate::monitor) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, observatio
         lines.push(cache_compaction_row(observation.value("gpu_cache")));
     }
     let text = lines.join("\n");
+    let utilization_height =
+        (text.lines().count() + 2).min(usize::from(area.height.saturating_sub(3))) as u16;
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(1)])
+        .constraints([Constraint::Length(utilization_height), Constraint::Min(3)])
         .split(area);
     frame.render_widget(
         Paragraph::new(text)

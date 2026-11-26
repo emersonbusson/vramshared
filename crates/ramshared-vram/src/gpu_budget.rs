@@ -192,6 +192,10 @@ impl GpuBudgetTelemetry {
 pub struct GpuUtilizationSnapshot {
     pub gpu_pct: u8,
     pub memory_pct: u8,
+    /// Video encoder busy time, when measured.
+    pub encoder_pct: Option<u8>,
+    /// Video decoder busy time, when measured.
+    pub decoder_pct: Option<u8>,
 }
 
 /// Published shape of an adapter busy-time sample: the snapshot plus the wall
@@ -208,6 +212,12 @@ pub struct GpuUtilizationTelemetry {
     /// Percent of the sample window with device-memory traffic. Busy time,
     /// not VRAM capacity occupancy.
     pub memory_pct: u8,
+    /// Busy time for the hardware encoder, when supplied by the adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_pct: Option<u8>,
+    /// Busy time for the hardware decoder, when supplied by the adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_pct: Option<u8>,
     pub sampled_at_unix_ms: u64,
 }
 
@@ -220,6 +230,8 @@ impl GpuUtilizationTelemetry {
             schema_version: 1,
             gpu_pct: snapshot.gpu_pct,
             memory_pct: snapshot.memory_pct,
+            encoder_pct: snapshot.encoder_pct,
+            decoder_pct: snapshot.decoder_pct,
             sampled_at_unix_ms,
         }
     }
@@ -246,7 +258,11 @@ impl GpuUtilizationTelemetry {
     /// Age is deliberately not consulted: a sample can be well formed and old
     /// at the same time, and that combination is the one a record must keep.
     pub fn is_well_formed(&self) -> bool {
-        self.schema_version == 1 && self.gpu_pct <= 100 && self.memory_pct <= 100
+        self.schema_version == 1
+            && self.gpu_pct <= 100
+            && self.memory_pct <= 100
+            && self.encoder_pct.is_none_or(|pct| pct <= 100)
+            && self.decoder_pct.is_none_or(|pct| pct <= 100)
     }
 
     /// `true` when this sample is still fresh at `now_unix_ms`.

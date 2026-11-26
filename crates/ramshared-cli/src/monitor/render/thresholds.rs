@@ -437,13 +437,22 @@ pub(in crate::monitor) fn utilization_row(
     match classify_utilization(sample, sample_stale, now_unix_ms) {
         UtilizationStatus::NotMeasured => not_measured.to_string(),
         UtilizationStatus::Stale => stale_row.to_string(),
-        UtilizationStatus::Measured(typed) => format!(
-            " GPU busy (sample window): {} {:>3}%\n mem busy (sample window): {} {:>3}%",
-            pct_bar(typed.gpu_pct),
-            typed.gpu_pct,
-            pct_bar(typed.memory_pct),
-            typed.memory_pct,
-        ),
+        UtilizationStatus::Measured(typed) => {
+            let mut rows = format!(
+                " GPU busy (sample window): {} {:>3}% kernels\n mem busy (sample window): {} {:>3}%",
+                pct_bar(typed.gpu_pct),
+                typed.gpu_pct,
+                pct_bar(typed.memory_pct),
+                typed.memory_pct,
+            );
+            for (engine, reading) in [("encode", typed.encoder_pct), ("decode", typed.decoder_pct)]
+            {
+                if let Some(pct) = reading {
+                    rows.push_str(&format!("\n {engine} busy: {} {pct:>3}%", pct_bar(pct)));
+                }
+            }
+            rows
+        }
     }
 }
 

@@ -228,24 +228,65 @@ pub(super) fn draw_cache(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(text.cache_origin);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(area.inner(ratatui::layout::Margin::new(1, 1)));
+    let hit_label = format!(" {} [0–100%] ", text.hits);
+    let origin_label = format!(
+        " {} [{}] ",
+        text.origin_reads,
+        dashboard_phrase(language, DashboardPhrase::ZeroToPeak)
+    );
+    let graph_width = usize::from(columns[0].width)
+        .saturating_sub(hit_label.chars().count().max(origin_label.chars().count()));
+    let hit_spark = sparkline(&history.cache_hit_rate, 100, graph_width);
+    let fallback_spark = sparkline(
+        &history.cache_origin_reads,
+        history
+            .cache_origin_reads
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1),
+        graph_width,
+    );
     if !cache.active() {
         let reason = cache
             .reason
             .as_deref()
             .map(|reason| reason_label(language, reason))
             .unwrap_or_else(|| text.not_measured.to_string());
-        let lines = vec![
-            Line::from(format!(
-                "{} — {reason}",
-                status_label(language, &cache.state)
-            )),
-            Line::from(dashboard_phrase(
+        let mut lines = vec![Line::from(format!(
+            "{} — {reason}",
+            status_label(language, &cache.state)
+        ))];
+        if history.cache_hit_rate.is_empty() && history.cache_origin_reads.is_empty() {
+            lines.push(Line::from(dashboard_phrase(
                 language,
                 DashboardPhrase::CheckCacheOrigin,
-            )),
-            Line::from(format!("{}: {}", text.state, state_lane(history, 40))),
-        ];
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+            )));
+        } else {
+            lines.extend([
+                Line::from(super::pick(
+                    language,
+                    "Last recorded samples",
+                    "Últimas amostras",
+                )),
+                Line::from(format!("{hit_label}{hit_spark}")),
+                Line::from(format!("{origin_label}{fallback_spark}")),
+            ]);
+        }
+        lines.push(Line::from(format!(
+            "{}: {}",
+            text.state,
+            state_lane(history, 40)
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+            area,
+        );
         return;
     }
     let hit = match (cache.hit_rate(), cache.hits) {
@@ -273,30 +314,6 @@ pub(super) fn draw_cache(
         .fill_pct()
         .map(|pct| format!("{pct}%"))
         .unwrap_or_else(|| text.not_measured.to_string());
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(area.inner(ratatui::layout::Margin::new(1, 1)));
-    let hit_label = format!(" {} [0–100%] ", text.hits);
-    let origin_label = format!(
-        " {} [{}] ",
-        text.origin_reads,
-        dashboard_phrase(language, DashboardPhrase::ZeroToPeak)
-    );
-    let graph_width = usize::from(columns[0].width)
-        .saturating_sub(hit_label.chars().count().max(origin_label.chars().count()));
-    let hit_spark = sparkline(&history.cache_hit_rate, 100, graph_width);
-    let fallback_spark = sparkline(
-        &history.cache_origin_reads,
-        history
-            .cache_origin_reads
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .max(1),
-        graph_width,
-    );
     let mut right = vec![
         Line::from(text.now.to_uppercase()),
         Line::from(format!(" {}       {hit}", text.hits)),
