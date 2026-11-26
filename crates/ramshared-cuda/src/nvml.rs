@@ -205,16 +205,7 @@ impl Nvml {
             }
         };
 
-        // SAFETY: init symbol resolved successfully.
-        let r = unsafe { (syms.init)() };
-        if r != NVML_SUCCESS {
-            return Err(NvmlError::Call {
-                op: "nvmlInit_v2",
-                code: r,
-                msg: err_string(&syms, r),
-            });
-        }
-
+        initialize_nvml(&syms)?;
         Ok(Nvml { _lib: lib, syms })
     }
 
@@ -326,6 +317,19 @@ impl Drop for Nvml {
             (self.syms.shutdown)();
         }
     }
+}
+
+fn initialize_nvml(syms: &NvmlSyms) -> Result<(), NvmlError> {
+    // SAFETY: init symbol resolved successfully.
+    let r = unsafe { (syms.init)() };
+    if r != NVML_SUCCESS {
+        return Err(NvmlError::Call {
+            op: "nvmlInit_v2",
+            code: r,
+            msg: err_string(syms, r),
+        });
+    }
+    Ok(())
 }
 
 fn video_utilization(
@@ -655,6 +659,25 @@ mod tests {
             mock::set_handle_returns_null(false);
             mock::set_error_string_returns_null(false);
         }
+    }
+
+    #[test]
+    fn initialize_nvml_distinguishes_success_from_driver_refusal() {
+        unsafe extern "C" fn refused() -> NvmlResult {
+            -7
+        }
+
+        let mut nvml = mock::build();
+        assert!(initialize_nvml(&nvml.syms).is_ok());
+        nvml.syms.init = refused;
+        assert!(matches!(
+            initialize_nvml(&nvml.syms),
+            Err(NvmlError::Call {
+                op: "nvmlInit_v2",
+                code: -7,
+                ..
+            })
+        ));
     }
 
     #[test]
