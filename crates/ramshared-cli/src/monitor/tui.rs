@@ -186,6 +186,7 @@ pub(super) fn tui_loop_with_handoff<B: Backend>(
     let mut next_identity_refresh = Instant::now() + identity_refresh_interval;
     let history_limit = ((options.history_seconds * MILLIS_PER_SECOND) / options.interval_ms)
         .clamp(HISTORY_MIN_SAMPLES, HISTORY_MAX_SAMPLES) as usize;
+    let mut repaint = handoff_state.is_some();
     let mut ui = handoff_state
         .take()
         .unwrap_or_else(|| TuiHandoffState::with_language(options.language));
@@ -435,6 +436,13 @@ pub(super) fn tui_loop_with_handoff<B: Backend>(
         // The same `history` this loop fills above: a fresh
         // `DashHistory::default()` here kept every chart at `not measured`
         // forever, with the series filled and never read.
+        if repaint {
+            // Discard old cells preserved by the terminal through exec or resize.
+            terminal
+                .clear()
+                .map_err(|error| MonitorError::Io(error.to_string()))?;
+            repaint = false;
+        }
         let _ = terminal.draw(|frame| {
             dashboard::draw(
                 frame,
@@ -454,6 +462,9 @@ pub(super) fn tui_loop_with_handoff<B: Backend>(
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(100));
         let event = runtime.next_event(wait);
+        if matches!(event, Some(Event::Resize(..))) {
+            repaint = true;
+        }
         if let Some(Event::Key(key)) = event.as_ref()
             && key.kind == KeyEventKind::Press
         {

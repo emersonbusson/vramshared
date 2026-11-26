@@ -550,6 +550,9 @@ fn compression_summary_keeps_only_complete_fields() {
     let fallback = compression_line(&observation, Language::En, 20).unwrap();
     assert!(fallback.contains(text(Language::En).not_measured));
     assert!(Line::from(fallback.as_str()).width() <= 20);
+    let wide_fallback = compression_line(&observation, Language::En, 120).unwrap();
+    assert!(!wide_fallback.contains("saved"), "{wide_fallback}");
+    assert!(!wide_fallback.contains('→'), "{wide_fallback}");
 }
 
 #[test]
@@ -670,6 +673,114 @@ fn unavailable_pressure_never_renders_fabricated_zero_percent() {
 }
 
 #[test]
+fn dashboard_preserves_history_and_reports_gpu_only_delay() {
+    let mut observation = active_cache_observation();
+    for (key, value) in [
+        ("overall_state", json!("BLOCKED")),
+        ("protection_state", json!("READY")),
+        ("origin_state", json!("READY")),
+        ("guardian_state", json!("HEALTHY")),
+        ("control_plane_state", json!("vsock_leased")),
+        ("order_ok", json!(true)),
+        ("ghost", json!(false)),
+        ("health_errors", json!([])),
+        ("reasons", json!([])),
+        (
+            "measurement_errors",
+            json!(["gpu_cache_telemetry_invalid_or_stale"]),
+        ),
+    ] {
+        observation.status.insert(key.into(), value);
+    }
+    let mut history = DashHistory::default();
+    history.cache_hit_rate.push_back(18);
+    history.cache_origin_reads.push_back(79);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let render = |terminal: &mut Terminal<TestBackend>, observation: &Observation| {
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    observation,
+                    &history,
+                    &metadata(),
+                    Language::En,
+                    Screen::Main,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (rendered, buffer[(0, 0)].fg)
+    };
+    let (rendered, color) = render(&mut terminal, &observation);
+    assert!(
+        rendered.contains("BLOCKED — GPU telemetry delayed"),
+        "{rendered}"
+    );
+    assert_eq!(color, Color::Yellow);
+    let cache_column = |rendered: &str| {
+        let (left, _) = rendered
+            .lines()
+            .find_map(|row| row.split_once("NOW"))
+            .expect("cache counters remain visible");
+        assert!(left.ends_with("  "), "{rendered}");
+        left.chars().count()
+    };
+    let active_column = cache_column(&rendered);
+
+    observation
+        .status
+        .insert("measurement_errors".into(), json!([]));
+    observation
+        .status
+        .insert("cache_state".into(), json!("UNAVAILABLE"));
+    let (rendered, color) = render(&mut terminal, &observation);
+    assert!(rendered.contains("GPU cache unavailable"), "{rendered}");
+    assert!(rendered.contains("Last recorded samples"), "{rendered}");
+    assert!(rendered.contains("[0–100%]"), "{rendered}");
+    assert_eq!(cache_column(&rendered), active_column);
+    assert_eq!(color, Color::Yellow);
+
+    observation.status.insert("order_ok".into(), json!(false));
+    let (rendered, color) = render(&mut terminal, &observation);
+    assert!(!rendered.contains("GPU cache unavailable"), "{rendered}");
+    assert_eq!(color, Color::Red);
+}
+
+#[test]
+fn dashboard_identifies_the_busiest_observed_gpu_engine() {
+    let mut observation = active_cache_observation();
+    observation.epoch_ms = 50_000;
+    for (enc, dec, engine, busiest) in [
+        (Some(41), Some(20), "enc", 41),
+        (Some(5), Some(46), "dec", 46),
+        (Some(26), Some(0), "kernels", 26),
+        (None, None, "kernels", 26),
+    ] {
+        observation.status.insert(
+            "gpu_utilization".to_string(),
+            json!({
+                "schema_version": 1,
+                "gpu_pct": 26,
+                "memory_pct": 21,
+                "encoder_pct": enc,
+                "decoder_pct": dec,
+                "sampled_at_unix_ms": 49_500,
+            }),
+        );
+        let row = gpu_busy_line(&observation, Language::En, 58);
+        assert!(row.contains(&format!("NVML busy {engine} ")), "{row}");
+        assert!(row.contains(&format!("{busiest}% · mem 21%")), "{row}");
+    }
+}
+
+#[test]
 fn main_dashboard_renders_live_idle_stale_and_unmeasured_gpu_busy() {
     let mut observation = active_cache_observation();
     observation.epoch_ms = 50_000;
@@ -685,12 +796,12 @@ fn main_dashboard_renders_live_idle_stale_and_unmeasured_gpu_busy() {
         }),
     );
     let en = gpu_busy_line(&observation, Language::En, 58);
-    assert!(en.contains("GPU busy"), "{en}");
+    assert!(en.contains("NVML busy"), "{en}");
     assert!(en.contains("13%"), "{en}");
     assert!(en.contains("mem 2%"), "{en}");
     assert!(!en.contains("not measured"), "{en}");
     let pt = gpu_busy_line(&observation, Language::PtBr, 38);
-    assert!(pt.contains("GPU ocupada"), "{pt}");
+    assert!(pt.contains("NVML ocupada"), "{pt}");
     assert!(pt.contains("13%"), "{pt}");
     assert!(pt.contains("mem 2%"), "{pt}");
 
@@ -717,6 +828,7 @@ fn main_dashboard_renders_live_idle_stale_and_unmeasured_gpu_busy() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(frame_text.contains("13% · mem 2%"), "{frame_text}");
+    assert!(frame_text.contains("NVML busy kernels"), "{frame_text}");
     assert!(
         !frame_text.contains("GPU busy: not measured"),
         "{frame_text}"

@@ -405,6 +405,8 @@ mod tests {
             &GpuUtilizationSnapshot {
                 gpu_pct: 0,
                 memory_pct: 0,
+                encoder_pct: None,
+                decoder_pct: None,
             },
             10_000,
         );

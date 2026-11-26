@@ -39,8 +39,13 @@ fn cuda_vram_traits_round_trip_on_hardware() {
         .expect("NVML utilization snapshot must work on hardware");
     assert!(utilization.gpu_pct <= 100);
     assert!(utilization.memory_pct <= 100);
+    assert!(utilization.encoder_pct.is_none_or(|pct| pct <= 100));
+    assert!(utilization.decoder_pct.is_none_or(|pct| pct <= 100));
     eprintln!(
-        "CUDA NVML utilization_snapshot: gpu_pct={}, memory_pct={}",
-        utilization.gpu_pct, utilization.memory_pct
+        "CUDA NVML utilization_snapshot: gpu_pct={}, memory_pct={}, encoder_pct={:?}, decoder_pct={:?}",
+        utilization.gpu_pct,
+        utilization.memory_pct,
+        utilization.encoder_pct,
+        utilization.decoder_pct
     );
 }

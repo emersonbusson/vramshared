@@ -420,12 +420,16 @@ fn wddm_and_admission_wrappers_forward_utilization_snapshot_verbatim() {
     let measured = Some(ramshared_vram::GpuUtilizationSnapshot {
         gpu_pct: 17,
         memory_pct: 4,
+        encoder_pct: None,
+        decoder_pct: None,
     });
     for sample in [
         measured,
         Some(ramshared_vram::GpuUtilizationSnapshot {
             gpu_pct: 0,
             memory_pct: 0,
+            encoder_pct: None,
+            decoder_pct: None,
         }),
         None,
     ] {

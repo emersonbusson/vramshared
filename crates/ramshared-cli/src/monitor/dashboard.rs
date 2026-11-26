@@ -9,17 +9,23 @@
 
 mod cache_panel;
 mod compression;
+mod gpu_status;
+mod header;
 mod host_memory;
 mod operation_banner;
 mod views;
 
 use cache_panel::{cache_snapshot, codec_line, draw_cache};
 use compression::compression_line;
+#[cfg(test)]
+use header::degraded_cause;
+use header::draw_header;
 use host_memory::{host_memory_line, host_memory_snapshot};
 use operation_banner::{active_action_summary, draw_operation_banner, has_active_operation};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+#[cfg(test)]
+use ratatui::style::Color;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
@@ -32,8 +38,8 @@ use super::i18n::{
 };
 use super::model::{MemoryScope, Observation};
 use super::render::{
-    DashHistory, DashboardMetadata, UtilizationStatus, classify_utilization, format_uptime_seconds,
-    make_bar, make_tier_bar, tier_fill_pct,
+    DashHistory, DashboardMetadata, UtilizationStatus, classify_utilization, make_bar,
+    make_tier_bar, tier_fill_pct,
 };
 
 const KIB: u64 = 1024;
@@ -120,142 +126,6 @@ fn draw_main(
         )),
         rows[4 + offset],
     );
-}
-
-fn draw_header(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    observation: &Observation,
-    metadata: &DashboardMetadata,
-    language: Language,
-) {
-    let text = text(language);
-    let cache = cache_snapshot(observation);
-    let overall_raw = observation.string("overall_state");
-    let overall = if overall_raw.is_empty() {
-        "UNKNOWN".to_string()
-    } else if overall_raw == "GUARDED" {
-        "DEGRADED".to_string()
-    } else {
-        overall_raw.to_string()
-    };
-    let overall_label = status_label(language, &overall);
-    let cause = degraded_cause(observation, language);
-    let cause = cause.map(|cause| format!(" — {cause}")).unwrap_or_default();
-    let swap = status_label(language, observation.string("protection_state"));
-    let origin = status_label(language, observation.string("origin_state"));
-    let cache_label = match cache.state.as_str() {
-        "ACTIVE" => {
-            let hit = cache
-                .hit_rate()
-                .map(|pct| format!("{pct}%"))
-                .unwrap_or_else(|| text.not_measured.to_string());
-            format!("{} · {}", text.active, hit)
-        }
-        "OFF" => {
-            let reason = cache
-                .reason
-                .as_deref()
-                .map(|reason| reason_label(language, reason))
-                .map(|reason| format!(" — {reason}"))
-                .unwrap_or_default();
-            format!("{}{reason}", text.off)
-        }
-        state => status_label(language, state),
-    };
-    let uptime = observation
-        .control_plane
-        .uptime_seconds
-        .map(format_uptime_seconds)
-        .unwrap_or_else(|| text.not_measured.to_string());
-    let pressure = if observation.control_plane.memory_psi_available {
-        let class = pressure_class(observation.control_plane.memory_psi_full_avg10);
-        pressure_label(language, class).to_string()
-    } else {
-        text.unavailable.to_string()
-    };
-    let title = if metadata.version_line.trim().is_empty() {
-        format!("RamShared {}", env!("CARGO_PKG_VERSION"))
-    } else {
-        metadata.version_line.clone()
-    };
-    let pressure_name = match observation.memory_scope {
-        MemoryScope::LinuxHost => text.pressure,
-        MemoryScope::Wsl | MemoryScope::Wsl2 => pick(language, "Guest pressure", "Pressão guest"),
-    };
-    let right_header = format!("{} {uptime}", text.host_up);
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let header_gap = inner_width
-        .saturating_sub(title.chars().count() + right_header.chars().count())
-        .max(2);
-    let lines = vec![
-        Line::from(format!("{title}{}{right_header}", " ".repeat(header_gap))),
-        Line::from(format!(
-            "{}: {overall_label}{cause}   {}: {swap}   {}: {cache_label}",
-            text.overall,
-            pick(language, "RamShared swap", "Swap RamShared"),
-            text.cache_gpu
-        )),
-        Line::from(format!(
-            "{}: {origin}   {}: {pressure} [p]",
-            text.origin, pressure_name
-        )),
-    ];
-    let color = match overall.as_str() {
-        "HEALTHY" => Color::Green,
-        "DEGRADED" | "UNKNOWN" => Color::Yellow,
-        _ => Color::Red,
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(color))
-            .block(Block::default().borders(Borders::ALL).title("RamShared")),
-        area,
-    );
-}
-
-fn degraded_cause(observation: &Observation, language: Language) -> Option<String> {
-    let overall = observation.string("overall_state");
-    if !overall.eq_ignore_ascii_case("GUARDED") && !overall.eq_ignore_ascii_case("DEGRADED") {
-        return None;
-    }
-    let text = text(language);
-    let full = observation.control_plane.memory_psi_full_avg10;
-    let mem = &observation.mem;
-    if let (Some(total), Some(available)) = (
-        mem.total_kib.and_then(|value| value.checked_mul(KIB)),
-        mem.available_kib.and_then(|value| value.checked_mul(KIB)),
-    ) {
-        let reserve = crate::supervisor::memory_policy::control_reserve_bytes(total);
-        let recovery =
-            reserve.saturating_add(crate::supervisor::memory_policy::RECOVERY_MARGIN_BYTES);
-        if available < reserve {
-            return Some(format!(
-                "{} ({}/{} GiB)",
-                text.reserve,
-                language.number(format!("{:.2}", available as f64 / GIB as f64)),
-                language.number(format!("{:.2}", reserve as f64 / GIB as f64))
-            ));
-        }
-        if available < recovery {
-            return Some(format!(
-                "{} ({}/{} GiB)",
-                text.recovery,
-                language.number(format!("{:.2}", available as f64 / GIB as f64)),
-                language.number(format!("{:.2}", recovery as f64 / GIB as f64))
-            ));
-        }
-    }
-    if observation.control_plane.memory_psi_available
-        && full >= crate::supervisor::memory_policy::GUARDED_PSI_FULL_AVG10_PERCENT
-    {
-        return Some(format!("PSI full {:.2}%", full));
-    }
-    // A guarded control plane with no measured pressure is not evidence of a
-    // reserve shortage. This used to fall back to "control reserve" for every
-    // GUARDED verdict, which turned a fail-closed boot (no daemon, or the
-    // supervisor's recovery window) into a false memory-pressure claim.
-    None
 }
 
 fn draw_memory(frame: &mut Frame<'_>, area: Rect, observation: &Observation, language: Language) {
@@ -457,13 +327,22 @@ fn gpu_busy_line(observation: &Observation, language: Language, inner_width: usi
             text.stale
         ),
         UtilizationStatus::Measured(util) => {
-            let label = pick(language, "GPU busy", "GPU ocupada");
-            let bar_len = if inner_width >= 44 { 14 } else { 6 };
-            let bar = make_bar(u64::from(util.gpu_pct), bar_len);
-            format!(
-                " {label} {bar} {}% · mem {}%",
-                util.gpu_pct, util.memory_pct
-            )
+            let label = pick(language, "NVML busy", "NVML ocupada");
+            let mut busiest = (pick(language, "kernels", "kernels"), util.gpu_pct);
+            for (name, reading) in [
+                (pick(language, "enc", "cod"), util.encoder_pct),
+                (pick(language, "dec", "dec"), util.decoder_pct),
+            ] {
+                if let Some(pct) = reading
+                    && pct > busiest.1
+                {
+                    busiest = (name, pct);
+                }
+            }
+            let (engine, pct) = busiest;
+            let bar_len = if inner_width >= 49 { 14 } else { 6 };
+            let bar = make_bar(u64::from(pct), bar_len);
+            format!(" {label} {engine} {bar} {pct}% · mem {}%", util.memory_pct)
         }
     }
 }
