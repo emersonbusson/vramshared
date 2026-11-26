@@ -327,7 +327,7 @@ fn gpu_busy_line(observation: &Observation, language: Language, inner_width: usi
             text.stale
         ),
         UtilizationStatus::Measured(util) => {
-            let label = pick(language, "GPU busy", "GPU ocupada");
+            let label = pick(language, "NVML busy", "NVML ocupada");
             let mut busiest = (pick(language, "kernels", "kernels"), util.gpu_pct);
             for (name, reading) in [
                 (pick(language, "enc", "cod"), util.encoder_pct),

@@ -550,6 +550,9 @@ fn compression_summary_keeps_only_complete_fields() {
     let fallback = compression_line(&observation, Language::En, 20).unwrap();
     assert!(fallback.contains(text(Language::En).not_measured));
     assert!(Line::from(fallback.as_str()).width() <= 20);
+    let wide_fallback = compression_line(&observation, Language::En, 120).unwrap();
+    assert!(!wide_fallback.contains("saved"), "{wide_fallback}");
+    assert!(!wide_fallback.contains('→'), "{wide_fallback}");
 }
 
 #[test]
@@ -721,6 +724,15 @@ fn dashboard_preserves_history_and_reports_gpu_only_delay() {
         "{rendered}"
     );
     assert_eq!(color, Color::Yellow);
+    let cache_column = |rendered: &str| {
+        let (left, _) = rendered
+            .lines()
+            .find_map(|row| row.split_once("NOW"))
+            .expect("cache counters remain visible");
+        assert!(left.ends_with("  "), "{rendered}");
+        left.chars().count()
+    };
+    let active_column = cache_column(&rendered);
 
     observation
         .status
@@ -732,6 +744,7 @@ fn dashboard_preserves_history_and_reports_gpu_only_delay() {
     assert!(rendered.contains("GPU cache unavailable"), "{rendered}");
     assert!(rendered.contains("Last recorded samples"), "{rendered}");
     assert!(rendered.contains("[0–100%]"), "{rendered}");
+    assert_eq!(cache_column(&rendered), active_column);
     assert_eq!(color, Color::Yellow);
 
     observation.status.insert("order_ok".into(), json!(false));
@@ -762,7 +775,7 @@ fn dashboard_identifies_the_busiest_observed_gpu_engine() {
             }),
         );
         let row = gpu_busy_line(&observation, Language::En, 58);
-        assert!(row.contains(&format!("GPU busy {engine} ")), "{row}");
+        assert!(row.contains(&format!("NVML busy {engine} ")), "{row}");
         assert!(row.contains(&format!("{busiest}% · mem 21%")), "{row}");
     }
 }
@@ -783,12 +796,12 @@ fn main_dashboard_renders_live_idle_stale_and_unmeasured_gpu_busy() {
         }),
     );
     let en = gpu_busy_line(&observation, Language::En, 58);
-    assert!(en.contains("GPU busy"), "{en}");
+    assert!(en.contains("NVML busy"), "{en}");
     assert!(en.contains("13%"), "{en}");
     assert!(en.contains("mem 2%"), "{en}");
     assert!(!en.contains("not measured"), "{en}");
     let pt = gpu_busy_line(&observation, Language::PtBr, 38);
-    assert!(pt.contains("GPU ocupada"), "{pt}");
+    assert!(pt.contains("NVML ocupada"), "{pt}");
     assert!(pt.contains("13%"), "{pt}");
     assert!(pt.contains("mem 2%"), "{pt}");
 
@@ -815,6 +828,7 @@ fn main_dashboard_renders_live_idle_stale_and_unmeasured_gpu_busy() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(frame_text.contains("13% · mem 2%"), "{frame_text}");
+    assert!(frame_text.contains("NVML busy kernels"), "{frame_text}");
     assert!(
         !frame_text.contains("GPU busy: not measured"),
         "{frame_text}"

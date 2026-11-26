@@ -230,7 +230,11 @@ pub(super) fn draw_cache(
         .title(text.cache_origin);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([
+            Constraint::Percentage(62),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
         .split(area.inner(ratatui::layout::Margin::new(1, 1)));
     let hit_label = format!(" {} [0–100%] ", text.hits);
     let origin_label = format!(
@@ -252,43 +256,6 @@ pub(super) fn draw_cache(
             .max(1),
         graph_width,
     );
-    if !cache.active() {
-        let reason = cache
-            .reason
-            .as_deref()
-            .map(|reason| reason_label(language, reason))
-            .unwrap_or_else(|| text.not_measured.to_string());
-        let mut lines = vec![Line::from(format!(
-            "{} — {reason}",
-            status_label(language, &cache.state)
-        ))];
-        if history.cache_hit_rate.is_empty() && history.cache_origin_reads.is_empty() {
-            lines.push(Line::from(dashboard_phrase(
-                language,
-                DashboardPhrase::CheckCacheOrigin,
-            )));
-        } else {
-            lines.extend([
-                Line::from(super::pick(
-                    language,
-                    "Last recorded samples",
-                    "Últimas amostras",
-                )),
-                Line::from(format!("{hit_label}{hit_spark}")),
-                Line::from(format!("{origin_label}{fallback_spark}")),
-            ]);
-        }
-        lines.push(Line::from(format!(
-            "{}: {}",
-            text.state,
-            state_lane(history, 40)
-        )));
-        frame.render_widget(
-            Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    }
     let hit = match (cache.hit_rate(), cache.hits) {
         (Some(pct), Some(count)) => format!("{pct}% ({count})"),
         (Some(pct), None) => format!("{pct}%"),
@@ -378,14 +345,18 @@ pub(super) fn draw_cache(
     } else {
         text.not_measured.to_string()
     };
-    let mut left = vec![
+    let samples_label = if cache.active() {
+        dashboard_phrase(language, DashboardPhrase::CumulativeSamples)
+    } else if history.cache_hit_rate.is_empty() && history.cache_origin_reads.is_empty() {
+        dashboard_phrase(language, DashboardPhrase::CheckCacheOrigin)
+    } else {
+        super::pick(language, "Last recorded samples", "Últimas amostras")
+    };
+    let left = vec![
         Line::from(top_summary),
         Line::from(format!("{hit_label}{hit_spark}")),
         Line::from(format!("{origin_label}{fallback_spark}")),
-        Line::from(dashboard_phrase(
-            language,
-            DashboardPhrase::CumulativeSamples,
-        )),
+        Line::from(samples_label),
         Line::from(format!(
             " {} {} {} / {}{}",
             text.physical,
@@ -408,12 +379,9 @@ pub(super) fn draw_cache(
             DashboardPhrase::CacheReadThroughNote,
         )),
     ];
-    let text_len = left.len().max(right.len());
-    left.resize(text_len, Line::from(""));
-    right.resize(text_len, Line::from(""));
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(left).wrap(Wrap { trim: true }), columns[0]);
-    frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: true }), columns[1]);
+    frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: true }), columns[2]);
 }
 
 fn format_top_summary(
@@ -424,6 +392,14 @@ fn format_top_summary(
     language: Language,
 ) -> String {
     let text = text(language);
+    if !cache.active() {
+        let reason = cache
+            .reason
+            .as_deref()
+            .map(|reason| reason_label(language, reason))
+            .unwrap_or_else(|| text.not_measured.to_string());
+        return format!("{} · {reason}", status_label(language, &cache.state));
+    }
     if let Some(ratio) = cache.payload_compression_ratio {
         let ratio_str = format!("{}:1", language.number(format!("{ratio:.2}")));
         let stored_str = fmt_bytes(cache.payload_stored_bytes(), language);
