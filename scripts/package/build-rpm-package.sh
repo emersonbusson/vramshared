@@ -186,6 +186,9 @@ echo "==> Staged $(grep -c . "$FILES_LIST") payload members for the RPM layout"
 # file nobody installed and cannot omit one that shipped.
 {
   cat << SPEC_EOF
+# Preserve the prebuilt executables recorded by BUILD-IDENTITY.
+%global debug_package %{nil}
+%global __strip /usr/bin/true
 Name:           ramshared
 Version:        ${RPM_VERSION}
 Release:        1%{?dist}
@@ -254,5 +257,17 @@ if (( ${#rpm_artifacts[@]} == 0 )); then
   echo "ERROR: rpmbuild produced no RPM artifact" >&2
   exit 1
 fi
+# Verify the payload fingerprints recorded by RPM before publishing artifacts.
+for artifact in "${rpm_artifacts[@]}"; do
+  payload_digests=$(rpm -qp --queryformat '[%{FILENAMES}\t%{FILEDIGESTS}\n]' "$artifact")
+  for binary in "$CLI_BIN" "$DAEMON_BIN"; do
+    destination="/usr/bin/${binary##*/}"
+    expected=$(sha256sum "$binary")
+    if ! grep -Fxq "$destination"$'\t'"${expected%% *}" <<< "$payload_digests"; then
+      printf 'ERROR: RPM payload identity mismatch for %s in %s\n' "$destination" "$artifact" >&2
+      exit 1
+    fi
+  done
+done
 cp "${rpm_artifacts[@]}" "$OUT_DIR/"
 echo "✓ RPM package built under $OUT_DIR/"
