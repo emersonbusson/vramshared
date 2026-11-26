@@ -36,8 +36,10 @@ pub(super) fn compression_line(
         || text.not_measured.to_string(),
         |ratio| format!("{}:1", language.number(format!("{ratio:.2}"))),
     );
-    let saved = original.saturating_sub(cost.unwrap_or(stored));
-    let mut line = if saved > 0 {
+    let saved = cost.map_or(0, |bytes| original.saturating_sub(bytes));
+    let mut line = if stored == 0 {
+        format!(" {}: {ratio}", text.zram)
+    } else if saved > 0 {
         let with_saved = format!(
             " {} → {}  {ratio} ({} {})",
             fmt_bytes(original, language),

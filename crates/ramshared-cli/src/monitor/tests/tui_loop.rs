@@ -723,6 +723,38 @@ fn flight_sample_dir_refuses_foreign_owners_and_unusable_bases() {
     fs::remove_dir_all(&root).unwrap();
 }
 
+fn terminal_with_old_screen_cells() -> Terminal<TestBackend> {
+    let mut terminal = Terminal::new(TestBackend::new(110, 32)).expect("test terminal");
+    let previous_cell = &ratatui::buffer::Cell::new("☂");
+    ratatui::backend::Backend::draw(
+        terminal.backend_mut(),
+        (0..32).flat_map(|y| (0..110).map(move |x| (x, y, previous_cell))),
+    )
+    .expect("existing alternate-screen contents");
+    terminal
+}
+
+#[test]
+fn tui_resize_repaints_when_viewport_dimensions_are_already_current() {
+    let mut terminal = terminal_with_old_screen_cells();
+    let mut runtime = ScriptedRuntime::new()
+        .with_observations(vec![observation(true, false), observation(true, false)])
+        .with_events(vec![Event::Resize(110, 32), quit_key()]);
+    let exit = tui_loop(
+        &mut terminal,
+        &tui_options(),
+        ProcessInstallOrigin::Unknown,
+        false,
+        None,
+        &mut InstallationIdentityCache::default(),
+        IDENTITY_REFRESH_INTERVAL,
+        &mut runtime,
+    )
+    .expect("tui exit");
+    assert_eq!(exit, TuiExit::UserRequested);
+    assert!(!buffer_text(&terminal).contains('☂'));
+}
+
 #[test]
 fn tui_handoff_preserves_language_screen_and_history_across_restart() {
     let restart = PathBuf::from("/opt/ramshared/current/bin/ramshared");
@@ -769,7 +801,7 @@ fn tui_handoff_preserves_language_screen_and_history_across_restart() {
     let mut second_runtime = ScriptedRuntime::new()
         .with_observations(vec![observation(true, false)])
         .with_events(vec![quit_key()]);
-    let mut second_terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 32)).unwrap();
+    let mut second_terminal = terminal_with_old_screen_cells();
     let second_exit = tui_loop_with_handoff(
         &mut second_terminal,
         &tui_options(),
@@ -784,6 +816,7 @@ fn tui_handoff_preserves_language_screen_and_history_across_restart() {
     .expect("second exit");
     assert_eq!(second_exit, TuiExit::UserRequested);
     let rendered = buffer_text(&second_terminal);
+    assert!(!rendered.contains('☂'), "old screen cells survived restart");
     let pt = crate::monitor::i18n::text(Language::PtBr);
     assert!(
         rendered.contains(pt.pressure) || rendered.contains("WSL2"),
