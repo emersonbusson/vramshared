@@ -228,7 +228,17 @@ impl CommandRunner for SystemCommandRunner {
         // container without the node keeps the legacy allocator as a bounded
         // fallback, never the other way round.
         zram_hot_add_from(Path::new("/sys/class/zram-control/hot_add"), &|| {
-            self.run("zramctl", &["--find"])
+            let path = self.run("zramctl", &["--find"])?;
+            let id = zram_id_from_path(Path::new(path.trim())).ok_or_else(|| {
+                CascadeError::UnsafeContainment(
+                    "fallback zram allocator returned an unverified device name".into(),
+                )
+            })?;
+            let zram = crate::runtime::zram_sysfs::ZramSysfs::open(id)
+                .map_err(|error| unproven_zram_preparation(&path, error))?;
+            zram.verify_unconfigured()
+                .map_err(|error| unproven_zram_preparation(&path, error))?;
+            Ok(path)
         })
     }
 
@@ -255,6 +265,8 @@ impl CommandRunner for SystemCommandRunner {
                 msg: error.to_string(),
             }
         })?;
+        zram.verify_unconfigured()
+            .map_err(|error| unproven_zram_preparation(zdev, error))?;
         zram.set_backing_dev(Path::new(backing_dev))
             .map_err(|error| CascadeError::Shell {
                 cmd: "zram sysfs".into(),
@@ -307,9 +319,14 @@ impl CommandRunner for SystemCommandRunner {
         })?;
         let bytes = mb.saturating_mul(1024 * 1024);
         crate::runtime::native_ops::execute_native_zram_configure(id, Path::new(backing_dev), bytes)
-            .map_err(|error| CascadeError::Shell {
-                cmd: "zram sysfs".into(),
-                msg: error.to_string(),
+            .map_err(|error| match error {
+                crate::runtime::zram_sysfs::ZramError::PreparationUnproven(_) => {
+                    unproven_zram_preparation(zdev, error)
+                }
+                error => CascadeError::Shell {
+                    cmd: "zram sysfs".into(),
+                    msg: error.to_string(),
+                },
             })
     }
 
@@ -351,6 +368,12 @@ impl CommandRunner for SystemCommandRunner {
             msg: format!("swapon outcome uncertain: {error}"),
         })
     }
+}
+
+fn unproven_zram_preparation(path: &str, error: impl std::fmt::Display) -> CascadeError {
+    CascadeError::UnsafeContainment(format!(
+        "cannot prove zram preparation for {path} ({error}); device and backend preserved"
+    ))
 }
 
 pub(super) fn zram_hot_add_from(

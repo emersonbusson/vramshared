@@ -139,6 +139,7 @@ mod nbd_attach;
 use nbd_attach::*;
 mod nbd_netlink;
 mod nbd_peer_recovery;
+mod writeback_startup;
 pub use nbd_peer_recovery::recover_nbd_peer;
 
 /// Starts the cascade from argv already separated by the top-level CLI dispatcher.

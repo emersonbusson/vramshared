@@ -59,8 +59,8 @@ pub fn execute_native_swap_activate(
     activate_swap_native(target, priority)
 }
 
-/// Configure zram writeback through the pinned sysfs descriptor. A disksize
-/// failure rolls the device back before the error is returned.
+/// Initialize an already prepared zram device through its pinned sysfs
+/// descriptor. The device lifecycle owns any subsequent reset.
 pub fn execute_native_zram_configure(
     zram_id: u32,
     backing_dev: &Path,
@@ -102,26 +102,17 @@ where
     F: FnMut() -> Result<(), ZramError>,
     S: FnMut(),
 {
-    let mut last = None;
-    for index in 0..=retries {
+    for _ in 0..retries {
         match attempt() {
-            Ok(()) => return Ok(()),
-            Err(error) if is_transient_busy(&error) && index < retries => {
-                last = Some(error);
+            Err(ZramError::Io(error))
+                if error.raw_os_error() == Some(Errno::BUSY.raw_os_error()) =>
+            {
                 backoff();
             }
-            Err(error) => return Err(error),
+            result => return result,
         }
     }
-    Err(last.unwrap_or(ZramError::RollbackFailed))
-}
-
-fn is_transient_busy(error: &ZramError) -> bool {
-    match error {
-        ZramError::RollbackFailed => true,
-        ZramError::Io(error) => error.raw_os_error() == Some(Errno::BUSY.raw_os_error()),
-        ZramError::SymlinkRefused | ZramError::NotSysfs | ZramError::InvalidInput(_) => false,
-    }
+    attempt()
 }
 
 fn reset_zram<F>(open: F, zram_id: u32) -> Result<(), ZramError>
@@ -260,6 +251,7 @@ mod tests {
         for name in ["reset", "backing_dev", "disksize"] {
             std::fs::write(root.join("zram0").join(name), b"").unwrap();
         }
+        std::fs::write(root.join("zram0/backing_dev"), b"/dev/nbd0\n").unwrap();
         configure_zram(
             |id| ZramSysfs::open_root_checked(&root, id, false),
             0,

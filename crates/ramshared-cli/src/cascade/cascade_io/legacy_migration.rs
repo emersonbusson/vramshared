@@ -716,9 +716,7 @@ impl<R: CommandRunner> LegacyMigrationExecutor for RuntimeLegacyMigrationExecuto
     }
 
     fn disconnect_nbd(&self, device: &BoundDeviceIdentity) -> Result<(), CascadeError> {
-        prove_exact_swap_absent(device)?;
-        revalidate_legacy_bound_device(device)?;
-        self.runner.run("nbd-client", &["-d", &device.path])?;
+        bind_legacy_device_for_effect(device)?.disconnect_nbd(self.runner)?;
         observe_exact_detached_nbd(&device.path).map(|_| ())
     }
 

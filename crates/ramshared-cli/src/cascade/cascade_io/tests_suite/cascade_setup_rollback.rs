@@ -90,6 +90,13 @@ pub(in crate::cascade::cascade_io) fn runtime_marker_and_pid_record_refuse_unsaf
     assert_eq!(system.pid_file, PathBuf::from(PID_FILE));
 }
 
+fn starting_writeback_daemon(fixture: &TestDir) -> PathBuf {
+    fixture.program(
+            "ramsharedd",
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--sock\" ]; then\n    runtime=${2%/*}\n    start=$(awk '{print $22}' /proc/$$/stat)\n    now=$(date +%s%3N)\n    printf '{\"schema_version\":1,\"daemon_instance_id\":\"%s-%s\",\"written_at_unix_ms\":%s,\"ok\":true,\"origin_state\":\"READY\",\"cache_state\":\"ACTIVE\",\"logical_capacity_kib\":1024,\"vram_cached_kib\":0,\"gpu_headroom_kib\":null,\"ssd_origin_written_kib\":1024,\"cache_fallback_reads\":0,\"cache_invalidations\":0,\"cache_releases\":0,\"cache_target_kib\":0}' \"$$\" \"$start\" \"$now\" > \"$runtime/cache-status.json\"\n    touch \"$2\"\n  fi\n  shift\ndone\nexec /bin/sleep 60\n",
+        )
+}
+
 /// SPEC zram-writeback-vram-tier DT-1/DT-2: the writeback mode makes
 /// the tier zram's `backing_dev` and keeps the tier out of the swap
 /// table. The zram is bound after the attach (the tier device must
@@ -97,17 +104,17 @@ pub(in crate::cascade::cascade_io) fn runtime_marker_and_pid_record_refuse_unsaf
 #[test]
 fn zram_writeback_mode_writes_backing_dev_once_and_keeps_overflow_swap() {
     let fixture = TestDir::new();
-    let daemon = fixture.program(
-            "ramsharedd",
-            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--sock\" ]; then\n    runtime=${2%/*}\n    start=$(awk '{print $22}' /proc/$$/stat)\n    now=$(date +%s%3N)\n    printf '{\"schema_version\":1,\"daemon_instance_id\":\"%s-%s\",\"written_at_unix_ms\":%s,\"ok\":true,\"origin_state\":\"READY\",\"cache_state\":\"ACTIVE\",\"logical_capacity_kib\":1024,\"vram_cached_kib\":0,\"gpu_headroom_kib\":null,\"ssd_origin_written_kib\":1024,\"cache_fallback_reads\":0,\"cache_invalidations\":0,\"cache_releases\":0,\"cache_target_kib\":0}' \"$$\" \"$start\" \"$now\" > \"$runtime/cache-status.json\"\n    touch \"$2\"\n  fi\n  shift\ndone\nexec /bin/sleep 60\n",
-        );
+    let daemon = starting_writeback_daemon(&fixture);
     let paths = RuntimePaths::under(&fixture.path);
     pin_zram_comp_algorithm(&paths, "/dev/zram7", "lzo-rle");
     let _seams = ParentSeams::install("Filename Type Size Used Priority\n", 0);
-    set_live_device_snapshots([Ok(vec![bound_device_fixture(
-        "/dev/zram7",
-        ManagedDeviceKind::Zram,
-    )])]);
+    let nbd = bound_device_fixture("/dev/nbd0", ManagedDeviceKind::Nbd);
+    let zram = bound_device_fixture("/dev/zram7", ManagedDeviceKind::Zram);
+    set_live_device_snapshots([
+        Ok(vec![nbd.clone()]),
+        Ok(vec![zram.clone()]),
+        Ok(vec![nbd, zram]),
+    ]);
     let socket = paths.socket.to_string_lossy().into_owned();
     // The writeback mode's order: the tier must exist before zram can
     // be bound to it, so the attach comes first and the zram's setup
@@ -677,4 +684,65 @@ fn bounded_daemon_log_rotates_oversized_file_and_refuses_symlinks() {
     }
     assert_eq!(fs::read_to_string(&target).expect("read target"), "keep\n");
     assert_eq!(fs::read_to_string(&fb2).expect("read fb2"), "safe-fb\n");
+}
+
+#[test]
+fn uncertain_attach_does_not_stop_the_setup_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    struct RefusingAttach<'a> {
+        paths: &'a RuntimePaths,
+        child: RefCell<Option<OwnedFd>>,
+    }
+
+    impl CommandRunner for RefusingAttach<'_> {
+        fn run(&self, command: &str, args: &[&str]) -> Result<String, CascadeError> {
+            if command == "modprobe" {
+                return Ok(String::new());
+            }
+            assert_eq!(command, "nbd-client");
+            assert_eq!(args.first().copied(), Some("-N"));
+            let pid = fs::read_to_string(&self.paths.pid_file)
+                .expect("spawned daemon PID record")
+                .parse::<i32>()
+                .expect("parse fixture daemon PID");
+            let pid = Pid::from_raw(pid).expect("positive fixture daemon PID");
+            *self.child.borrow_mut() =
+                Some(pidfd_open(pid, PidfdFlags::empty()).expect("pin fixture child"));
+            Err(CascadeError::Io("NBD client result unavailable".into()))
+        }
+    }
+
+    impl Drop for RefusingAttach<'_> {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.get_mut().take() {
+                let _ = pidfd_send_signal(&child, Signal::KILL);
+            }
+        }
+    }
+
+    let fixture = TestDir::new();
+    let paths = RuntimePaths::under(&fixture.path);
+    let daemon = starting_writeback_daemon(&fixture);
+    let _seams = ParentSeams::install("Filename Type Size Used Priority\n", 0);
+    set_live_device_snapshots([Err("NBD state unavailable after attach")]);
+    let runner = RefusingAttach {
+        paths: &paths,
+        child: RefCell::new(None),
+    };
+    let mut args = up_args_fixture();
+    args.zram_writeback_tier = true;
+    args.daemon = as_program(&daemon);
+
+    let outcome = setup_new_cascade(&runner, &paths, &args, &TierPriorities::default());
+
+    assert!(
+        matches!(outcome, Err(CascadeError::UnsafeContainment(ref error))
+            if error.contains("first kernel-state reconciliation failed")),
+        "{outcome:?}"
+    );
+    let pid = fs::read_to_string(&paths.pid_file)?.parse()?;
+    assert!(!process_is_gone_or_zombie(pid));
+    assert!(paths.socket.exists());
+    assert!(paths.forensics_markers[0].exists());
+    assert!(runner.child.borrow().is_some());
+    Ok(())
 }
