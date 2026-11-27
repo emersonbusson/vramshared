@@ -297,6 +297,10 @@ pub(crate) fn write_usage(stderr: &mut dyn Write) {
         stderr,
         "  ramshared session --class <class> [--memory-max MiB]",
     );
+    line(
+        stderr,
+        "    Workload admission for run and session requires root.",
+    );
     line(stderr, "  ramshared supervise [--once]");
     line(stderr, "  ramshared recover --status|--resume|--nbd-peer");
     line(stderr, "  ramshared check [--json]");

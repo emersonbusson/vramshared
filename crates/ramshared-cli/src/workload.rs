@@ -245,6 +245,11 @@ pub fn parse_run_args(args: &[String]) -> Result<WorkloadRequest, String> {
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let request = parse_run_args(args)?;
+    if !rustix::process::geteuid().is_root() {
+        return Err(
+            "workload admission requires root privileges to access the reservation ledger".into(),
+        );
+    }
     let meminfo = fs::read_to_string("/proc/meminfo").map_err(|error| error.to_string())?;
     run_with(
         request,
