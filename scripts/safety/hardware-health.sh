@@ -10,7 +10,7 @@
 #
 # Sources, all bounded:
 #   - the daemon crash log (durable, primary);
-#   - the last eight boots, filtered to the last seven days, for
+#   - up to 32 boots that overlap the last seven days, for
 #     `MCE: Killing` records;
 #   - the `.armed` lifecycle marker (survives a reboot on the Windows drive).
 #
@@ -23,7 +23,7 @@
 set -uo pipefail
 
 journal_window_days=7
-journal_boot_limit=8
+journal_boot_limit=32
 journal_list_limit=$((journal_boot_limit + 1))
 journal_list_max_bytes=8192
 

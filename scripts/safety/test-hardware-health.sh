@@ -62,7 +62,7 @@ while (($#)); do
         if [[ $boot_id == "$current_id" ]]; then
           index=0
         else
-          for candidate in -1 -2 -3 -4 -5 -6 -7 -8; do
+          for ((candidate=-1; candidate>=-32; candidate--)); do
             printf -v candidate_id '%032x' "$((-candidate))"
             if [[ $boot_id == "$candidate_id" ]]; then
               index=$candidate
@@ -91,7 +91,7 @@ import sys
 journal_dir, boot_id_file, now_ms = sys.argv[1:]
 current_id = pathlib.Path(boot_id_file).read_text(encoding='ascii').strip().replace('-', '').lower()
 records = []
-for index in range(-8, 1):
+for index in range(-32, 1):
     if not (pathlib.Path(journal_dir) / f'boot{index}.log').is_file():
         continue
     boot_id = current_id if index == 0 else f'{-index:032x}'
@@ -285,10 +285,20 @@ for index in -8 -7 -6 -5 -4 -3 -2 -1 0; do
   printf '2026-10-24T01:58:00-03:00 emedev kernel: benign boot line\n' \
     >"$fx/journal/boot${index}.log"
 done
+expect_verdict nine_recent_clean_boots_pass "$fx" "$NOW" 0 clean
+printf '%s emedev kernel: MCE: Killing on the oldest retained boot\n' "$MCE_OLD" \
+  >"$fx/journal/boot-8.log"
+expect_verdict mce_on_ninth_recent_boot_refuses "$fx" "$NOW" 78 refused_mce
+
+fx=$(new_fixture)
+for ((index=-32; index<=0; index++)); do
+  printf '2026-10-24T01:58:00-03:00 emedev kernel: benign boot line\n' \
+    >"$fx/journal/boot${index}.log"
+done
 expect_verdict too_many_recent_boots_refuses_incomplete_window "$fx" "$NOW" 78 refused_unclean
 
 fx=$(new_fixture)
-for index in -8 -7 -6 -5 -4 -3 -2 -1 0; do
+for ((index=-32; index<=0; index++)); do
   printf '2026-10-24T01:58:00-03:00 emedev kernel: benign boot line\n' \
     >"$fx/journal/boot${index}.log"
 done
@@ -304,8 +314,8 @@ boot_id_file, now_ms = sys.argv[1:]
 current_id = pathlib.Path(boot_id_file).read_text(encoding='ascii').strip().replace('-', '').lower()
 timestamp = int(now_ms) * 1000
 records = []
-for index in range(-8, 1):
-    last_entry = timestamp - 8 * 24 * 60 * 60 * 1000 * 1000 if index == -8 else timestamp
+for index in range(-32, 1):
+    last_entry = timestamp - 8 * 24 * 60 * 60 * 1000 * 1000 if index == -32 else timestamp
     records.append({
         'index': index,
         'boot_id': current_id if index == 0 else f'{-index:032x}',
@@ -318,7 +328,7 @@ PY
 fi
 exec "$RAMSHARED_FAKE_JOURNALCTL_BASE" "$@"
 SH
-expect_verdict ninth_old_boot_does_not_expand_recent_window "$fx" "$NOW" 0 clean
+expect_verdict out_of_window_boot_does_not_expand_recent_window "$fx" "$NOW" 0 clean
 
 # --- empty_journal_notice_is_not_a_hardware_event --------------------------
 fx=$(new_fixture)

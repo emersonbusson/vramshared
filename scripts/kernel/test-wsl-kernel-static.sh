@@ -531,5 +531,47 @@ if [[ "$non_apply_source" == *"INSTALL_IMMUTABLE_KERNEL_LAUNCHER_BUNDLE"* ||
 	exit 1
 fi
 
+python3 - "$ROOT/boot-kernel-safe.ps1" "$fixture" <<'PY'
+import os
+import pathlib
+import subprocess
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+fixture = pathlib.Path(sys.argv[2])
+start = source.index("\nwait_boot=")
+end = source.index("\njournal_unclean=", start)
+collector = source[start:end] + '\nprintf "%s\\n" "$wait_boot"'
+
+journalctl = fixture / "journalctl"
+journalctl.write_text(
+    '#!/bin/sh\n'
+    'test "$*" = "-b -k --no-pager -o cat" || exit 2\n'
+    'printf "%s" "$FIXTURE_BOOT_JOURNAL"\n'
+    'exit "$FIXTURE_JOURNAL_EXIT"\n'
+)
+journalctl.chmod(0o700)
+
+for label, journal, status, expected in (
+    ("clean", "Linux version fixture\nWaitForBootProcess: ready\n", "0", "0"),
+    ("numbered", "WSL: WaitForBootProcess:3711: /sbin/init failed to start within 10000ms\n", "0", "1"),
+    ("legacy", "WSL: WaitForBootProcess: /sbin/init failed to start within 10000ms\n", "0", "1"),
+    ("unreadable", "", "1", "unavailable"),
+    ("empty", "", "0", "unavailable"),
+):
+    result = subprocess.check_output(
+        ["sh", "-eu", "-c", collector],
+        text=True,
+        env=dict(
+            os.environ,
+            PATH=f"{fixture}:{os.environ['PATH']}",
+            FIXTURE_BOOT_JOURNAL=journal,
+            FIXTURE_JOURNAL_EXIT=status,
+            dmesg_text="Linux version fixture",
+        ),
+    ).strip()
+    assert result == expected, f"{label}: expected {expected!r}, got {result!r}"
+PY
+
 echo 'SPEC_TEST=apply_is_the_only_gate_forwarder PASS'
 echo 'test-wsl-kernel-static: PASS'
