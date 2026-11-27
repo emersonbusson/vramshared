@@ -263,3 +263,41 @@ fn owned_stop_records_the_control_process_before_accepting_quiescence() {
 }
 
 mod receipt_refusals;
+
+#[test]
+fn upgrade_display_uses_only_the_bound_live_stop_receipt() {
+    let fixture = Fixture::new();
+    let installer = InstallerLock::acquire(&fixture.paths).unwrap();
+    let mut inputs = signed_pair();
+    inputs.previous_release = "v1.0.3-rc.13".into();
+    inputs.candidate_release = "v1.0.3-rc.14".into();
+    let stop = unit("deactivating", "stop", "success", "14", 720, 9000)
+        .process
+        .unwrap();
+    let mut receipt = Receipt {
+        schema_version: 1,
+        boot_id: current_boot_id().unwrap(),
+        inputs,
+        prior_runtime: occupied(),
+        effective_enrollment: None,
+        phase: Phase::Submitted {
+            job: NonZeroU32::new(14).unwrap(),
+            process: Some(stop),
+        },
+    };
+    installer.publish(&receipt).unwrap();
+    let actual = read_upgrade_drain(&fixture.paths, 720, 9000).unwrap();
+    assert_eq!(actual.previous, "v1.0.3-rc.13");
+    assert_eq!(actual.candidate, "v1.0.3-rc.14");
+    assert_eq!(read_upgrade_drain(&fixture.paths, 721, 9000), None);
+    assert_eq!(read_upgrade_drain(&fixture.paths, 720, 9001), None);
+
+    receipt.inputs.candidate_release = "version\u{1b}[2J".into();
+    installer.publish(&receipt).unwrap();
+    assert_eq!(read_upgrade_drain(&fixture.paths, 720, 9000), None);
+
+    receipt.inputs.candidate_release = "v1.0.3-rc.14".into();
+    receipt.phase = Phase::Drained;
+    installer.publish(&receipt).unwrap();
+    assert_eq!(read_upgrade_drain(&fixture.paths, 720, 9000), None);
+}

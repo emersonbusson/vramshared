@@ -65,11 +65,19 @@ fn build_cli_operation_banner(
     language: Language,
     now_unix_ms: u64,
 ) -> OperationBannerContent {
-    let title = format!(
-        " {} · {} ",
-        dashboard_phrase(language, DashboardPhrase::OperationBannerTitle),
-        operation_kind_label(language, progress.kind)
-    );
+    let title = if let Some(upgrade) = progress.upgrade.as_ref() {
+        let label = match language {
+            Language::En => "UPDATE",
+            Language::PtBr => "ATUALIZAÇÃO",
+        };
+        format!(" {label} · {} → {} ", upgrade.previous, upgrade.candidate)
+    } else {
+        format!(
+            " {} · {} ",
+            dashboard_phrase(language, DashboardPhrase::OperationBannerTitle),
+            operation_kind_label(language, progress.kind)
+        )
+    };
     let pct = progress.percent();
     let bar = make_bar(u64::from(pct), BANNER_BAR_WIDTH);
     let step_label = dashboard_phrase(language, DashboardPhrase::StepLabel);
@@ -282,6 +290,7 @@ mod tests {
             ttl_ms: 15_000,
             owner_pid: 99,
             owner_start_ticks: 111,
+            upgrade: None,
         });
         assert!(has_active_operation(&obs));
 
@@ -310,6 +319,21 @@ mod tests {
             "{} 2/4",
             dashboard_phrase(Language::PtBr, DashboardPhrase::StepLabel)
         )));
+
+        let progress = obs.operation_progress.as_mut().expect("live progress");
+        progress.upgrade = crate::operation_progress::UpgradeDrainProgress::new(
+            "v1.0.3-rc.13".into(),
+            "v1.0.3-rc.14".into(),
+        );
+        let update_banner = build_operation_banner(&obs, Language::PtBr).expect("update banner");
+        assert!(
+            update_banner
+                .title
+                .contains("ATUALIZAÇÃO · v1.0.3-rc.13 → v1.0.3-rc.14")
+        );
+        assert!(update_banner.primary_line.contains("50%"));
+        assert!(update_banner.secondary_line.contains("320.5 MiB/s"));
+        assert_eq!(update_banner.border_color, Color::Cyan);
 
         // Clear CLI operation, test daemon VRAM cache demote drain banner.
         obs.operation_progress = None;
