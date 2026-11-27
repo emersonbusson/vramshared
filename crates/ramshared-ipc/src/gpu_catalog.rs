@@ -215,19 +215,24 @@ impl CatalogSession {
                 let age = sample
                     .age_ms
                     .checked_add(elapsed_ms)
-                    .filter(|age| *age < GPU_BUDGET_MAX_AGE_MS)
-                    .ok_or_else(|| refuse("observation expired in transit"))?;
-                let expires = timing
-                    .received
-                    .checked_add(Duration::from_millis(
-                        (GPU_BUDGET_MAX_AGE_MS - age).min(lease_remaining),
-                    ))
-                    .ok_or_else(|| refuse("observation expiry overflow"))?;
-                Some(AuthenticatedCatalog {
-                    report: sample.report,
-                    received: timing.received,
-                    expires,
-                })
+                    .ok_or_else(|| refuse("observation age overflow"))?;
+                // A valid sample may expire before receipt. Revoke the
+                // catalog while retaining the independently verified beat.
+                if age >= GPU_BUDGET_MAX_AGE_MS {
+                    None
+                } else {
+                    let expires = timing
+                        .received
+                        .checked_add(Duration::from_millis(
+                            (GPU_BUDGET_MAX_AGE_MS - age).min(lease_remaining),
+                        ))
+                        .ok_or_else(|| refuse("observation expiry overflow"))?;
+                    Some(AuthenticatedCatalog {
+                        report: sample.report,
+                        received: timing.received,
+                        expires,
+                    })
+                }
             }
         };
         let host_memory = ack.host_memory.as_ref().and_then(|sample| {

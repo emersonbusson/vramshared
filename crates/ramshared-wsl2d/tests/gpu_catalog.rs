@@ -155,3 +155,87 @@ fn invalid_catalog_never_renews_cache_authority_or_revokes_origin() {
         assert!(server.join().unwrap().is_err());
     }
 }
+
+#[test]
+fn catalog_expiry_in_transit_revokes_worker_metadata_without_reconnect() {
+    use ramshared_ipc::HostMemoryTelemetry;
+    use ramshared_vram::GPU_BUDGET_MAX_AGE_MS;
+    use ramshared_wsl2d::host_catalog::{
+        HostGpuCatalogProvider, SharedHostCatalog, WorkerHostCatalog,
+    };
+    use std::time::Instant;
+
+    let (stream, mut host) = UnixStream::pair().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut round = 0;
+        serve_connection(
+            &mut host,
+            SECRET,
+            LeasePolicy::new(5, 15).unwrap(),
+            || 1000,
+            || {
+                round += 1;
+                let mut gpu = sample();
+                if round == 2 {
+                    // The full exchange is strictly positive and rounded up,
+                    // so this valid sender sample will expire on receipt.
+                    gpu.age_ms = GPU_BUDGET_MAX_AGE_MS - 1;
+                }
+                HostSamples {
+                    memory: Some(HostMemoryTelemetry {
+                        sampled_at_unix_ms: 1000,
+                        total_bytes: 8192,
+                        available_bytes: 4096 + round,
+                        commit_total_bytes: 2048,
+                        commit_limit_bytes: 16384,
+                        page_size_bytes: 4096,
+                        vmmem_wsl_working_set_bytes: None,
+                    }),
+                    gpu: Some(gpu),
+                    ..HostSamples::default()
+                }
+            },
+        )
+    });
+
+    let catalog = SharedHostCatalog::new();
+    let mut guest = plane(stream);
+    guest.attach_host_catalog(catalog.clone());
+    let worker = WorkerHostCatalog::from_stream(catalog.subscribe().unwrap()).unwrap();
+    guest.perform_handshake(1000).unwrap();
+    guest.heartbeat(1001).unwrap();
+    let first_generation = catalog.live_generation().unwrap();
+    assert!(worker.current_report().is_some());
+
+    guest
+        .heartbeat(1002)
+        .expect("heartbeat outlives an optional GPU observation");
+    assert!(guest.gpu_catalog().is_none());
+    assert!(catalog.live_generation().is_none());
+    assert!(worker.current_report().is_none());
+    assert_eq!(
+        guest
+            .liveness_handle()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1002
+    );
+    assert_eq!(
+        guest
+            .host_memory_handle()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sample(Instant::now(), 1002)
+            .unwrap()
+            .available_bytes,
+        4098
+    );
+    assert!(guest.admit_origin_io().is_ok());
+
+    guest.heartbeat(1003).unwrap();
+    assert!(catalog.live_generation().unwrap() > first_generation);
+    assert!(worker.current_report().is_some());
+    drop(guest);
+    assert!(server.join().unwrap().is_err());
+}
