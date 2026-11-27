@@ -363,10 +363,11 @@ pub(super) fn bind_zram_backing_device(
     // either `/dev/zram0` or `zram0`; the kernel path takes the latter.
     runner
         .native_zram_bind_backing(zdev, backing_dev)
-        .map_err(|error| {
-            CascadeError::Precondition(format!(
+        .map_err(|error| match error {
+            error @ CascadeError::UnsafeContainment(_) => error,
+            error => CascadeError::Precondition(format!(
                 "cannot bind backing device {backing_dev} to {zdev} before sizing it: {error}"
-            ))
+            )),
         })?;
     Ok(())
 }
@@ -405,11 +406,12 @@ fn set_zram_size(
 ) -> Result<(), CascadeError> {
     runner
         .native_zram_set_size(zdev, backing_dev, mb)
-        .map_err(|error| {
-            CascadeError::Precondition(format!(
+        .map_err(|error| match error {
+            error @ CascadeError::UnsafeContainment(_) => error,
+            error => CascadeError::Precondition(format!(
                 "cannot set the zram tier size on {zdev}: {error}; a bound backing device \
                  must be at least as large as the tier"
-            ))
+            )),
         })?;
     Ok(())
 }
@@ -452,6 +454,9 @@ fn abandon_allocated_zram_device<R: CommandRunner>(
     before: &[BoundDeviceIdentity],
     primary: CascadeError,
 ) -> CascadeError {
+    if matches!(primary, CascadeError::UnsafeContainment(_)) {
+        return primary;
+    }
     if let Err(error) = runner.native_zram_reset(Path::new(zdev)) {
         return CascadeError::UnsafeContainment(format!(
             "zram setup refused after allocating {zdev} and its reset is unproven ({error}); \
@@ -478,6 +483,17 @@ pub(super) fn setup_zram_with<R: CommandRunner>(
     prio: i32,
     backing_dev: Option<&str>,
 ) -> Result<String, CascadeError> {
+    setup_zram_with_custody(runner, paths, mb, prio, backing_dev, None)
+}
+
+pub(super) fn setup_zram_with_custody<R: CommandRunner>(
+    runner: &R,
+    paths: &RuntimePaths,
+    mb: u64,
+    prio: i32,
+    backing_dev: Option<&str>,
+    writeback_binding: Option<LifecycleBinding>,
+) -> Result<String, CascadeError> {
     if mb == 0 {
         eprintln!("[up] zram skipped (--zram 0)");
         return Ok(String::new());
@@ -490,6 +506,11 @@ pub(super) fn setup_zram_with<R: CommandRunner>(
     // refused rather than doubled — reconfiguration is `ramshared down`
     // followed by `up`, never a second allocation.
     if let Some((existing, current)) = live_recorded_zram_tier(paths) {
+        if writeback_binding.is_some() {
+            return Err(CascadeError::UnsafeContainment(format!(
+                "existing zram {existing} appeared during writeback startup; backend preserved"
+            )));
+        }
         let requested = backing_dev.unwrap_or("none");
         match current {
             Some(bound) if bound == requested => {
@@ -567,6 +588,9 @@ pub(super) fn setup_zram_with<R: CommandRunner>(
                             ZramAllocationFailure::AlgorithmUnsupported => {
                                 let primary =
                                     abandon_allocated_zram_device(runner, &zdev, &before, primary);
+                                if matches!(primary, CascadeError::UnsafeContainment(_)) {
+                                    return Err(primary);
+                                }
                                 eprintln!(
                                     "[up] kernel does not offer zram compressor {algo}; \
                                      trying the next one: {primary}"
@@ -592,6 +616,7 @@ pub(super) fn setup_zram_with<R: CommandRunner>(
                     }
                     break (zdev, before);
                 }
+                Err(error @ CascadeError::UnsafeContainment(_)) => return Err(error),
                 Err(error) => {
                     let primary = error.to_string();
                     match classify_zram_allocation_failure(&error) {
@@ -652,52 +677,45 @@ pub(super) fn setup_zram_with<R: CommandRunner>(
                 "zram identity could not be recorded before formatting ({error}); {zdev} was preserved without mkswap, swapon, or reset"
             )));
         }
-        // `zramctl --algorithm` is a request; only the kernel's `comp_algorithm`
-        // is the answer. The device is initialized (and the compressor locked)
-        // the moment the allocator set its size, so a re-read here is a
-        // postcondition check — fail closed before mkswap or swapon rather
-        // than activate a device on a compressor nobody asked for.
-        let zram_name = identity.path.rsplit('/').next().unwrap_or_default();
-        let verified_algo = match verify_zram_active_algorithm(&paths.sys_block, zram_name, algo) {
-            Ok(name) => name,
+        let paired = writeback_binding.is_some();
+        if let Some(binding) = writeback_binding {
+            super::writeback_startup::seal_zram(paths, binding, &identity)?;
+        }
+        // A failed activation can still have changed the kernel swap table.
+        let mut may_be_active = false;
+        let armed = (|| {
+            let name = identity.path.rsplit('/').next().unwrap_or_default();
+            let verified = verify_zram_active_algorithm(&paths.sys_block, name, algo)?;
+            let pinned = bind_device_for_effect(&identity)?;
+            pinned.revalidate_named_identity()?;
+            may_be_active = true;
+            runner.native_mkswap_and_swapon(
+                Path::new(pinned.path()),
+                mb.saturating_mul(1024 * 1024),
+                &priority,
+            )?;
+            pinned.revalidate_named_identity().map_err(|error| {
+                CascadeError::UnsafeContainment(format!(
+                    "zram identity changed after swapon ({error}); ownership evidence preserved"
+                ))
+            })?;
+            Ok(verified)
+        })();
+        let verified_algo = match armed {
+            Ok(verified) => verified,
+            Err(error) if paired || matches!(error, CascadeError::UnsafeContainment(_)) => {
+                return Err(error);
+            }
             Err(error) => {
                 return Err(error_after_zram_rollback(
-                    runner, paths, &zdev, false, error,
+                    runner,
+                    paths,
+                    &zdev,
+                    may_be_active,
+                    error,
                 ));
             }
         };
-        let pinned = match bind_device_for_effect(&identity) {
-            Ok(pinned) => pinned,
-            Err(error) => {
-                return Err(error_after_zram_rollback(
-                    runner, paths, &zdev, false, error,
-                ));
-            }
-        };
-        if let Err(error) = pinned.revalidate_named_identity() {
-            return Err(error_after_zram_rollback(
-                runner, paths, &zdev, false, error,
-            ));
-        }
-        if let Err(error) = runner.native_mkswap_and_swapon(
-            Path::new(pinned.path()),
-            mb.saturating_mul(1024 * 1024),
-            &priority,
-        ) {
-            return Err(error_after_zram_rollback(
-                runner, paths, &zdev, false, error,
-            ));
-        }
-        if let Err(error) = pinned.revalidate_named_identity() {
-            return Err(error_after_zram_rollback(
-                runner, paths, &zdev, false, error,
-            ));
-        }
-        if let Err(error) = pinned.revalidate_named_identity() {
-            return Err(CascadeError::UnsafeContainment(format!(
-                "zram identity changed after swapon ({error}); exact device and ownership evidence were preserved"
-            )));
-        }
         eprintln!("[up] zram {zdev} algo={verified_algo} prio={prio}");
         return Ok(zdev);
     }

@@ -317,7 +317,9 @@ pub(super) fn setup_new_cascade<R: CommandRunner>(
         ) {
             Ok(device) => device,
             Err(error) => {
-                disarm_forensics_at(paths);
+                if !matches!(error, CascadeError::UnsafeContainment(_)) {
+                    disarm_forensics_at(paths);
+                }
                 return Err(error);
             }
         };
@@ -362,7 +364,7 @@ pub(super) fn setup_new_cascade<R: CommandRunner>(
             total_bytes: 0,
             throughput_mib_per_s: None,
         });
-        if let Err(error) = connect_nbd_with(
+        connect_nbd_with(
             runner,
             &mut daemon,
             paths,
@@ -385,13 +387,10 @@ pub(super) fn setup_new_cascade<R: CommandRunner>(
                 host_manifest_sha256: &args.host_manifest_sha256,
                 configuration_sha256: &args.configuration_sha256,
             },
-        ) {
-            stop_daemon_bounded(&mut daemon);
-            return Err(error);
-        }
+        )?;
         Ok(daemon)
     })();
-    let mut daemon = match daemon {
+    let daemon = match daemon {
         Ok(daemon) => daemon,
         Err(error) => {
             if matches!(error, CascadeError::UnsafeContainment(_)) {
@@ -422,73 +421,18 @@ pub(super) fn setup_new_cascade<R: CommandRunner>(
             total_bytes: 0,
             throughput_mib_per_s: None,
         });
-        // The tier exists now, so the zram can be bound to it as its
-        // writeback target (SPEC zram-writeback-vram-tier DT-1). The
-        // kernel takes the backing device only before the zram is sized
-        // (DT-2), which is the order `setup_zram_with` already uses.
-        zram_device = match setup_zram_with(
+        zram_device = writeback_startup::arm_zram(
             runner,
             paths,
             args.zram_mb,
             prios.zram,
-            Some(args.swap_dev.as_str()),
-        ) {
-            Ok(device) => device,
-            Err(error) => {
-                // The tier and the daemon are live: tear them down before
-                // the refusal, so a failed arm leaves no half-cascade.
-                let _ = runner.run("nbd-client", &["-d", args.swap_dev.as_str()]);
-                let _ = runner.native_swapoff(Path::new(args.swap_dev.as_str()), None);
-                // The daemon was spawned before the zram bind. Stopping it here
-                // is what keeps a refused arm from leaving an orphan with no
-                // pid file or export socket.
-                stop_daemon_bounded(&mut daemon);
-                disarm_forensics_at(paths);
-                remove_runtime_file(&paths.socket);
-                remove_runtime_file(&paths.pid_file);
-                return Err(error);
-            }
-        };
+            &args.swap_dev,
+            daemon.id(),
+        )?;
         eprintln!(
-            "[up] zram tier {zram_device} writes back to the tier {} (the compressed spill lands on the tier; the overflow reaches the fallback)",
+            "[up] zram tier {zram_device} writes back to {}",
             args.swap_dev
         );
-        // The lifecycle binding was captured at the attach, before the zram
-        // existed; without the zram in it the teardown's guard finds an
-        // unbound record and refuses to mutate anything.
-        let rebind_config = NbdAttachConfig {
-            connections: args.connections,
-            swap_dev: &args.swap_dev,
-            swap_the_tier: !writeback_tier,
-            vram_prio: prios.vram,
-            disk_baseline_kib: args.disk_baseline_kib,
-            logical_capacity_kib: args.vram_mb.saturating_mul(1024),
-            zram_device: &zram_device,
-            origin_partuuid: partuuid,
-            origin_ptuuid: &args.origin_ptuuid,
-            origin_partition_dev_t: &args.origin_partition_dev_t,
-            origin_parent_dev_t: &args.origin_parent_dev_t,
-            expected_swap_uuid: &args.expected_swap_uuid,
-            host_manifest_sha256: &args.host_manifest_sha256,
-            configuration_sha256: &args.configuration_sha256,
-        };
-        if let Err(error) = rebind_zram_into_lifecycle_binding(
-            paths,
-            daemon.id(),
-            &args.swap_dev,
-            &rebind_config,
-            &zram_device,
-        ) {
-            // The tier and the daemon are live: tear them down before the
-            // refusal, so a failed arm leaves no half-cascade.
-            let _ = runner.run("nbd-client", &["-d", args.swap_dev.as_str()]);
-            let _ = runner.native_swapoff(Path::new(zram_device.as_str()), None);
-            disarm_forensics_at(paths);
-            remove_runtime_file(&paths.socket);
-            remove_runtime_file(&paths.pid_file);
-            remove_runtime_file(&paths.lifecycle_binding_file);
-            return Err(error);
-        }
     }
     eprintln!(
         "[up] RamShared logical device {} (prio {}, {} MiB, {} connection(s))",

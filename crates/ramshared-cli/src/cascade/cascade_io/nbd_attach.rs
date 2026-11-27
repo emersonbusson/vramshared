@@ -61,10 +61,7 @@ pub(super) fn rollback_nbd_attach_with<R: CommandRunner, C: SpawnedChildContainm
             ))
         })?;
         authorize_bound_environment(&binding, paths, &swaps, &detect_live_managed_devices()?)?;
-        prove_exact_swap_absent(device)?;
-        let pinned = bind_device_for_effect(device)?;
-        pinned.revalidate_named_identity()?;
-        if let Err(error) = runner.run("nbd-client", &["-d", swap_dev]) {
+        if let Err(error) = bind_device_for_effect(device)?.disconnect_nbd(runner) {
             return Err(CascadeError::UnsafeContainment(format!(
                 "NBD detach for {swap_dev} is unproven after startup failure ({error}); exact daemon, runtime records, and forensics retained"
             )));
@@ -97,17 +94,6 @@ pub(super) fn rollback_nbd_attach_with<R: CommandRunner, C: SpawnedChildContainm
     Ok(())
 }
 
-fn rollback_nbd_attach<R: CommandRunner>(
-    runner: &R,
-    attached: bool,
-    record_written: bool,
-    swap_dev: &str,
-    daemon: &mut std::process::Child,
-    paths: &RuntimePaths,
-) -> Result<(), CascadeError> {
-    rollback_nbd_attach_with(runner, attached, record_written, swap_dev, daemon, paths)
-}
-
 fn error_after_nbd_rollback<R: CommandRunner>(
     runner: &R,
     attached: bool,
@@ -117,9 +103,11 @@ fn error_after_nbd_rollback<R: CommandRunner>(
     paths: &RuntimePaths,
     primary: CascadeError,
 ) -> CascadeError {
-    match rollback_nbd_attach(runner, attached, record_written, swap_dev, daemon, paths) {
+    match rollback_nbd_attach_with(runner, attached, record_written, swap_dev, daemon, paths) {
         Ok(()) => primary,
-        Err(containment) => containment,
+        Err(error) => CascadeError::UnsafeContainment(format!(
+            "NBD attach failed ({primary}); rollback is unproven ({error})"
+        )),
     }
 }
 
@@ -142,22 +130,6 @@ pub(super) struct NbdAttachConfig<'a> {
     pub(super) expected_swap_uuid: &'a str,
     pub(super) host_manifest_sha256: &'a str,
     pub(super) configuration_sha256: &'a str,
-}
-
-/// Re-capture and re-write the lifecycle binding with a zram that was
-/// armed after the attach (the writeback topology: the tier device must
-/// exist before zram can take it as its backing device, so the zram is
-/// bound after the attach). Without this the teardown's guard finds an
-/// unbound zram record and refuses to mutate anything.
-pub(super) fn rebind_zram_into_lifecycle_binding(
-    paths: &RuntimePaths,
-    daemon_pid: u32,
-    swap_dev: &str,
-    config: &NbdAttachConfig<'_>,
-    zram_device: &str,
-) -> Result<(), CascadeError> {
-    let binding = capture_lifecycle_binding(paths, daemon_pid, swap_dev, config, zram_device)?;
-    write_lifecycle_binding(paths, &binding)
 }
 
 fn capture_lifecycle_binding(
@@ -489,6 +461,7 @@ pub(super) fn connect_nbd_with<R: CommandRunner>(
             logical_capacity_kib, origin_partuuid, disk_baseline_kib
         ),
     ) {
+        drop(pinned);
         return Err(error_after_nbd_rollback(
             runner,
             true,
@@ -500,6 +473,7 @@ pub(super) fn connect_nbd_with<R: CommandRunner>(
         ));
     }
     if let Err(error) = write_nbd_path_record(&paths.swap_dev_file, swap_dev) {
+        drop(pinned);
         return Err(error_after_nbd_rollback(
             runner, true, true, swap_dev, daemon, paths, error,
         ));

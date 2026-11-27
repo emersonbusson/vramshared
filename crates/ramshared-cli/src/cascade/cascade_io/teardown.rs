@@ -272,18 +272,24 @@ impl<R: CommandRunner> NbdLifecycleExecutor for RuntimeNbdLifecycleExecutor<'_, 
         let swaps = read_swaps()?;
         let live = detect_live_managed_devices()?;
         authorize_bound_environment_for(self.binding, self.paths, &swaps, &live, self.peer)?;
-        prove_exact_swap_absent(device)?;
+        if self.binding.devices.iter().any(|candidate| {
+            candidate.kind == ManagedDeviceKind::Zram
+                && (live.contains(candidate)
+                    || swaps
+                        .iter()
+                        .any(|entry| entry.canonical_path() == candidate.path))
+        }) {
+            return Err(CascadeError::UnsafeContainment(
+                "zram still has swap or live device evidence; NBD backend preserved".into(),
+            ));
+        }
         if self.peer == PeerState::Released && !live.contains(device) {
+            prove_exact_swap_absent(device)?;
             // Enumeration alone is not proof: require the exact kernel/node
             // identity and owner, size, holder and swap absence again.
             return released_peer::prove_detached_bound_nbd(device);
         }
-        let pinned = bind_device_for_effect(device)?;
-        pinned.revalidate_named_identity()?;
-        // nbd-client likewise derives NBD sysfs state from the canonical name;
-        // revalidate the exact descriptor first, then close before invoking disconnect.
-        drop(pinned);
-        self.runner.run("nbd-client", &["-d", &device.path])?;
+        bind_device_for_effect(device)?.disconnect_nbd(self.runner)?;
         // The command acknowledges the request; the kernel clears the owner
         // `pid` asynchronously. Prove the completion over a bounded settle
         // window instead of losing a successful teardown to that gap.

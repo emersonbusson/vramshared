@@ -25,7 +25,7 @@ pub enum ZramError {
     Io(std::io::Error),
     SymlinkRefused,
     NotSysfs,
-    RollbackFailed,
+    PreparationUnproven(String),
     InvalidInput(&'static str),
 }
 
@@ -35,7 +35,9 @@ impl std::fmt::Display for ZramError {
             Self::Io(error) => write!(formatter, "zram sysfs io: {error}"),
             Self::SymlinkRefused => formatter.write_str("zram sysfs symlink refused"),
             Self::NotSysfs => formatter.write_str("zram path is not sysfs"),
-            Self::RollbackFailed => formatter.write_str("zram rollback failed"),
+            Self::PreparationUnproven(reason) => {
+                write!(formatter, "zram preparation unproven: {reason}")
+            }
             Self::InvalidInput(reason) => write!(formatter, "zram invalid input: {reason}"),
         }
     }
@@ -170,18 +172,64 @@ impl ZramSysfs {
         self.write_attr("disksize", disksize_bytes.to_string().as_bytes())
     }
 
-    /// Configure writeback in the order the kernel expects. A disksize failure
-    /// rolls the unclaimed backing device back with `reset`.
-    pub fn configure(&self, backing_dev: &Path, disksize_bytes: u64) -> Result<(), ZramError> {
-        self.write_attr("reset", b"1")?;
-        self.set_backing_dev(backing_dev)?;
-        if let Err(error) = self.set_disksize(disksize_bytes) {
-            if self.write_attr("reset", b"1").is_err() {
-                return Err(ZramError::RollbackFailed);
+    /// Prove an uninitialized device has no pre-existing backing.
+    pub fn verify_unconfigured(&self) -> Result<(), ZramError> {
+        let size = self.read_attr("disksize").map_err(|error| {
+            ZramError::PreparationUnproven(format!("read current size ({error})"))
+        })?;
+        if size != "0" {
+            return Err(ZramError::PreparationUnproven(
+                "the selected device already has a size".into(),
+            ));
+        }
+        self.verify_backing_dev(Path::new(""))
+    }
+
+    fn verify_backing_dev(&self, backing_dev: &Path) -> Result<(), ZramError> {
+        let standalone = backing_dev.as_os_str().is_empty();
+        let observed = match self.read_attr("backing_dev") {
+            Ok(path) => path,
+            Err(ZramError::Io(error))
+                if standalone && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(());
             }
-            return Err(error);
+            Err(error) => {
+                return Err(ZramError::PreparationUnproven(format!(
+                    "read current backing device ({error})"
+                )));
+            }
+        };
+        let path = Path::new(&observed);
+        let matches = if standalone {
+            observed == "none"
+        } else {
+            path.is_absolute()
+                && backing_dev.is_absolute()
+                && (path == backing_dev
+                    || std::fs::canonicalize(path)
+                        .ok()
+                        .zip(std::fs::canonicalize(backing_dev).ok())
+                        .is_some_and(|(actual, expected)| actual == expected))
+        };
+        if !matches {
+            return Err(ZramError::PreparationUnproven(format!(
+                "observed backing {observed:?} differs from expected {}",
+                if standalone {
+                    "none".into()
+                } else {
+                    backing_dev.display().to_string()
+                }
+            )));
         }
         Ok(())
+    }
+
+    /// Initialize the prepared device without repeating the earlier backing
+    /// and compressor writes. Its lifecycle owner handles any required reset.
+    pub fn configure(&self, backing_dev: &Path, disksize_bytes: u64) -> Result<(), ZramError> {
+        self.verify_backing_dev(backing_dev)?;
+        self.set_disksize(disksize_bytes)
     }
 
     fn write_attr(&self, name: &str, value: &[u8]) -> Result<(), ZramError> {
@@ -224,33 +272,105 @@ mod tests {
     }
 
     #[test]
-    fn zram_sysfs_rejects_symlink_and_rolls_back_on_disksize_error() {
+    fn zram_initialization_preserves_the_prepared_backing_and_reset() {
         let root = prepare();
+        let dev = root.join("zram0");
         let zram = ZramSysfs::open_root(&root, 0).unwrap();
+        std::fs::write(dev.join("backing_dev"), b"/dev/nbd0\n").unwrap();
+        std::fs::write(dev.join("comp_algorithm"), b"[lzo-rle]").unwrap();
         zram.configure(Path::new("/dev/nbd0"), 1 << 20).unwrap();
-        assert_eq!(std::fs::read(root.join("zram0/reset")).unwrap(), b"1");
+        assert_eq!(std::fs::read(dev.join("disksize")).unwrap(), b"1048576");
         assert_eq!(
-            std::fs::read(root.join("zram0/backing_dev")).unwrap(),
-            b"/dev/nbd0"
+            std::fs::read(dev.join("backing_dev")).unwrap(),
+            b"/dev/nbd0\n"
         );
         assert_eq!(
-            std::fs::read_to_string(root.join("zram0/disksize")).unwrap(),
-            "1048576"
+            std::fs::read(dev.join("comp_algorithm")).unwrap(),
+            b"[lzo-rle]"
         );
-        std::fs::write(root.join("zram0/reset"), b"").unwrap();
-        std::fs::create_dir_all(root.join("zram0/disksize-dir")).unwrap();
-        let broken = root.join("zram0/disksize");
-        std::fs::remove_file(&broken).unwrap();
-        std::fs::create_dir(&broken).unwrap();
-        assert!(zram.configure(Path::new("/dev/nbd0"), 1 << 20).is_err());
-        assert_eq!(std::fs::read(root.join("zram0/reset")).unwrap(), b"1");
+        assert!(std::fs::read(dev.join("reset")).unwrap().is_empty());
 
-        symlink(root.join("zram0"), root.join("zram1")).unwrap();
+        let size = dev.join("disksize");
+        std::fs::remove_file(&size).unwrap();
+        std::fs::create_dir(&size).unwrap();
+        assert!(zram.configure(Path::new("/dev/nbd0"), 1 << 20).is_err());
+        assert_eq!(
+            std::fs::read(dev.join("backing_dev")).unwrap(),
+            b"/dev/nbd0\n"
+        );
+        assert!(std::fs::read(dev.join("reset")).unwrap().is_empty());
+
+        symlink(&dev, root.join("zram1")).unwrap();
         assert!(matches!(
             ZramSysfs::open_root(&root, 1),
             Err(ZramError::SymlinkRefused)
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zram_standalone_initialization_accepts_no_writeback_attribute() {
+        let root = prepare();
+        let dev = root.join("zram0");
+        let zram = ZramSysfs::open_root(&root, 0).unwrap();
+        std::fs::write(dev.join("backing_dev"), b"none\n").unwrap();
+        zram.configure(Path::new(""), 1 << 20).unwrap();
+        std::fs::remove_file(dev.join("backing_dev")).unwrap();
+        zram.configure(Path::new(""), 1 << 21).unwrap();
+        assert_eq!(std::fs::read(dev.join("disksize")).unwrap(), b"2097152");
+        assert!(matches!(
+            zram.configure(Path::new("/dev/nbd0"), 1 << 20),
+            Err(ZramError::PreparationUnproven(_))
+        ));
+        assert_eq!(std::fs::read(dev.join("disksize")).unwrap(), b"2097152");
+        assert!(std::fs::read(dev.join("reset")).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zram_initialization_accepts_the_resolved_backing_alias() {
+        let root = prepare();
+        let actual = root.join("backing-device");
+        let alias = root.join("backing-alias");
+        std::fs::write(&actual, b"").unwrap();
+        symlink(&actual, &alias).unwrap();
+        std::fs::write(
+            root.join("zram0/backing_dev"),
+            actual.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        let zram = ZramSysfs::open_root(&root, 0).unwrap();
+        zram.configure(&alias, 4096).unwrap();
+        assert_eq!(std::fs::read(root.join("zram0/disksize")).unwrap(), b"4096");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zram_unconfigured_preflight_refuses_existing_state() {
+        let root = prepare();
+        let dev = root.join("zram0");
+        let zram = ZramSysfs::open_root(&root, 0).unwrap();
+        std::fs::write(dev.join("disksize"), b"0\n").unwrap();
+        std::fs::write(dev.join("backing_dev"), b"none\n").unwrap();
+        zram.verify_unconfigured().unwrap();
+        std::fs::write(dev.join("disksize"), b"4096\n").unwrap();
+        assert!(matches!(
+            zram.verify_unconfigured(),
+            Err(ZramError::PreparationUnproven(_))
+        ));
+        std::fs::write(dev.join("disksize"), b"0\n").unwrap();
+        std::fs::write(dev.join("backing_dev"), b"/dev/nbd9\n").unwrap();
+        assert!(matches!(
+            zram.verify_unconfigured(),
+            Err(ZramError::PreparationUnproven(_))
+        ));
+        assert!(matches!(
+            zram.configure(Path::new("/dev/nbd0"), 4096),
+            Err(ZramError::PreparationUnproven(_))
+        ));
+        assert_eq!(std::fs::read(dev.join("disksize")).unwrap(), b"0\n");
+        assert!(std::fs::read(dev.join("reset")).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -293,7 +413,7 @@ mod zram_edge_tests {
         for error in [
             ZramError::SymlinkRefused,
             ZramError::NotSysfs,
-            ZramError::RollbackFailed,
+            ZramError::PreparationUnproven("changed backing".into()),
             ZramError::InvalidInput("bad"),
             ZramError::Io(std::io::Error::other("x")),
         ] {
@@ -349,7 +469,7 @@ mod zram_edge_tests {
         let zram = ZramSysfs::open_root(&root, 0).unwrap();
         assert!(matches!(
             zram.configure(Path::new("/dev/nbd0"), 1 << 20),
-            Err(ZramError::SymlinkRefused)
+            Err(ZramError::PreparationUnproven(ref reason)) if reason.contains("symlink refused")
         ));
         let _ = std::fs::remove_dir_all(&root);
     }

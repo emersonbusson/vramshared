@@ -134,7 +134,7 @@ pub(super) struct TestDir {
 }
 
 impl TestDir {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let parent = std::env::temp_dir();
         for _ in 0..1024 {
             let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);

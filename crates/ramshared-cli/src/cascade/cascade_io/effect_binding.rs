@@ -17,6 +17,8 @@
 //! next attempt rather than trusted, and a record whose origin does not
 //! match the current boot is refused before any device is touched.
 
+mod nbd_probe_lock;
+
 #[allow(unused_imports)]
 use super::*;
 
