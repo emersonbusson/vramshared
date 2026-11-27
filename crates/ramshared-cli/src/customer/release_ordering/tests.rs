@@ -279,3 +279,20 @@ fn policy_and_enrolled_posture_parse_strictly() {
         ReleaseOrder::Unknown
     );
 }
+
+#[test]
+fn published_source_is_explicit_and_has_no_configurable_network_origin() {
+    assert!(!parse_auto_update_policy(b"enabled=1\n").unwrap().published);
+    assert!(
+        !parse_auto_update_policy(b"enabled=1\nsource=local\n")
+            .unwrap()
+            .published
+    );
+    assert!(
+        parse_auto_update_policy(b"enabled=1\nsource=github\n")
+            .unwrap()
+            .published
+    );
+    assert!(parse_auto_update_policy(b"enabled=1\nsource=github\nsource=local\n").is_err());
+    assert!(parse_auto_update_policy(b"source=https://example.com\n").is_err());
+}

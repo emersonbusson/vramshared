@@ -46,6 +46,7 @@ mod package_tree;
 mod package_trust;
 pub(crate) mod plan;
 pub(crate) mod plan_document;
+mod published_update;
 mod release_ordering;
 pub(crate) mod service;
 pub(crate) mod setup_apply;
