@@ -352,8 +352,11 @@ pub(super) fn draw_cache(
     } else {
         super::pick(language, "Last recorded samples", "Últimas amostras")
     };
-    let left = vec![
-        Line::from(top_summary),
+    let mut left = vec![Line::from(top_summary)];
+    if let Some(activity) = super::super::gpu_activity::codec_activity_line(observation, language) {
+        left.push(Line::from(activity));
+    }
+    left.extend([
         Line::from(format!("{hit_label}{hit_spark}")),
         Line::from(format!("{origin_label}{fallback_spark}")),
         Line::from(samples_label),
@@ -378,7 +381,7 @@ pub(super) fn draw_cache(
             language,
             DashboardPhrase::CacheReadThroughNote,
         )),
-    ];
+    ]);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(left).wrap(Wrap { trim: true }), columns[0]);
     frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: true }), columns[2]);

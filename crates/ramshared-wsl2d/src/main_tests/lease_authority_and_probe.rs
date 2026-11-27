@@ -192,6 +192,7 @@ fn composed_cache_admission_follows_the_authority() {
         lease_seen: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         host_memory: std::sync::Arc::new(std::sync::Mutex::new(None)),
         host_catalog: ramshared_wsl2d::host_catalog::SharedHostCatalog::new(),
+        host_activity: Default::default(),
         host_storage: ramshared_wsl2d::host_storage_state::SharedHostStorage::new(),
     };
     assert!(admission.admit_cache().is_err());

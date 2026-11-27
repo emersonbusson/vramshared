@@ -204,6 +204,7 @@ pub(super) fn sample_cache_telemetry(
         schema_version: 1,
         sampled_at_unix_ms,
         codec: CodecTelemetry::new(CodecCapability::Available, CodecState::Ready, None),
+        gpu_codec_activity: None,
         logical_cached_bytes,
         physical_cache_slab_bytes: 2 * 1024 * 1024,
         codec_workspace_bytes: 0,

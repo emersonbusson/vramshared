@@ -186,6 +186,15 @@ fn snapshot(
     } = context;
     let host_memory = control_admission.and_then(ControlPlaneCacheAdmission::host_memory);
     let host_storage = control_admission.and_then(ControlPlaneCacheAdmission::host_storage);
+    let host_gpu_activity = control_admission.and_then(|admission| {
+        if admission.lease_lost() {
+            return None;
+        }
+        let sample = admission
+            .host_activity
+            .telemetry(Instant::now(), unix_time_ms()?)?;
+        (!admission.lease_lost()).then_some(sample)
+    });
     let critical_reclaim = worker.critical_reclaim;
     let physical_cached_bytes = cache.refresh_cached_bytes();
     let gpu_budget = cache.gpu_budget_telemetry();
@@ -243,6 +252,7 @@ fn snapshot(
             .ok()
             .flatten(),
         gpu_utilization,
+        host_gpu_activity,
         gpu_cache,
         host_memory,
         host_storage,
@@ -325,6 +335,9 @@ pub(super) struct OriginCacheStatus {
     /// Adapter busy time over the driver's trailing sample window (DT-8
     /// sibling of the budget). `None` is "not measured", never measured idle.
     pub(super) gpu_utilization: Option<GpuUtilizationTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) host_gpu_activity:
+        Option<ramshared_vram::host_gpu_activity::HostGpuActivityTelemetry>,
     /// Cache occupancy and codec health (DT-8). Logical cache bytes are cache
     /// occupancy in the worker's address space, never guest or host RAM.
     pub(super) gpu_cache: Option<WorkerCacheTelemetry>,
@@ -390,7 +403,15 @@ pub(super) fn write_origin_cache_status(
     path: &Path,
     status: &OriginCacheStatus,
 ) -> Result<(), String> {
-    let encoded = serde_json::to_vec(status).map_err(|error| error.to_string())?;
+    let encode = |status| serde_json::to_vec(status).map_err(|error| error.to_string());
+    let mut encoded = encode(status)?;
+    if encoded.len() > ramshared_block::cache_group::MAX_CACHE_STATUS_BYTES
+        && status.host_gpu_activity.is_some()
+    {
+        let mut without_activity = status.clone();
+        without_activity.host_gpu_activity = None;
+        encoded = encode(&without_activity)?;
+    }
     if encoded.len() > ramshared_block::cache_group::MAX_CACHE_STATUS_BYTES {
         return Err("cache-status document exceeds its encoded size limit".into());
     }

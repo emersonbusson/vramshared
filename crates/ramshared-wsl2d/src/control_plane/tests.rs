@@ -343,25 +343,27 @@ pub(super) fn accepted_version_outside_the_supported_range_is_refused() {
     assert_eq!(
         validate_accepted_version(0),
         Err(ControlPlaneError::Protocol(
-            "peer accepted version 0, outside the supported range 2..=5".into()
+            "peer accepted version 0, outside the supported range 2..=7".into()
         ))
     );
     assert_eq!(
         validate_accepted_version(1),
         Err(ControlPlaneError::Protocol(
-            "peer accepted version 1, outside the supported range 2..=5".into()
+            "peer accepted version 1, outside the supported range 2..=7".into()
         ))
     );
     assert_eq!(
-        validate_accepted_version(6),
+        validate_accepted_version(8),
         Err(ControlPlaneError::Protocol(
-            "peer accepted version 6, outside the supported range 2..=5".into()
+            "peer accepted version 8, outside the supported range 2..=7".into()
         ))
     );
     assert_eq!(validate_accepted_version(2), Ok(2));
     assert_eq!(validate_accepted_version(3), Ok(3));
     assert_eq!(validate_accepted_version(4), Ok(4));
     assert_eq!(validate_accepted_version(5), Ok(5));
+    assert_eq!(validate_accepted_version(6), Ok(6));
+    assert_eq!(validate_accepted_version(7), Ok(7));
 }
 
 #[test]

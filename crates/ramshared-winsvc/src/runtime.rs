@@ -449,6 +449,9 @@ pub enum ProductCommand {
         json: bool,
     },
     InspectGpus,
+    InspectGpuActivity {
+        supervised: bool,
+    },
     InspectVms,
     InspectStorage {
         file: String,
@@ -531,6 +534,13 @@ pub fn parse_product_cli(args: &[String]) -> Result<ProductCommand, RuntimeError
         }
         Some("inspect-gpus") if args.len() == 2 && args[1] == "--json" => {
             Ok(ProductCommand::InspectGpus)
+        }
+        Some("inspect-gpu-activity")
+            if args.len() == 2 && matches!(args[1].as_str(), "--json" | "--supervised-json") =>
+        {
+            Ok(ProductCommand::InspectGpuActivity {
+                supervised: args[1] == "--supervised-json",
+            })
         }
         Some("benchmark-volumes") => {
             let parsed = crate::storage_benchmark::parse_benchmark_volumes_args(&args[1..])

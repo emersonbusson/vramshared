@@ -22,6 +22,7 @@ fn live_supervisor_waits_for_the_first_authenticated_catalog() {
         lease_seen: Arc::new(AtomicBool::new(false)),
         host_memory: Arc::new(Mutex::new(None)),
         host_catalog: SharedHostCatalog::new(),
+        host_activity: Default::default(),
         host_storage: SharedHostStorage::new(),
         lifetime: Some(lifetime),
     };
@@ -168,6 +169,7 @@ fn admission_real_protocol_session_stops_and_preserves_origin() {
         lease_seen: Arc::new(AtomicBool::new(true)),
         host_memory: Arc::new(Mutex::new(admission.host_memory.lock().unwrap().clone())),
         host_catalog: SharedHostCatalog::new(),
+        host_activity: Default::default(),
         host_storage: SharedHostStorage::new(),
         lifetime: None,
     };
@@ -221,6 +223,7 @@ fn admission_tracks_host_gpu_catalog_and_worker_recovery_lifecycle() {
         lease_seen: Arc::new(AtomicBool::new(false)),
         host_memory: Arc::new(Mutex::new(None)),
         host_catalog: pre_lease_catalog.clone(),
+        host_activity: Default::default(),
         host_storage: SharedHostStorage::new(),
         lifetime: None,
     };
@@ -449,6 +452,7 @@ fn initial_catalog_wait_respects_zero_lost_lease_and_timely_publish() {
         lease_seen: Arc::new(AtomicBool::new(false)),
         host_memory: Arc::new(Mutex::new(None)),
         host_catalog: SharedHostCatalog::new(),
+        host_activity: Default::default(),
         host_storage: SharedHostStorage::new(),
         lifetime: None,
     };

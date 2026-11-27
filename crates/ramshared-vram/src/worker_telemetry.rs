@@ -102,6 +102,13 @@ impl CodecTelemetry {
     }
 }
 
+/// Monotonic age of the last successful GPU codec operations at the heartbeat.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GpuCodecActivity {
+    pub compression_age_ms: Option<u64>,
+    pub decompression_age_ms: Option<u64>,
+}
+
 /// Cache occupancy and codec health for one worker heartbeat (DT-8).
 ///
 /// Every field is a length or a counter. `logical_cached_bytes` is cache
@@ -112,6 +119,8 @@ pub struct WorkerCacheTelemetry {
     pub schema_version: u8,
     pub sampled_at_unix_ms: u64,
     pub codec: CodecTelemetry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_codec_activity: Option<GpuCodecActivity>,
     /// Logical address-space bytes currently covered by the cache.
     pub logical_cached_bytes: u64,
     /// Physical VRAM bytes held in compressed-store slabs.
@@ -283,6 +292,7 @@ mod tests {
             schema_version: 1,
             sampled_at_unix_ms,
             codec: CodecTelemetry::new(CodecCapability::Available, CodecState::Ready, None),
+            gpu_codec_activity: None,
             logical_cached_bytes: 4096,
             physical_cache_slab_bytes: 2 * 1024 * 1024,
             codec_workspace_bytes: 0,

@@ -59,6 +59,10 @@ impl From<SlabError> for CodecError {
 /// Single-worker-thread bound hardware codec trait for batch VRAM compression and decode.
 pub trait GpuDeviceCodec {
     fn backend_name(&self) -> &'static str;
+    /// Whether the backend executes LZ4 compression and decompression on the GPU.
+    fn uses_gpu_lz4(&self) -> bool {
+        false
+    }
     /// Bytes allocated on the device for the slab and workspace, when the
     /// implementation can account for both. Unknown is not a measured zero.
     fn device_allocation_bytes(&self) -> Option<(u64, u64)> {

@@ -783,6 +783,207 @@ fn dashboard_identifies_the_busiest_observed_gpu_engine() {
     }
 }
 
+fn wddm_observation() -> Observation {
+    let mut observation = active_cache_observation();
+    observation.epoch_ms = 50_000;
+    observation.gpu = Some(crate::monitor::model::GpuObservation {
+        adapter: ramshared_vram::GpuAdapterIdentity {
+            backend: "cuda".into(),
+            key: format!("{:032x}", 10),
+            luid: Some("00000000:00000010".into()),
+            node_mask: Some(1),
+        },
+        source: ramshared_vram::GpuBudgetSource::DriverReported,
+        sampled_at_unix_ms: 49_500,
+        total_bytes: Some(1024),
+        budget_bytes: 1024,
+        used_bytes: 0,
+        free_bytes: 1024,
+        vram_reserve_enforced_mib: 0,
+        vram_reserve_source: "sealed-manifest".into(),
+        vram_reserve_sealed_min_mib: 0,
+        vram_reserve_sealed_percent: 0,
+        vram_reserve_runtime_buffer_mib: 0,
+    });
+    observation
+        .status
+        .insert("cache_state".into(), json!("OFF"));
+    observation.status.insert(
+        "host_gpu_activity".into(),
+        json!({
+            "valid_before_unix_ms": 51_000,
+            "report": {
+                "schema_version": 1, "source": "wddm_pdh", "sampled_at_unix_ms": 49_500,
+                "interval_ms": 1_000, "adapters": [ {
+                    "luid": "00000000:00000010", "physical_index": 0,
+                    "engines": [
+                        {"index": 0, "kind": "3D", "busy_pct": 12},
+                        {"index": 2, "kind": "VideoEncode", "busy_pct": 40}
+                    ]
+                } ]
+            }
+        }),
+    );
+    observation
+}
+
+#[test]
+fn dashboard_shows_processes_and_recent_codec_operations() {
+    use crate::monitor::gpu_activity::{codec_activity_line, engine_sample};
+    let mut observation = wddm_observation();
+    let sample = observation.status.get_mut("host_gpu_activity").unwrap();
+    sample["report"]["schema_version"] = json!(2);
+    sample["report"]["adapters"][0]["engines"] = json!([
+        {"index": 0, "kind": "3D", "busy_pct": 95, "processes": [
+            {"pid": 5104, "busy_pct": 90}, {"pid": 2012, "busy_pct": 3},
+            {"pid": 3308, "busy_pct": 2}
+        ]},
+        {"index": 2, "kind": "VideoEncode", "busy_pct": 40, "processes": [
+            {"pid": 4112, "busy_pct": 40}
+        ]}
+    ]);
+    let sample = engine_sample(&observation).unwrap();
+    assert!(sample.busy_line(Language::En, 66).contains("WDDM 3D "));
+    assert_eq!(
+        sample.process_lines(Language::En),
+        [" PID 5104 · 90%", " PID 2012 · 3%", " PID 3308 · 2%"]
+    );
+
+    observation
+        .status
+        .insert("cache_state".into(), json!("ACTIVE"));
+    let cache = observation.status.get_mut("gpu_cache").unwrap();
+    cache["sampled_at_unix_ms"] = json!(49_000);
+    cache["gpu_codec_activity"] = json!({
+        "compression_age_ms": 800, "decompression_age_ms": 4200
+    });
+    assert_eq!(
+        codec_activity_line(&observation, Language::PtBr).as_deref(),
+        Some(" GPU LZ4 · compactou · descompactou")
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(136, 42)).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                &observation,
+                &DashHistory::default(),
+                &metadata(),
+                Language::En,
+                Screen::Main,
+            );
+        })
+        .unwrap();
+    let output = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    for expected in [
+        "PID 5104 · 90%",
+        "PID 3308 · 2%",
+        "GPU LZ4 · compressed · decompressed",
+    ] {
+        assert!(output.contains(expected), "{expected}");
+    }
+    observation.epoch_ms = 51_000;
+    assert!(engine_sample(&observation).is_none());
+    assert_eq!(
+        codec_activity_line(&observation, Language::En).as_deref(),
+        Some(" GPU LZ4 · compressed")
+    );
+    observation.epoch_ms = 54_100;
+    assert_eq!(codec_activity_line(&observation, Language::En), None);
+}
+
+#[test]
+fn matched_host_activity_survives_cache_off() {
+    let mut observation = wddm_observation();
+    let row = gpu_busy_line(&observation, Language::En, 58);
+    assert!(
+        row.contains("WDDM VideoEncode") && row.contains("40% · 1000 ms"),
+        "{row}"
+    );
+    observation.gpu = None;
+    let row = gpu_busy_line(&observation, Language::En, 58);
+    assert!(row.contains("Host WDDM VideoEncode"), "{row}");
+    observation.epoch_ms = 51_000;
+    assert!(!gpu_busy_line(&observation, Language::En, 58).contains("WDDM"));
+}
+
+#[test]
+fn activity_meter_handles_windows_clock_ahead_of_guest() {
+    let mut observation = wddm_observation();
+    let sample = observation.status.get_mut("host_gpu_activity").unwrap();
+    sample["report"]["sampled_at_unix_ms"] = json!(65_000);
+    sample["sampled_at_guest_unix_ms"] = json!(49_500);
+    let row = gpu_busy_line(&observation, Language::En, 58);
+    assert!(
+        row.contains("WDDM VideoEncode") && row.contains("40%"),
+        "{row}"
+    );
+    observation.epoch_ms = 51_000;
+    assert!(!gpu_busy_line(&observation, Language::En, 58).contains("WDDM"));
+}
+
+#[test]
+fn unmatched_host_activity_is_not_a_gpu_reading() {
+    let mut observation = wddm_observation();
+    let gpu = observation.gpu.as_mut().unwrap();
+    gpu.adapter.luid = Some("00000000:00000010".into());
+    gpu.adapter.node_mask = Some(2);
+    assert!(!gpu_busy_line(&observation, Language::En, 58).contains("WDDM"));
+    observation.gpu = None;
+    let adapters = observation.status.get_mut("host_gpu_activity").unwrap()["report"]["adapters"]
+        .as_array_mut()
+        .unwrap();
+    let mut second = adapters[0].clone();
+    second["physical_index"] = json!(1);
+    adapters.push(second);
+    assert!(!gpu_busy_line(&observation, Language::En, 58).contains("WDDM"));
+}
+
+#[test]
+fn host_catalog_selects_dashboard_gpu_when_cache_is_off() {
+    let mut observation = wddm_observation();
+    let sample = observation.status.get_mut("host_gpu_activity").unwrap();
+    sample["preferred_host_adapter"] = json!({"luid": "00000000:00000010", "physical_index": 0});
+    let adapters = sample["report"]["adapters"].as_array_mut().unwrap();
+    adapters.push(json!({
+        "luid": "00000000:00000011", "physical_index": 0,
+        "engines": [{"index": 0, "kind": "3D", "busy_pct": 99}]
+    }));
+    observation.gpu = None;
+    let row = gpu_busy_line(&observation, Language::En, 58);
+    assert!(
+        row.contains("Host WDDM VideoEncode") && row.contains("40%"),
+        "{row}"
+    );
+
+    let sample = observation.status.get_mut("host_gpu_activity").unwrap();
+    sample["preferred_host_adapter"]["physical_index"] = json!(9);
+    assert!(!gpu_busy_line(&observation, Language::En, 58).contains("WDDM"));
+}
+
+#[test]
+fn activity_provider_change_replaces_the_meter() {
+    let mut observation = wddm_observation();
+    observation.status.insert(
+        "gpu_utilization".into(),
+        json!({
+            "schema_version": 1, "gpu_pct": 13, "memory_pct": 2, "sampled_at_unix_ms": 49_500
+        }),
+    );
+    let wddm = gpu_busy_line(&observation, Language::En, 58);
+    assert!(wddm.contains("WDDM") && wddm.contains("40%"), "{wddm}");
+    observation.status.remove("host_gpu_activity");
+    let nvml = gpu_busy_line(&observation, Language::En, 58);
+    assert!(nvml.contains("NVML") && nvml.contains("13%"), "{nvml}");
+}
+
 #[test]
 fn main_dashboard_renders_live_idle_stale_and_unmeasured_gpu_busy() {
     let mut observation = active_cache_observation();

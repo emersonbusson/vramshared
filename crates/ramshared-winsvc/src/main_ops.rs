@@ -15,6 +15,9 @@ pub(crate) fn run_non_windows() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_product_cli(&args) {
         Ok(ProductCommand::InspectGpus) => ramshared_winsvc::gpu_identity::inspect_command(),
+        Ok(ProductCommand::InspectGpuActivity { supervised }) => {
+            ramshared_winsvc::gpu_activity::inspect_command(supervised)
+        }
         Ok(ProductCommand::InspectVms) => ramshared_winsvc::vm_identity::inspect_command(),
         Ok(ProductCommand::InspectStorage { file }) => {
             ramshared_winsvc::host_storage::inspect_command(std::path::Path::new(&file))
@@ -115,6 +118,9 @@ pub(crate) mod win {
     pub fn dispatch_operator_command(cmd: ProductCommand) -> Option<i32> {
         let code = match cmd {
             ProductCommand::InspectGpus => ramshared_winsvc::gpu_identity::inspect_command(),
+            ProductCommand::InspectGpuActivity { supervised } => {
+                ramshared_winsvc::gpu_activity::inspect_command(supervised)
+            }
             ProductCommand::InspectVms => ramshared_winsvc::vm_identity::inspect_command(),
             ProductCommand::InspectStorage { file } => {
                 ramshared_winsvc::host_storage::inspect_command(std::path::Path::new(&file))

@@ -139,6 +139,11 @@ pub fn render_status_json(view: &LifecycleView, snap: &CascadeSnapshot, ts: &str
         .as_ref()
         .and_then(|sample| serde_json::to_string(sample).ok())
         .unwrap_or_else(|| "null".to_string());
+    let host_gpu_activity_json = snap
+        .host_gpu_activity
+        .as_ref()
+        .and_then(|sample| serde_json::to_string(sample).ok())
+        .unwrap_or_else(|| "null".to_string());
     // Cache occupancy and codec health ride beside the budget and the busy
     // time. `None` publishes `null`, which reads as "no cache telemetry" —
     // never as a measured empty cache.
@@ -195,6 +200,7 @@ pub fn render_status_json(view: &LifecycleView, snap: &CascadeSnapshot, ts: &str
 \"thresholds_kib\":{{\"active\":{thr}}},\
 \"gpu_budget\":{gpu_budget},\
 \"gpu_utilization\":{gpu_utilization},\
+\"host_gpu_activity\":{host_gpu_activity},\
 \"gpu_cache\":{gpu_cache},\
 \"origin_cache_io\":{origin_cache_io},\
 \"host_memory\":{host_memory},\
@@ -247,6 +253,7 @@ pub fn render_status_json(view: &LifecycleView, snap: &CascadeSnapshot, ts: &str
         gpu_headroom_kib = number_or_null(snap.gpu_headroom_kib),
         gpu_budget = gpu_budget_json,
         gpu_utilization = gpu_utilization_json,
+        host_gpu_activity = host_gpu_activity_json,
         gpu_cache = gpu_cache_json,
         origin_cache_io = origin_cache_io_json,
         host_memory = host_memory_json,

@@ -44,7 +44,7 @@ pub fn format_luid(bytes: [u8; 8]) -> Option<String> {
     (low != 0 || high != 0).then(|| format!("{high:08x}:{low:08x}"))
 }
 
-fn canonical_luid(luid: &str) -> bool {
+pub(crate) fn canonical_luid(luid: &str) -> bool {
     luid.len() == 17
         && luid.as_bytes()[8] == b':'
         && luid

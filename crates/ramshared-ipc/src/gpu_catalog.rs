@@ -8,12 +8,17 @@
 //! This proves a host observation only; it cannot authorize GPU allocation.
 use crate::{
     FrameError, HandshakeTranscript, HeartbeatAck, HostChallenge, HostMemoryTelemetry,
-    IPC_VERSION_4, IPC_VERSION_5, MAX_GPU_CATALOG_PAYLOAD, compute_hmac, host_proof, verify_hmac,
+    IPC_VERSION_4, IPC_VERSION_5, IPC_VERSION_6, IPC_VERSION_7, MAX_GPU_CATALOG_PAYLOAD,
+    compute_hmac, host_proof, verify_hmac,
 };
 use ramshared_vram::GPU_BUDGET_MAX_AGE_MS;
 use ramshared_vram::host_identity::{HostGpuIdentityReport, HostGpuObservation};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+
+mod activity;
+pub use activity::{AuthenticatedActivity, HostGpuActivityObservation};
 
 const LABEL: &[u8] = b"ramshared-vsock-host-gpu-catalog-v1";
 /// Maximum accepted age of a signed host-memory observation.
@@ -31,8 +36,8 @@ struct Body {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Envelope {
-    body: Body,
+struct Envelope<B> {
+    body: B,
     proof: Vec<u8>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +45,7 @@ pub struct CatalogSession {
     binding: [u8; 32],
     lease_id: u32,
     round: u64,
+    version: u32,
 }
 /// Monotonic times bracketing the entire guest exchange, including writes.
 pub struct CatalogTiming {
@@ -79,6 +85,7 @@ impl AuthenticatedHostMemory {
 pub struct AuthenticatedHeartbeat {
     pub catalog: Option<AuthenticatedCatalog>,
     pub host_memory: Option<AuthenticatedHostMemory>,
+    pub activity: Option<AuthenticatedActivity>,
 }
 impl AuthenticatedCatalog {
     pub fn report(&self, now: Instant) -> Option<&HostGpuIdentityReport> {
@@ -103,7 +110,10 @@ impl CatalogSession {
     ) -> Result<Self, FrameError> {
         if secret.is_empty()
             || lease_id == 0
-            || !matches!(challenge.accepted_version, IPC_VERSION_4 | IPC_VERSION_5)
+            || !matches!(
+                challenge.accepted_version,
+                IPC_VERSION_4 | IPC_VERSION_5 | IPC_VERSION_6 | IPC_VERSION_7
+            )
             || !(transcript.min_version..=transcript.max_version)
                 .contains(&challenge.accepted_version)
         {
@@ -117,6 +127,7 @@ impl CatalogSession {
             binding,
             lease_id,
             round: 4,
+            version: challenge.accepted_version,
         })
     }
     pub fn round(&self) -> u64 {
@@ -127,7 +138,7 @@ impl CatalogSession {
             .checked_add(1)
             .ok_or_else(|| refuse("round exhausted"))
     }
-    fn proof_bytes(&self, body: &Body) -> Result<Vec<u8>, FrameError> {
+    fn proof_bytes(&self, body: &impl Serialize) -> Result<Vec<u8>, FrameError> {
         let encoded = crate::json_payload::encode(body, MAX_GPU_CATALOG_PAYLOAD)?;
         let mut bytes = Vec::with_capacity(LABEL.len() + self.binding.len() + encoded.len());
         bytes.extend_from_slice(LABEL);
@@ -135,6 +146,25 @@ impl CatalogSession {
         bytes.extend_from_slice(&encoded);
         Ok(bytes)
     }
+
+    fn encode_body(&self, secret: &[u8], body: impl Serialize) -> Result<Vec<u8>, FrameError> {
+        let proof = compute_hmac(secret, &self.proof_bytes(&body)?);
+        crate::json_payload::encode(&Envelope { body, proof }, MAX_GPU_CATALOG_PAYLOAD)
+    }
+
+    fn decode_body<B: DeserializeOwned + Serialize>(
+        &self,
+        secret: &[u8],
+        encoded: &[u8],
+    ) -> Result<B, FrameError> {
+        let envelope: Envelope<B> =
+            serde_json::from_slice(encoded).map_err(|error| refuse(&error.to_string()))?;
+        if !verify_hmac(secret, &self.proof_bytes(&envelope.body)?, &envelope.proof) {
+            return Err(refuse("host proof mismatch"));
+        }
+        Ok(envelope.body)
+    }
+
     /// Seal once for the next round. A failed write requires discarding the
     /// connection, never rewinding this sequence to replay a partial exchange.
     pub fn seal(
@@ -142,6 +172,17 @@ impl CatalogSession {
         secret: &[u8],
         ack: &HeartbeatAck,
         observation: Option<HostGpuObservation>,
+    ) -> Result<Vec<u8>, FrameError> {
+        self.seal_with_activity(secret, ack, observation, None)
+    }
+
+    /// Encode activity only in a connection negotiated for the extended catalog.
+    pub fn seal_with_activity(
+        &mut self,
+        secret: &[u8],
+        ack: &HeartbeatAck,
+        observation: Option<HostGpuObservation>,
+        activity: Option<HostGpuActivityObservation>,
     ) -> Result<Vec<u8>, FrameError> {
         let next = self.next_round()?;
         if let Some(sample) = &observation {
@@ -153,9 +194,16 @@ impl CatalogSession {
             ack: ack.clone(),
             observation,
         };
-        let proof = compute_hmac(secret, &self.proof_bytes(&body)?);
-        let encoded =
-            crate::json_payload::encode(&Envelope { body, proof }, MAX_GPU_CATALOG_PAYLOAD)?;
+        let encoded = if self.version >= IPC_VERSION_6 {
+            self.encode_extended(
+                secret,
+                &body,
+                activity.as_ref(),
+                self.version >= IPC_VERSION_7,
+            )?
+        } else {
+            self.encode_body(secret, body)?
+        };
         self.round = next;
         Ok(encoded)
     }
@@ -171,7 +219,7 @@ impl CatalogSession {
             .map(|heartbeat| heartbeat.catalog)
     }
 
-    /// Authenticate the full acknowledgement before exposing either sample.
+    /// Authenticate the full acknowledgement before exposing any observation.
     pub fn open_verified(
         &mut self,
         secret: &[u8],
@@ -184,18 +232,17 @@ impl CatalogSession {
         if encoded.len() > MAX_GPU_CATALOG_PAYLOAD as usize {
             return Err(refuse("envelope exceeds 64 KiB"));
         }
-        let envelope: Envelope =
-            serde_json::from_slice(encoded).map_err(|error| refuse(&error.to_string()))?;
-        let body = envelope.body;
+        let (body, activity) = if self.version >= IPC_VERSION_6 {
+            self.decode_extended(secret, encoded, self.version >= IPC_VERSION_7)?
+        } else {
+            (self.decode_body(secret, encoded)?, None)
+        };
         if correlation != self.round
             || body.round != self.round
             || body.lease_id != self.lease_id
             || &body.ack != ack
         {
             return Err(refuse("round, lease or heartbeat acknowledgement mismatch"));
-        }
-        if !verify_hmac(secret, &self.proof_bytes(&body)?, &envelope.proof) {
-            return Err(refuse("host proof mismatch"));
         }
         let elapsed = timing
             .received
@@ -257,6 +304,9 @@ impl CatalogSession {
         Ok(AuthenticatedHeartbeat {
             catalog,
             host_memory,
+            activity: activity.and_then(|sample| {
+                sample.authenticate(timing.received, elapsed_ms, lease_remaining)
+            }),
         })
     }
 }
@@ -273,6 +323,7 @@ mod tests {
             binding: [1; 32],
             lease_id: 7,
             round: 4,
+            version: IPC_VERSION_4,
         };
         let now = Instant::now();
         let ack = HeartbeatAck {

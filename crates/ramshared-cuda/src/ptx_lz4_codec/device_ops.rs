@@ -300,6 +300,10 @@ impl GpuDeviceCodec for CudaContextPtxCodec<'_, '_> {
         "cuda-ptx-gpu"
     }
 
+    fn uses_gpu_lz4(&self) -> bool {
+        true
+    }
+
     fn invalidate(&mut self, ticket: &VramSlabTicket) {
         self.slots.remove(&(ticket.frame_idx, ticket.sub_slot));
     }

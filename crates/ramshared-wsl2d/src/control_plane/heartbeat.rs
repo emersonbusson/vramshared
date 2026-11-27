@@ -7,7 +7,7 @@
 //! Verify the complete response before committing heartbeat authority.
 use super::{ControlPlaneError, VsockControlPlane};
 use crate::host_gate::LeaseToken;
-use ipc::gpu_catalog::{AuthenticatedCatalog, AuthenticatedHostMemory, CatalogTiming};
+use ipc::gpu_catalog::{AuthenticatedHeartbeat, CatalogTiming};
 use ipc::vsock::VsockStreamTrait;
 use ipc::{
     FrameError, HeartbeatAck, MSG_GPU_CATALOG, MSG_HEARTBEAT, MSG_HEARTBEAT_ACK, read_frame,
@@ -40,7 +40,7 @@ impl<S: VsockStreamTrait> VsockControlPlane<S> {
             ));
         }
         let ack: HeartbeatAck = ipc::decode_control(&ack_payload)?;
-        let (catalog, host_memory) = if ack.lease_remaining_ms > 0 {
+        let host_observations = if ack.lease_remaining_ms > 0 {
             if let Some(session) = self.catalog_session.as_mut() {
                 let (kind, bytes, correlation) =
                     read_frame(&mut exchange, ipc::MAX_GPU_CATALOG_PAYLOAD)?;
@@ -57,18 +57,18 @@ impl<S: VsockStreamTrait> VsockControlPlane<S> {
                         received: Instant::now(),
                     },
                 )?;
-                (authenticated.catalog, authenticated.host_memory)
+                Some(authenticated)
             } else {
-                (None, None)
+                None
             }
         } else {
-            (None, None)
+            None
         };
         exchange
             .finish()
             .map_err(|error| FrameError::StreamIo(error.to_string()))?;
         let lease_remaining_ms = ack.lease_remaining_ms;
-        self.commit_heartbeat(ack, catalog, host_memory, now_ms)?;
+        self.commit_heartbeat(ack, host_observations, now_ms)?;
         self.refresh_host_storage(lease_remaining_ms)
     }
     fn refresh_host_storage(&mut self, lease_remaining_ms: u64) -> Result<(), ControlPlaneError> {
@@ -130,8 +130,7 @@ impl<S: VsockStreamTrait> VsockControlPlane<S> {
     fn commit_heartbeat(
         &mut self,
         ack: HeartbeatAck,
-        catalog: Option<AuthenticatedCatalog>,
-        authenticated_memory: Option<AuthenticatedHostMemory>,
+        observations: Option<AuthenticatedHeartbeat>,
         now_ms: u64,
     ) -> Result<(), ControlPlaneError> {
         if ack.lease_remaining_ms == 0 {
@@ -141,6 +140,7 @@ impl<S: VsockStreamTrait> VsockControlPlane<S> {
             self.lease_deadline_ms = 0;
             self.host_catalog = None;
             self.publish_host_catalog();
+            self.publish_host_activity(None);
             #[cfg(target_os = "linux")]
             self.revoke_host_storage();
             return Err(ControlPlaneError::LeaseExpired);
@@ -157,11 +157,20 @@ impl<S: VsockStreamTrait> VsockControlPlane<S> {
         }
         self.publish_authority();
         self.last_ack_ms.store(now_ms, Ordering::Relaxed);
+        let (catalog, authenticated_memory, activity) = match observations {
+            Some(observations) => (
+                observations.catalog,
+                observations.host_memory,
+                observations.activity,
+            ),
+            None => (None, None, None),
+        };
         if let Ok(mut host_memory) = self.host_memory.lock() {
             *host_memory = authenticated_memory;
         }
         self.host_catalog = catalog;
         self.publish_host_catalog();
+        self.publish_host_activity(activity);
         Ok(())
     }
 }

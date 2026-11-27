@@ -8,9 +8,12 @@
 // Bridge between the isolated GPU worker and the VRAM slab codec
 // (SPEC gpu-vram-hardware-compression ITEM-4, RF-6/RF-8, NFR-2/NFR-5).
 
+#[cfg(any(unix, test))]
+use ramshared_vram::GpuCodecActivity;
 use ramshared_vram::device_codec::{CodecError, GpuDeviceCodec, PAGE_BYTES, PageDecodeStatus};
-use ramshared_vram::slab_pool::{VramSlabPool, VramSlabTicket};
+use ramshared_vram::slab_pool::{SlotEncoding, VramSlabPool, VramSlabTicket};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 pub const BRIDGE_STAGING_BYTES: u64 = 776 * 1024;
 pub const BRIDGE_FRAME_BYTES: u64 = 65_536;
@@ -63,19 +66,31 @@ pub struct SlabBridgeTelemetry {
     pub deadline_poison_events: Option<u64>,
 }
 
+#[derive(Default)]
+struct GpuCodecCompletions {
+    compression: Option<Instant>,
+    decompression: Option<Instant>,
+}
+
 pub struct GpuWorkerSlabBridge<'a> {
     pool: VramSlabPool,
     codec: Option<Box<dyn GpuDeviceCodec + 'a>>,
     crc_mismatches: u64,
     corrupt_lz4: u64,
     deadline_poison: u64,
+    completions: Option<GpuCodecCompletions>,
 }
 
 impl<'a> GpuWorkerSlabBridge<'a> {
     pub fn new(pool: VramSlabPool, codec: Option<Box<dyn GpuDeviceCodec + 'a>>) -> Self {
+        let completions = codec
+            .as_ref()
+            .filter(|codec| codec.uses_gpu_lz4())
+            .map(|_| GpuCodecCompletions::default());
         Self {
             pool,
             codec,
+            completions,
             crc_mismatches: 0,
             corrupt_lz4: 0,
             deadline_poison: 0,
@@ -108,7 +123,17 @@ impl<'a> GpuWorkerSlabBridge<'a> {
             .codec
             .as_mut()
             .ok_or_else(|| CodecError::BackendFailure("gpu codec is disabled".to_string()))?;
-        codec.compress_and_pack_batch(pages, &mut self.pool, out_tickets)
+        codec.compress_and_pack_batch(pages, &mut self.pool, out_tickets)?;
+        if let Some(completions) = &mut self.completions
+            && out_tickets
+                .iter()
+                .take(pages.len())
+                .flatten()
+                .any(|ticket| ticket.encoding == SlotEncoding::Lz4)
+        {
+            completions.compression = Some(Instant::now());
+        }
+        Ok(())
     }
 
     /// Verify and unpack a batch. A page that fails CRC or LZ4 decoding is
@@ -136,6 +161,16 @@ impl<'a> GpuWorkerSlabBridge<'a> {
                 return Err(CodecError::DeadlineExceeded);
             }
             Err(error) => return Err(error),
+        }
+        if let Some(completions) = &mut self.completions
+            && tickets
+                .iter()
+                .zip(out_status.iter())
+                .any(|(ticket, status)| {
+                    ticket.encoding == SlotEncoding::Lz4 && *status == PageDecodeStatus::Ok
+                })
+        {
+            completions.decompression = Some(Instant::now());
         }
         for (index, status) in out_status.iter().enumerate() {
             match status {
@@ -184,6 +219,17 @@ impl<'a> GpuWorkerSlabBridge<'a> {
         }
     }
 
+    #[cfg(any(unix, test))]
+    pub(crate) fn gpu_codec_activity(&self) -> Option<GpuCodecActivity> {
+        let completions = self.completions.as_ref()?;
+        let now = Instant::now();
+        let age_ms = |at: Instant| u64::try_from(now.checked_duration_since(at)?.as_millis()).ok();
+        Some(GpuCodecActivity {
+            compression_age_ms: completions.compression.and_then(age_ms),
+            decompression_age_ms: completions.decompression.and_then(age_ms),
+        })
+    }
+
     pub fn telemetry(&self) -> SlabBridgeTelemetry {
         match self.codec.as_ref() {
             None => SlabBridgeTelemetry {
@@ -225,6 +271,55 @@ mod tests {
             };
         }
         page
+    }
+
+    #[test]
+    fn tracks_successful_lz4_work_independently() {
+        let mut codec = ReferenceLz4Codec::new();
+        codec.set_deadline(std::time::Duration::from_secs(30));
+        let mut bridge =
+            GpuWorkerSlabBridge::new(VramSlabPool::new(1).unwrap(), Some(Box::new(codec)));
+        assert!(bridge.gpu_codec_activity().is_none());
+        // The fixture executes the same ticket contract with a CPU codec.
+        bridge.completions = Some(GpuCodecCompletions::default());
+        assert_eq!(
+            bridge.gpu_codec_activity().unwrap().compression_age_ms,
+            None
+        );
+        let mut tickets = [None];
+        bridge.compress_batch(&[page(63)], &mut tickets).unwrap();
+        let ticket = tickets[0].unwrap();
+        assert_eq!(ticket.encoding, SlotEncoding::Lz4);
+        let activity = bridge.gpu_codec_activity().unwrap();
+        assert!(activity.compression_age_ms.is_some());
+        assert_eq!(activity.decompression_age_ms, None);
+
+        let mut out = [[0u8; PAGE_BYTES]];
+        let mut status = [PageDecodeStatus::InvalidTicket];
+        bridge
+            .recover_batch(&[ticket], &mut out, &mut status, |_| {
+                panic!("unexpected fallback")
+            })
+            .unwrap();
+        assert_eq!(out, [page(63)]);
+        assert!(
+            bridge
+                .gpu_codec_activity()
+                .unwrap()
+                .decompression_age_ms
+                .is_some()
+        );
+
+        bridge.completions.as_mut().unwrap().decompression = None;
+        bridge.invalidate_ticket(&ticket);
+        bridge
+            .recover_batch(&[ticket], &mut out, &mut status, |_| Ok(page(9)))
+            .unwrap();
+        assert_eq!(out, [page(9)]);
+        assert_eq!(
+            bridge.gpu_codec_activity().unwrap().decompression_age_ms,
+            None
+        );
     }
 
     #[test]

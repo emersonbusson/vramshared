@@ -282,6 +282,7 @@ pub struct CascadeSnapshot {
     /// report. This is busy **time**, not VRAM capacity, and never shares a
     /// meter with `vram_cached_kib` or `gpu_headroom_kib`.
     pub gpu_utilization: Option<GpuUtilizationTelemetry>,
+    pub host_gpu_activity: Option<ramshared_vram::host_gpu_activity::HostGpuActivityTelemetry>,
     /// Cache occupancy and codec health (DT-8). Logical cache bytes are cache
     /// occupancy in the worker's address space, never guest or host RAM.
     /// `None` is "no cache telemetry", never a measured empty cache.

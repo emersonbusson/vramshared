@@ -16,6 +16,8 @@ pub mod supervisor;
 mod native;
 #[cfg(windows)]
 pub use native::inspect_native;
+#[cfg(windows)]
+pub(crate) use native::process_identity;
 
 pub use ramshared_vram::host_identity::{
     HostGpuIdentity, HostGpuIdentityReport, HostGpuObservation, IdentitySource,

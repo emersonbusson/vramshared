@@ -16,6 +16,7 @@ pub mod control_plane;
 pub mod cuda_probe;
 pub mod driver_link;
 pub mod evidence;
+pub mod gpu_activity;
 pub mod gpu_identity;
 pub mod host_memory;
 pub mod host_safety;

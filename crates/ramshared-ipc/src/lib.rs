@@ -30,7 +30,11 @@ pub const IPC_VERSION_4: u32 = 4;
 /// Reserved for the storage-capable protocol; not advertised until both
 /// endpoints implement its complete exchange.
 pub const IPC_VERSION_5: u32 = 5;
-pub const IPC_MAX_VERSION: u32 = IPC_VERSION_5;
+/// Adds activity to the signed catalog body; the frame layout is unchanged.
+pub const IPC_VERSION_6: u32 = 6;
+// Catalog negotiation with bounded per-process activity. Frame versions stay unchanged.
+pub const IPC_VERSION_7: u32 = 7;
+pub const IPC_MAX_VERSION: u32 = IPC_VERSION_7;
 pub const IPC_MIN_VERSION: u32 = 2;
 pub const MAX_PAYLOAD_LEN: u32 = 1024 * 1024;
 pub const MAX_CONTROL_PAYLOAD: u32 = 4 * 1024;
@@ -114,7 +118,9 @@ impl VsockFrameHeader {
         }
         b4.copy_from_slice(&buf[4..8]);
         let version = u32::from_le_bytes(b4);
-        if !(IPC_MIN_VERSION..=IPC_MAX_VERSION).contains(&version) {
+        // Version 6 is a negotiated payload dialect. Wire headers keep
+        // their established message-specific versions.
+        if !(IPC_MIN_VERSION..=IPC_VERSION_5).contains(&version) {
             return Err(FrameError::UnsupportedVersion(version));
         }
         b4.copy_from_slice(&buf[8..12]);

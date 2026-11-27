@@ -186,6 +186,10 @@ impl<'p, P: VramProvider + 'p> GpuCacheWorker<'p, P> {
             schema_version: ramshared_vram::WORKER_TELEMETRY_SCHEMA_VERSION,
             sampled_at_unix_ms,
             codec: CodecTelemetry::new(capability, state, refusal_reason),
+            gpu_codec_activity: self
+                .slab_bridge
+                .as_ref()
+                .and_then(GpuWorkerSlabBridge::gpu_codec_activity),
             logical_cached_bytes,
             physical_cache_slab_bytes,
             codec_workspace_bytes,

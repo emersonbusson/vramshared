@@ -183,7 +183,9 @@ fn version_negotiation_selects_highest_mutual() {
     assert_eq!(negotiate_version(3, 3), Some(3));
     assert_eq!(negotiate_version(4, 5), Some(5));
     assert_eq!(negotiate_version(5, 5), Some(5));
-    assert_eq!(negotiate_version(6, 6), None);
+    assert_eq!(negotiate_version(6, 6), Some(6));
+    assert_eq!(negotiate_version(7, 7), Some(7));
+    assert_eq!(negotiate_version(8, 8), None);
     assert_eq!(negotiate_version(1, 1), None);
 }
 
@@ -782,7 +784,7 @@ fn catalog_header_requires_version_four_and_keeps_legacy_bootstrap() {
     );
 }
 #[test]
-fn reserved_storage_protocol_preserves_catalog_negotiation_without_advertising() {
+fn activity_negotiation_keeps_storage_and_catalog_frame_versions() {
     use crate::gpu_catalog::CatalogSession;
     use crate::storage_proof::StorageSession;
     let mut transcript = HandshakeTranscript {
@@ -798,7 +800,7 @@ fn reserved_storage_protocol_preserves_catalog_negotiation_without_advertising()
         lease_timeout_secs: 20,
         host_nonce: [2; 32],
     };
-    assert_eq!(IPC_MAX_VERSION, IPC_VERSION_5);
+    assert_eq!(IPC_MAX_VERSION, IPC_VERSION_7);
     assert!(CatalogSession::new(b"secret", &transcript, &challenge, 7).is_ok());
     assert!(StorageSession::new(b"secret", &transcript, &challenge, 7).is_ok());
     transcript.max_version = 4;
@@ -807,8 +809,18 @@ fn reserved_storage_protocol_preserves_catalog_negotiation_without_advertising()
     challenge.accepted_version = 4;
     assert!(CatalogSession::new(b"secret", &transcript, &challenge, 7).is_ok());
     assert!(StorageSession::new(b"secret", &transcript, &challenge, 7).is_err());
-    challenge.accepted_version = 6;
-    transcript.max_version = 6;
-    assert!(CatalogSession::new(b"secret", &transcript, &challenge, 7).is_err());
-    assert!(StorageSession::new(b"secret", &transcript, &challenge, 7).is_err());
+    challenge.accepted_version = IPC_VERSION_6;
+    transcript.max_version = IPC_VERSION_6;
+    assert!(CatalogSession::new(b"secret", &transcript, &challenge, 7).is_ok());
+    assert!(StorageSession::new(b"secret", &transcript, &challenge, 7).is_ok());
+    challenge.accepted_version = IPC_VERSION_7;
+    transcript.max_version = IPC_VERSION_7;
+    assert!(CatalogSession::new(b"secret", &transcript, &challenge, 7).is_ok());
+    assert!(StorageSession::new(b"secret", &transcript, &challenge, 7).is_ok());
+    let mut activity_header = VsockFrameHeader::new(MSG_GPU_CATALOG, 0, 4);
+    activity_header.version = IPC_VERSION_6;
+    assert_eq!(
+        VsockFrameHeader::decode(&activity_header.encode()),
+        Err(FrameError::UnsupportedVersion(IPC_VERSION_6))
+    );
 }

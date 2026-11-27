@@ -7,12 +7,21 @@
 //! Real connected product host/guest exchange with synthetic metadata, no GPU effects.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use ramshared_vram::host_identity::{HostGpuIdentityReport, HostGpuObservation, ProducerProcess};
+use ramshared_ipc::gpu_catalog::HostGpuActivityObservation;
+use ramshared_vram::GpuAdapterIdentity;
+use ramshared_vram::host_gpu_activity::{
+    HostGpuActivityReport, HostGpuActivitySource, HostGpuActivityTarget, HostGpuAdapterActivity,
+    HostGpuEngineActivity,
+};
+use ramshared_vram::host_identity::{
+    HostGpuIdentity, HostGpuIdentityReport, HostGpuObservation, ProducerProcess,
+};
 use ramshared_winsvc::vsock_lease::{HostSamples, LeasePolicy, serve_connection};
+use ramshared_wsl2d::control_plane::SharedHostActivity;
 use ramshared_wsl2d::control_plane::{ControlPlane, VsockControlPlane};
 use ramshared_wsl2d::host_gate::{SealedOrigin, SharedAuthority};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SECRET: &[u8] = b"actual-connected-catalog-test-secret";
 fn sample() -> HostGpuObservation {
     HostGpuObservation {
@@ -42,6 +51,164 @@ fn plane(stream: UnixStream) -> VsockControlPlane<UnixStream> {
         },
         Duration::from_secs(2),
     )
+}
+
+#[test]
+fn activity_survives_cache_worker_pause() {
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let activity = HostGpuActivityObservation {
+        age_ms: 1,
+        report: HostGpuActivityReport {
+            schema_version: 1,
+            source: HostGpuActivitySource::WddmPdh,
+            sampled_at_unix_ms: wall + 60_000,
+            interval_ms: 1_000,
+            adapters: vec![],
+        },
+    };
+    assert_activity_exchange(activity, wall, None, None);
+}
+
+#[test]
+fn activity_matches_one_catalog_adapter_with_cache_paused() {
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut catalog = sample();
+    catalog.report.adapters.push(HostGpuIdentity {
+        ordinal: 0,
+        allocator: GpuAdapterIdentity {
+            backend: "cuda".into(),
+            key: format!("{:032x}", 1),
+            luid: Some("00000000:0000000a".into()),
+            node_mask: Some(1),
+        },
+        interface_id: "test-display-interface".into(),
+    });
+    let adapter = HostGpuAdapterActivity {
+        luid: "00000000:0000000a".into(),
+        physical_index: 0,
+        engines: vec![HostGpuEngineActivity {
+            index: 1,
+            kind: "VideoEncode".into(),
+            busy_pct: 37,
+            processes: None,
+        }],
+    };
+    let competing = HostGpuAdapterActivity {
+        physical_index: 1,
+        ..adapter.clone()
+    };
+    let expected = HostGpuActivityTarget {
+        luid: adapter.luid.clone(),
+        physical_index: 0,
+    };
+    let activity = HostGpuActivityObservation {
+        age_ms: 1,
+        report: HostGpuActivityReport {
+            schema_version: 1,
+            source: HostGpuActivitySource::WddmPdh,
+            sampled_at_unix_ms: wall,
+            interval_ms: 1_000,
+            adapters: vec![competing, adapter],
+        },
+    };
+    catalog.report.validate().unwrap();
+    assert_activity_exchange(activity, wall, Some(catalog), Some(expected));
+}
+
+#[test]
+#[ignore = "requires a fresh report from the native Windows GPU Engine probe"]
+fn native_wddm_sample_crosses_authenticated_guest_exchange() {
+    let path = std::env::var_os("RAMSHARED_NATIVE_WDDM_REPORT").unwrap();
+    let report: HostGpuActivityReport =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    report.validate().unwrap();
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let age_ms: u64 = std::env::var("RAMSHARED_NATIVE_WDDM_AGE_MS")
+        .expect("provide the monotonic upper bound on sample age at receipt")
+        .parse()
+        .unwrap();
+    assert!(
+        age_ms < 1_500,
+        "native activity is {age_ms} ms old before exchange"
+    );
+    let adapter_count = report.adapters.len();
+    let engine_count: usize = report
+        .adapters
+        .iter()
+        .map(|adapter| adapter.engines.len())
+        .sum();
+    assert!(adapter_count > 0 && engine_count > 0);
+    assert_activity_exchange(
+        HostGpuActivityObservation { age_ms, report },
+        wall,
+        None,
+        None,
+    );
+    eprintln!(
+        "NATIVE_WDDM_EXCHANGE_PASS adapters={adapter_count} engines={engine_count} age_before_ms={age_ms}"
+    );
+}
+
+fn assert_activity_exchange(
+    activity: HostGpuActivityObservation,
+    wall: u64,
+    catalog: Option<HostGpuObservation>,
+    preferred: Option<HostGpuActivityTarget>,
+) {
+    let expected = activity.report.clone();
+    let (guest, mut host) = UnixStream::pair().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut round = 0;
+        serve_connection(
+            &mut host,
+            SECRET,
+            LeasePolicy::new(5, 15).unwrap(),
+            || 1000,
+            || {
+                round += 1;
+                HostSamples {
+                    gpu: if round == 1 { catalog.clone() } else { None },
+                    activity: (round != 2).then(|| activity.clone()),
+                    ..HostSamples::default()
+                }
+            },
+        )
+    });
+    let shared = SharedAuthority::new();
+    let mut guest = plane(guest).with_authority_mirror(shared.begin_session());
+    let slot = SharedHostActivity::default();
+    guest.attach_host_activity(slot.clone());
+    guest.perform_handshake(1000).unwrap();
+    assert!(slot.telemetry(Instant::now(), wall).is_none());
+    guest.heartbeat(1001).unwrap();
+    let first = slot.telemetry(Instant::now(), wall).unwrap();
+    assert_eq!(first.report, expected);
+    assert_eq!(first.preferred_host_adapter, preferred);
+    assert_eq!(first.report_at(wall), Some(&expected));
+    assert!(first.report_at(first.valid_before_unix_ms).is_none());
+    assert!(
+        slot.telemetry(Instant::now() + Duration::from_secs(5), wall + 5_000)
+            .is_none()
+    );
+    guest.heartbeat(1002).unwrap();
+    assert!(slot.telemetry(Instant::now(), wall).is_none());
+    guest.heartbeat(1003).unwrap();
+    let recovered = slot.telemetry(Instant::now(), wall).unwrap();
+    assert_eq!(recovered.report, expected);
+    assert!(recovered.preferred_host_adapter.is_none());
+    let _new_session = shared.begin_session();
+    assert!(slot.telemetry(Instant::now(), wall).is_none());
+    drop(guest);
+    assert!(server.join().unwrap().is_err());
 }
 #[test]
 fn authenticated_catalog_tracks_availability_and_current_generation() {

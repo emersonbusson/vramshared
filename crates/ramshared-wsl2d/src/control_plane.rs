@@ -37,7 +37,10 @@
 //! - The HMAC shared secret is supplied by the caller from an environment or
 //!   secret-store source. Nothing in this module hardcodes a key.
 
+mod activity;
 mod heartbeat;
+use activity::HostActivity;
+pub use activity::SharedHostActivity;
 use ramshared_ipc::gpu_catalog::{AuthenticatedCatalog, CatalogSession};
 use ramshared_ipc::{
     self as ipc, FrameError, Handshake, HandshakeAck, HandshakeError, HandshakeFinish,
@@ -143,7 +146,7 @@ pub struct NegotiatedCadence {
 /// The frame header's version and the payload's `accepted_version` are
 /// different fields: `VsockFrameHeader::decode` bounds the former, nothing
 /// else bounds the latter. A peer that claims version 1 (below
-/// `IPC_MIN_VERSION`) or 6 (above `IPC_MAX_VERSION`) is refused here.
+/// `IPC_MIN_VERSION`) or 8 (above `IPC_MAX_VERSION`) is refused here.
 fn validate_accepted_version(accepted: u32) -> Result<u32, ControlPlaneError> {
     if !(ipc::IPC_MIN_VERSION..=ipc::IPC_MAX_VERSION).contains(&accepted) {
         return Err(ControlPlaneError::Protocol(format!(
@@ -209,6 +212,7 @@ pub struct VsockControlPlane<S: ipc::vsock::VsockStreamTrait> {
     catalog_session: Option<CatalogSession>,
     host_catalog: Option<AuthenticatedCatalog>,
     shared_host_catalog: Option<SharedHostCatalog>,
+    host_activity: HostActivity,
     storage_session: Option<StorageSession>,
     #[cfg(target_os = "linux")]
     shared_host_storage: Option<SharedHostStorage>,
@@ -251,6 +255,7 @@ impl<S: ipc::vsock::VsockStreamTrait> VsockControlPlane<S> {
             catalog_session: None,
             host_catalog: None,
             shared_host_catalog: None,
+            host_activity: HostActivity::default(),
             storage_session: None,
             #[cfg(target_os = "linux")]
             shared_host_storage: None,
@@ -386,6 +391,7 @@ impl<S: ipc::vsock::VsockStreamTrait> VsockControlPlane<S> {
         self.catalog_session = None;
         self.host_catalog = None;
         self.publish_host_catalog();
+        self.publish_host_activity(None);
         self.storage_session = None;
         #[cfg(target_os = "linux")]
         self.revoke_host_storage();
@@ -515,7 +521,7 @@ impl<S: ipc::vsock::VsockStreamTrait> VsockControlPlane<S> {
         } else {
             None
         };
-        let storage_session = if ack.accepted_version == ipc::IPC_VERSION_5 {
+        let storage_session = if ack.accepted_version >= ipc::IPC_VERSION_5 {
             Some(StorageSession::new(
                 &self.secret,
                 &transcript,
@@ -548,6 +554,7 @@ impl<S: ipc::vsock::VsockStreamTrait> VsockControlPlane<S> {
         self.catalog_session = None;
         self.host_catalog = None;
         self.publish_host_catalog();
+        self.publish_host_activity(None);
         self.storage_session = None;
         #[cfg(target_os = "linux")]
         self.revoke_host_storage();

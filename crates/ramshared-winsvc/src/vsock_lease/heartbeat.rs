@@ -7,6 +7,7 @@
 //! Bounded heartbeat response composition; observation effects are injected.
 use super::{LeasePolicy, LeaseServerError, LeaseSession};
 use ramshared_ipc::deadline::DeadlineIo;
+use ramshared_ipc::gpu_catalog::HostGpuActivityObservation;
 use ramshared_ipc::vsock::VsockStreamTrait;
 use ramshared_ipc::{
     Heartbeat, HeartbeatAck, HostMemoryTelemetry, MAX_CONTROL_PAYLOAD, MSG_GPU_CATALOG,
@@ -34,6 +35,7 @@ pub type StorageObserver = Arc<dyn Fn([u8; 16]) -> Option<StorageSample> + Send 
 pub struct HostSamples {
     pub memory: Option<HostMemoryTelemetry>,
     pub gpu: Option<HostGpuObservation>,
+    pub activity: Option<HostGpuActivityObservation>,
     pub storage: Option<StorageObserver>,
 }
 
@@ -60,7 +62,9 @@ fn write_heartbeat(
     // Admit both complete payloads before emitting the successful ack.
     let control = encode_control(&ack)?;
     let catalog = match session.catalog.as_mut() {
-        Some(catalog) if !expired => Some(catalog.seal(secret, &ack, samples.gpu)?),
+        Some(catalog) if !expired => {
+            Some(catalog.seal_with_activity(secret, &ack, samples.gpu, samples.activity)?)
+        }
         _ => None,
     };
     write_frame(stream, MSG_HEARTBEAT_ACK, &control, correlation)?;

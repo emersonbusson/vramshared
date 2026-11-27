@@ -67,6 +67,7 @@ fn origin_and_cache_failures_are_sticky_until_exact_recovery() {
         gpu_utilization: None,
         gpu_cache: None,
         host_memory: None,
+        host_gpu_activity: None,
         host_storage: None,
         control_plane_state: None,
         control_plane_lease_deadline_ms: None,
