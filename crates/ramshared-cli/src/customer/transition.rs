@@ -80,16 +80,31 @@ pub(crate) struct PackagePending {
     pub(crate) issued_unix: u64,
 }
 
-fn validate_pending_identity(pending: &PackagePending) -> Result<(), CustomerError> {
+pub(super) fn is_single_component_release_name(target: &str) -> bool {
+    if crate::release_identity::parse_identity_line(target.as_bytes()).as_deref() != Some(target)
+        || target.starts_with('.')
+        || target.contains('/')
+        || target.contains('\\')
+    {
+        return false;
+    }
+    let mut components = std::path::Path::new(target).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(part)), None) if part == std::ffi::OsStr::new(target)
+    )
+}
+
+pub(super) fn validate_pending_identity(pending: &PackagePending) -> Result<(), CustomerError> {
     if !super::package::is_lowercase_sha256(&pending.old_hash)
         || !super::package::is_lowercase_sha256(&pending.new_hash)
-        || pending.target_release.as_ref().is_some_and(|target| {
-            crate::release_identity::parse_identity_line(target.as_bytes()).as_deref()
-                != Some(target.as_str())
-        })
+        || pending
+            .target_release
+            .as_deref()
+            .is_some_and(|target| !is_single_component_release_name(target))
     {
         return Err(confinement_refusal(
-            "package pending record requires canonical lowercase SHA-256 identities",
+            "package pending record requires canonical lowercase SHA-256 and single-component release identities",
         ));
     }
     Ok(())

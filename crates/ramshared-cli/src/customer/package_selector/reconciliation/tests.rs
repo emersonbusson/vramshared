@@ -58,6 +58,39 @@ fn digest(bytes: &[u8]) -> String {
     crate::installed_image::sha256_reader(&mut r).unwrap()
 }
 
+#[test]
+fn cleanup_refuses_selected_release_when_selector_uses_parent_component() {
+    let root =
+        std::env::temp_dir().join(format!("ramshared-selected-cleanup-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let fixture = TempFixture(root);
+    let release = fixture.0.join("releases/v1");
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(release.join("sentinel"), b"keep").unwrap();
+    let metadata = std::fs::metadata(&release).unwrap();
+    let selector = fixture.0.join("current");
+    symlink("releases/../releases/v1", &selector).unwrap();
+
+    assert!(
+        remove_owned_unselected_release(&release, (metadata.dev(), metadata.ino()), &selector,)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(release.join("sentinel")).unwrap(), b"keep");
+    std::fs::remove_file(&selector).unwrap();
+    std::fs::write(&selector, b"not a selector").unwrap();
+    assert!(
+        remove_owned_unselected_release(&release, (metadata.dev(), metadata.ino()), &selector,)
+            .is_err()
+    );
+    assert!(release.join("sentinel").exists());
+    std::fs::remove_file(&selector).unwrap();
+    std::fs::create_dir(fixture.0.join("releases/v2")).unwrap();
+    symlink("releases/v2", &selector).unwrap();
+    remove_owned_unselected_release(&release, (metadata.dev(), metadata.ino()), &selector).unwrap();
+    assert!(!release.exists());
+    assert!(fixture.0.join("releases/v2").is_dir());
+}
+
 fn create_sealed_release_fixture(
     root: &Path,
     version: &str,
@@ -511,7 +544,21 @@ fn reconciliation_and_effect_primitives_refuse_malformed_and_foreign_states() {
     persist_record(&guard, &rec).unwrap();
     assert!(inspect_effect_journal(&paths).is_err());
 
+    rec.staging_name = "..".into();
+    persist_record(&guard, &rec).unwrap();
+    assert!(inspect_effect_journal(&paths).is_err());
+
     rec.staging_name = ".current.test.staging".into();
+    rec.target = PathBuf::from("../escape");
+    persist_record(&guard, &rec).unwrap();
+    assert!(inspect_effect_journal(&paths).is_err());
+
+    rec.target = PathBuf::from("releases/v1");
+    rec.pending.target_release = Some("../escape".into());
+    persist_record(&guard, &rec).unwrap();
+    assert!(inspect_effect_journal(&paths).is_err());
+
+    rec.pending = pending.clone();
     rec.pending.issued_unix = 999;
     persist_record(&guard, &rec).unwrap();
     assert!(

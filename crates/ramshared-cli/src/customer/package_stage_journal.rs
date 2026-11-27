@@ -66,6 +66,101 @@ pub(super) fn clear_stage_journal(
     )
 }
 
+/// Remove only staged files whose identities are recorded by this transaction.
+pub(super) fn cleanup_staged_members(
+    guard: &CustomerTransitionGuard,
+    pending: &PackagePending,
+    parent: &Path,
+) -> Result<(), CustomerError> {
+    cleanup_staged_members_with_hook(guard, pending, parent, || {})
+}
+
+fn cleanup_staged_members_with_hook(
+    guard: &CustomerTransitionGuard,
+    pending: &PackagePending,
+    parent: &Path,
+    mut after_remove: impl FnMut(),
+) -> Result<(), CustomerError> {
+    use rustix::fs::{AtFlags, Dir, unlinkat};
+    use std::collections::BTreeMap;
+
+    if guard.owner() != OperationOwner::Package
+        || read_pending(guard.paths())?.as_ref() != Some(pending)
+    {
+        return Err(recovery_refusal(
+            "stage cleanup requires matching package custody",
+        ));
+    }
+    guard.revalidate()?;
+    let history = read_stage_history(guard.paths())?.unwrap_or_default();
+    if history
+        .iter()
+        .any(|entry| entry.pending != *pending || entry.parent != parent)
+    {
+        return Err(recovery_refusal("stage history does not match cleanup"));
+    }
+    let Some(directory) = super::transition_custody::open_directory_no_follow(parent, false)?
+    else {
+        return if history.is_empty() {
+            Ok(())
+        } else {
+            Err(recovery_refusal("stage directory disappeared"))
+        };
+    };
+    super::transition_custody::validate_directory(&directory, "package stage directory")?;
+    let meta = directory
+        .metadata()
+        .map_err(|_| recovery_refusal("stage directory unavailable"))?;
+    let parent_id = (meta.dev(), meta.ino());
+    let mut recorded = BTreeMap::new();
+    for entry in &history {
+        if entry
+            .parent_device
+            .zip(entry.parent_inode)
+            .is_some_and(|id| id != parent_id)
+        {
+            return Err(recovery_refusal("stage directory identity changed"));
+        }
+        if entry.phase != StagePhase::Intent {
+            recorded.insert(entry.name.as_str(), entry);
+        }
+    }
+    let mut slots = Vec::new();
+    let mut entries =
+        Dir::read_from(&directory).map_err(|_| recovery_refusal("stage directory unreadable"))?;
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(|_| recovery_refusal("stage directory unreadable"))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| recovery_refusal("stage name is invalid"))?;
+        if matches!(name, "." | "..") {
+            continue;
+        }
+        let record = recorded
+            .remove(name)
+            .ok_or_else(|| recovery_refusal("unowned stage entry; retain evidence"))?;
+        slots.push((name.to_owned(), open_recorded_stage(record)?));
+    }
+    guard.revalidate()?;
+    if read_pending(guard.paths())?.as_ref() != Some(pending)
+        || read_stage_history(guard.paths())?.unwrap_or_default() != history
+    {
+        return Err(recovery_refusal("stage cleanup evidence changed"));
+    }
+    for (name, slot) in slots {
+        slot.revalidate()
+            .ok_or_else(|| recovery_refusal("stage member changed"))?;
+        unlinkat(&directory, name.as_str(), AtFlags::empty())
+            .map_err(|_| recovery_refusal("stage member removal failed"))?;
+        after_remove();
+    }
+    directory
+        .sync_all()
+        .map_err(|_| recovery_refusal("stage cleanup sync failed"))?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum StagePhase {
@@ -800,8 +895,86 @@ mod tests {
         assert_eq!(legacy_slot.file_mut().metadata().unwrap().len(), maximum);
         assert!(!stage.join("legacy").exists());
         drop(legacy_guard);
+        let saved = root.join("original-stage-member");
+        std::fs::rename(stage.join("one"), &saved).unwrap();
+        std::fs::write(stage.join("one"), b"foreign replacement").unwrap();
+        assert!(cleanup_staged_members(&guard, &pending, &stage).is_err());
+        assert_eq!(
+            std::fs::read(stage.join("one")).unwrap(),
+            b"foreign replacement"
+        );
+        assert!(stage.join("two").exists());
+        std::fs::remove_file(stage.join("one")).unwrap();
+        std::fs::rename(&saved, stage.join("one")).unwrap();
+        std::fs::write(stage.join("foreign"), b"keep").unwrap();
+        assert!(cleanup_staged_members(&guard, &pending, &stage).is_err());
+        assert!(stage.join("one").exists());
+        std::fs::remove_file(stage.join("foreign")).unwrap();
+        drop(guard);
+        interrupt_cleanup(&root);
+        let guard = acquire_transition(OperationOwner::Package, &paths).unwrap();
+        assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 2);
+        cleanup_staged_members(&guard, &pending, &stage).unwrap();
+        cleanup_staged_members(&guard, &pending, &stage).unwrap();
+        assert!(!stage.join("two").exists());
+        assert!(!stage.join("manifest").exists());
+        assert!(stage.is_dir());
         drop(guard);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked by staged cleanup interruption test"]
+    fn cleanup_kill_child() {
+        use std::io::{Read, Write};
+        let root = PathBuf::from(std::env::var_os("RAMSHARED_CLEANUP_CHILD_DIR").unwrap());
+        let paths = TransitionPaths::under(&root.join("transaction"));
+        let guard =
+            super::super::transition::acquire_transition(OperationOwner::Package, &paths).unwrap();
+        let pending = read_pending(&paths).unwrap().unwrap();
+        cleanup_staged_members_with_hook(&guard, &pending, &root.join("stage"), || {
+            println!("RAMSHARED_CLEANUP_TEST_READY");
+            std::io::stdout().flush().unwrap();
+            let _ = std::io::stdin().read(&mut [0u8; 1]);
+        })
+        .unwrap();
+    }
+
+    fn interrupt_cleanup(root: &Path) {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "customer::package_stage_journal::tests::cleanup_kill_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RAMSHARED_CLEANUP_CHILD_DIR", root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.contains("RAMSHARED_CLEANUP_TEST_READY") {
+                    let _ = send.send(());
+                    break;
+                }
+            }
+        });
+        let ready = receive.recv_timeout(Duration::from_secs(15));
+        let killed = child.kill();
+        let status = child.wait();
+        reader.join().unwrap();
+        assert!(ready.is_ok(), "cleanup child did not reach removal");
+        assert!(killed.is_ok());
+        assert!(!status.unwrap().success());
     }
 
     #[test]
@@ -1114,5 +1287,101 @@ mod tests {
             assert!(stage_journal_present(&paths).unwrap());
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_staged_members_and_clear_journal_refuse_wrong_custody_and_drifted_parent() {
+        use super::super::transition::{acquire_transition, enroll_pending};
+
+        let root = std::env::temp_dir().join(format!(
+            "ramshared-stage-cleanup-refusals-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let paths = TransitionPaths::under(&root.join("tx"));
+        std::fs::create_dir_all(paths.transactions_root()).unwrap();
+        let pending = PackagePending {
+            target_release: Some("v1".into()),
+            action: PackageAction::Install,
+            old_hash: "0".repeat(64),
+            new_hash: "a".repeat(64),
+            issued_unix: 1,
+        };
+        let other_pending = PackagePending {
+            issued_unix: 2,
+            ..pending.clone()
+        };
+
+        // reconciliation_evidence refuses when absent.
+        assert!(reconciliation_evidence(&paths).is_err());
+
+        // Non-package owner refused before touching stage.
+        let non_pkg = acquire_transition(OperationOwner::Setup, &paths).unwrap();
+        assert!(cleanup_staged_members(&non_pkg, &pending, &stage).is_err());
+        drop(non_pkg);
+
+        let guard = acquire_transition(OperationOwner::Package, &paths).unwrap();
+        enroll_pending(&guard, &pending).unwrap();
+
+        // Missing stage dir with empty history is idempotent Ok(()).
+        let absent_stage = root.join("absent-stage");
+        assert!(cleanup_staged_members(&guard, &pending, &absent_stage).is_ok());
+
+        // Write a stage journal belonging to another transaction -> clear & cleanup refuse.
+        let stage_meta = std::fs::metadata(&stage).unwrap();
+        let mut entry = StageJournal {
+            pending: other_pending.clone(),
+            source_boot_id: observed_boot_id().unwrap(),
+            source_device: 1,
+            source_inode: 2,
+            role: "ramshared".into(),
+            parent: stage.clone(),
+            name: "member.part".into(),
+            limit: 64,
+            phase: StagePhase::Intent,
+            parent_device: Some(stage_meta.dev()),
+            parent_inode: Some(stage_meta.ino()),
+            device: None,
+            inode: None,
+        };
+        let jpath = paths.transactions_root().join(JOURNAL);
+        std::fs::write(
+            &jpath,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        assert!(clear_stage_journal(&guard, &pending).is_err());
+        assert!(cleanup_staged_members(&guard, &pending, &stage).is_err());
+
+        // Matching pending, vanished stage dir with non-empty history -> refuses.
+        entry.pending = pending.clone();
+        entry.parent = absent_stage.clone();
+        std::fs::write(
+            &jpath,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        assert!(cleanup_staged_members(&guard, &pending, &absent_stage).is_err());
+
+        // Matching pending, parent inode drift -> refuses.
+        entry.parent = stage.clone();
+        entry.parent_inode = Some(stage_meta.ino().wrapping_add(1));
+        std::fs::write(
+            &jpath,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        assert!(cleanup_staged_members(&guard, &pending, &stage).is_err());
+
+        // Unreadable journal (symlink) -> stage_journal_present fails closed.
+        std::fs::remove_file(&jpath).unwrap();
+        std::os::unix::fs::symlink("foreign", &jpath).unwrap();
+        assert!(stage_journal_present(&paths).is_err());
+        std::fs::remove_file(&jpath).unwrap();
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

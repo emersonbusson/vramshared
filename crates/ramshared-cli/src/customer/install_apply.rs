@@ -39,7 +39,7 @@ use super::package_selector::{
 };
 use super::package_source::stream::{MemoryObservation, MemoryRequirement};
 use super::package_source::{DeclaredBundle, MEMBER_LIMIT, StreamVerifiedBundle};
-use super::package_stage_journal::clear_stage_journal;
+use super::package_stage_journal::{cleanup_staged_members, clear_stage_journal};
 use super::package_transition::{PackageObservation, begin_verified_package_held};
 use super::package_tree::clear_tree_journal;
 use super::package_trust::{
@@ -774,7 +774,7 @@ fn finish_committed_apply(
     if let Err(err) = cleanup_owned_prior_approvals(&env.approval_dir, approved_ver) {
         let _ = writeln!(stdout, "{err}");
     }
-    clear_stage_artifacts(stage_root);
+    cleanup_staged_members(admitted.guard(), pending, stage_root)?;
     clear_all_package_journals(admitted.guard(), pending)?;
     let _ = std::marker::PhantomData::<SystemUnitHost>;
     Ok(CommittedInstall {
@@ -808,15 +808,8 @@ fn rollback_failed_apply(
     if let Some((path, id)) = prepared_release_loc {
         remove_owned_unselected_release(&path, id, selector)?;
     }
-    clear_stage_artifacts(stage_root);
+    cleanup_staged_members(guard, pending, stage_root)?;
     clear_all_package_journals(guard, pending)
-}
-
-pub(super) fn clear_stage_artifacts(stage_root: &Path) {
-    for role in ["ramshared", "ramsharedd"] {
-        let _ = std::fs::remove_file(stage_root.join(role));
-    }
-    let _ = std::fs::remove_dir_all(stage_root);
 }
 
 pub(super) fn clear_all_package_journals(

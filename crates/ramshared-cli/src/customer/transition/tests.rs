@@ -652,19 +652,74 @@ fn package_pending_binds_a_bounded_target_and_reads_legacy_records() {
         serde_json::from_str::<PackagePending>(&legacy).unwrap(),
         pending
     );
-    for invalid in ["", " v1", "v1\nother", "v1\0"] {
+    for invalid in [
+        "",
+        " v1",
+        "v1\nother",
+        "v1\0",
+        ".",
+        "..",
+        "../v1",
+        "releases/v1",
+        "/v1",
+        "v1\\v2",
+        ".hidden",
+    ] {
         pending.target_release = Some(invalid.into());
-        assert!(enroll_pending(&guard, &pending).is_err());
+        assert!(
+            enroll_pending(&guard, &pending).is_err(),
+            "enroll_pending must refuse invalid target_release {invalid:?}"
+        );
         assert!(read_pending(&paths).unwrap().is_none());
     }
     pending.target_release = Some("a".repeat(crate::release_identity::MAX_IDENTITY_LINE_BYTES + 1));
     assert!(enroll_pending(&guard, &pending).is_err());
     assert!(read_pending(&paths).unwrap().is_none());
+    for valid in ["v1", "v1.0.4", "v0.15.0-rc.1"] {
+        assert!(
+            super::is_single_component_release_name(valid),
+            "valid single-component release name {valid:?} must be accepted"
+        );
+    }
     pending.target_release = Some("v1".into());
     enroll_pending(&guard, &pending).unwrap();
     assert_eq!(read_pending(&paths).unwrap(), Some(pending));
     drop(guard);
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_pending_refuses_traversal_and_separator_target_release() {
+    let root = fixture();
+    let paths = TransitionPaths::under(&root);
+    fs::create_dir_all(paths.transactions_root()).unwrap();
+    let (old_hash, new_hash) = hashes("candidate");
+    for invalid in [".", "..", "../escape", "nested/v1", "/etc", "a\\b", ".dot"] {
+        let pending = PackagePending {
+            target_release: Some(invalid.into()),
+            action: PackageAction::Upgrade,
+            old_hash: old_hash.clone(),
+            new_hash: new_hash.clone(),
+            issued_unix: 9,
+        };
+        let journal = paths
+            .transactions_root()
+            .join(TransitionPaths::pending_file_name());
+        let encoded = serde_json::to_vec(&pending).unwrap();
+        fs::write(&journal, &encoded).unwrap();
+        let refused =
+            read_pending(&paths).expect_err("persisted non-single-component release must fail");
+        assert_eq!(refused.reason, CustomerReason::UnsupportedSurface);
+        assert_eq!(
+            fs::read(&journal).unwrap(),
+            encoded,
+            "refusal must preserve persisted pending journal bytes"
+        );
+        let refused_activate = acquire_transition(OperationOwner::Setup, &paths)
+            .expect_err("non-package mutation must fail closed on corrupt pending journal");
+        assert_eq!(refused_activate.reason, CustomerReason::UnsupportedSurface);
+    }
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Reading a persisted record applies the same strict identity contract as

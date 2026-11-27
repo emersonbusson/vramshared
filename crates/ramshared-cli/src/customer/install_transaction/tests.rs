@@ -2745,3 +2745,93 @@ fn attended_install_recognizes_active_upgrade_preserves_config_and_reactivates_t
     assert!(shared.borrow().active_managed_swap);
     assert_eq!(shared.borrow().active.get(CASCADE_UNIT), Some(&true));
 }
+
+#[test]
+fn stage_cleanup_preserves_unowned_foreign_content() {
+    let root = std::env::temp_dir().join(format!("ramshared-foreign-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+    let stage = root.join("staging");
+    std::fs::create_dir(&stage).unwrap();
+    std::fs::write(stage.join("foreign"), b"keep").unwrap();
+    let paths = TransitionPaths::under(&root.join("tx"));
+    std::fs::create_dir_all(paths.transactions_root()).unwrap();
+    let guard = acquire_transition(OperationOwner::Package, &paths).unwrap();
+    let pending = PackagePending {
+        target_release: Some("v1".into()),
+        action: PackageAction::Install,
+        old_hash: "0".repeat(64),
+        new_hash: "a".repeat(64),
+        issued_unix: 1,
+    };
+    enroll_pending(&guard, &pending).unwrap();
+    assert!(
+        super::super::package_stage_journal::cleanup_staged_members(&guard, &pending, &stage)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(stage.join("foreign")).unwrap(), b"keep");
+    std::fs::remove_file(stage.join("foreign")).unwrap();
+    super::super::package_stage_journal::cleanup_staged_members(&guard, &pending, &stage).unwrap();
+    assert!(stage.is_dir());
+    drop(guard);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconcile_rollback_refuses_traversal_target_release_and_preserves_outside_dir() {
+    let base = std::env::temp_dir().join(format!(
+        "ramshared-reconcile-traversal-target-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let _guard_dir = Fixture(base.clone());
+    let env = test_env(&base);
+    std::fs::create_dir_all(env.releases_dir()).unwrap();
+    std::fs::create_dir_all(env.transition.transactions_root()).unwrap();
+
+    let outside = env.product_root.join("escape-target");
+    std::fs::create_dir_all(&outside).unwrap();
+    let sentinel = outside.join("keep.txt");
+    std::fs::write(&sentinel, b"do-not-delete").unwrap();
+
+    let tampered = PackagePending {
+        target_release: Some("../escape-target".into()),
+        action: PackageAction::Upgrade,
+        old_hash: "a".repeat(64),
+        new_hash: "b".repeat(64),
+        issued_unix: 42,
+    };
+    let pending_path = env
+        .transition
+        .transactions_root()
+        .join(TransitionPaths::pending_file_name());
+    let raw = serde_json::to_vec(&tampered).unwrap();
+    std::fs::write(&pending_path, &raw).unwrap();
+
+    let mut units = FakeUnitHost::inactive_all();
+    let boot = FakeBootHost::default();
+    let mut mem = live_test_memory;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let rc = run_with(
+        &["--reconcile-rollback".into()],
+        &env,
+        &mut units,
+        &boot,
+        &mut mem,
+        &mut out,
+        &mut err,
+    );
+    assert_ne!(rc, 0, "tampered traversal target_release must be refused");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"do-not-delete",
+        "outside directory must remain intact"
+    );
+    assert_eq!(
+        std::fs::read(&pending_path).unwrap(),
+        raw,
+        "pending journal must remain intact for forensic inspection"
+    );
+}

@@ -12,9 +12,7 @@
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 
-use super::super::install_apply::{
-    clear_all_package_journals, clear_stage_artifacts, verify_candidate_trust,
-};
+use super::super::install_apply::{clear_all_package_journals, verify_candidate_trust};
 use super::super::install_args::InstallRequest;
 use super::super::install_drain::InstallerLock;
 use super::super::install_fs::fs_error;
@@ -25,6 +23,7 @@ use super::super::package_selector::{
     remove_owned_unselected_release,
 };
 use super::super::package_source::DeclaredBundle;
+use super::super::package_stage_journal::cleanup_staged_members;
 use super::super::package_tree::rollback::observe_owned_root;
 use super::super::transition::{
     CustomerTransitionGuard, OperationOwner, PackagePending, acquire_transition, read_pending,
@@ -92,7 +91,7 @@ fn reconcile_complete(
         && let Some(plan) = lock.package_recovery_plan(pending)?
     {
         drain::settle_package(req, env, guard, pending, lock, plan, unit_host, boot_host)?;
-        clear_stage_artifacts(&env.stage_dir());
+        cleanup_staged_members(guard, pending, &env.stage_dir())?;
         clear_all_package_journals(guard, pending)?;
         let _ = writeln!(stdout, "NBD_INSTALL_STATE=RECONCILED_COMPLETE");
         return Ok(());
@@ -117,13 +116,17 @@ fn reconcile_complete(
             ));
         }
     } else {
-        let target_ver = pending.target_release.as_deref().ok_or_else(|| {
-            fs_error(
-                CustomerReason::RecoveryRequired,
-                "NBD_INSTALL_REASON=RECONCILE_TARGET_MISSING",
-                CustomerState::RecoveryRequired,
-            )
-        })?;
+        let target_ver = pending
+            .target_release
+            .as_deref()
+            .filter(|version| super::super::transition::is_single_component_release_name(version))
+            .ok_or_else(|| {
+                fs_error(
+                    CustomerReason::RecoveryRequired,
+                    "NBD_INSTALL_REASON=RECONCILE_TARGET_MISSING",
+                    CustomerState::RecoveryRequired,
+                )
+            })?;
         let releases_meta = std::fs::metadata(env.releases_dir()).map_err(|_| {
             fs_error(
                 CustomerReason::RecoveryRequired,
@@ -160,7 +163,7 @@ fn reconcile_complete(
     }
     unit_host.daemon_reload()?;
     unit_host.sync_selected_release()?;
-    clear_stage_artifacts(&env.stage_dir());
+    cleanup_staged_members(guard, pending, &env.stage_dir())?;
     clear_all_package_journals(guard, pending)?;
     let _ = writeln!(stdout, "NBD_INSTALL_STATE=RECONCILED_COMPLETE");
     Ok(())
@@ -172,6 +175,15 @@ fn reconcile_rollback(
     pending: &PackagePending,
     stdout: &mut dyn Write,
 ) -> Result<(), CustomerError> {
+    if pending
+        .target_release
+        .as_deref()
+        .is_some_and(|version| !super::super::transition::is_single_component_release_name(version))
+    {
+        return Err(super::super::transition::recovery_refusal(
+            "pending target release is not a single path component",
+        ));
+    }
     let tree = observe_owned_root(guard, pending, &env.releases_dir())?;
     if inspect_effect_journal(&env.transition)?.is_some() {
         let _ = reconcile_selector(guard, pending, SelectorRecoveryAction::Rollback, None, None)?;
@@ -179,7 +191,7 @@ fn reconcile_rollback(
     if let Some(tree) = tree {
         remove_owned_unselected_release(tree.path(), tree.identity(), &env.selector_path())?;
     }
-    clear_stage_artifacts(&env.stage_dir());
+    cleanup_staged_members(guard, pending, &env.stage_dir())?;
     clear_all_package_journals(guard, pending)?;
     let _ = writeln!(stdout, "NBD_INSTALL_STATE=RECONCILED_ROLLBACK");
     Ok(())
