@@ -139,10 +139,26 @@ jobs:
 
       - name: Package Arch Linux PKGBUILD Tarball
         run: |
-          tar -czf artifacts/packages/ramshared-arch.tar.gz \
-            packaging/arch/PKGBUILD \
-            packaging/arch/ramshared.install \
-            packaging/systemd/65-ramshared-observability.rules
+          set -euo pipefail
+          source scripts/package/package-product-version.sh
+          version=$(ramshared_workspace_product_version "$PWD")
+          test "$RELEASE_TAG" = "v$version"
+
+          stage=$(mktemp -d)
+          trap 'rm -rf -- "$stage"' EXIT
+          arch="$stage/packaging/arch"
+          mkdir -p "$arch" "$stage/packaging/systemd"
+          source_archive="$arch/ramshared-$version.tar.gz"
+          git archive --format=tar --prefix="ramshared-$version/" HEAD | gzip -n > "$source_archive"
+          digest=$(sha256sum "$source_archive")
+          digest=${digest%% *}
+          sed -e "s/^pkgver=.*/pkgver=$version/" \
+            -e 's|^source=.*|source=("$pkgname-$pkgver.tar.gz")|' \
+            -e "s/^_source_sha256=.*/_source_sha256='$digest'/" \
+            packaging/arch/PKGBUILD > "$arch/PKGBUILD"
+          cp packaging/arch/ramshared.install "$arch/"
+          cp packaging/systemd/65-ramshared-observability.rules "$stage/packaging/systemd/"
+          tar -czf artifacts/packages/ramshared-arch.tar.gz -C "$stage" packaging
 
       - name: Generate Checksums
         working-directory: artifacts/packages
