@@ -106,7 +106,7 @@ fn vm_report_refuses_ambiguous_missing_malformed_and_excess_data() {
 fn vm_native_projection_bounds_and_required_fields_are_enforced() {
     let valid: serde_json::Value =
         serde_json::from_str(&row(ID, "VirtualMachine", "Linux", "Running")).unwrap();
-    for field in ["SystemType", "State", "RuntimeId", "Id"] {
+    for field in ["SystemType", "RuntimeId", "Id"] {
         let mut missing = valid.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(
@@ -210,6 +210,29 @@ fn vm_guid_parser_accepts_canonical_braces_and_refuses_malformed_input() {
 #[test]
 fn native_vm_command_refuses_a_non_windows_host() {
     assert_eq!(ramshared_winsvc::vm_identity::inspect_command(), 2);
+}
+
+#[test]
+fn hcs_created_vm_with_omitted_state_does_not_block_running_wsl() {
+    let created = serde_json::json!({
+        "Id": "11111111-2222-3333-4444-555555555555",
+        "RuntimeId": "11111111-2222-3333-4444-555555555555",
+        "SystemType": "VirtualMachine",
+        "Owner": "VMMS"
+    });
+    let running = serde_json::json!({
+        "Id": ID, "RuntimeId": ID, "SystemType": "VirtualMachine", "State": "Running"
+    });
+    let observation = serde_json::to_vec(&[created.clone(), running]).unwrap();
+    let systems = project_systems(&observation).unwrap();
+    assert_eq!(systems.len(), 1);
+    assert_eq!(systems[0].runtime_id, parse_guid(ID).unwrap());
+    assert_eq!(systems[0].os_classification, VmOsClassification::Omitted);
+    assert!(
+        project_systems(&serde_json::to_vec(&[created]).unwrap())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
