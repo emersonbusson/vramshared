@@ -19,7 +19,7 @@ use super::super::CustomerError;
 use super::super::package_trust::VerifiedSignature;
 use super::super::transition::{
     CustomerTransitionGuard, OperationOwner, PackagePending, TransitionPaths, read_journal_body,
-    read_pending, recovery_refusal,
+    read_pending, recovery_refusal, validate_pending_identity,
 };
 use super::super::transition_custody::{open_directory_no_follow, validate_directory};
 use super::effect::{
@@ -54,7 +54,20 @@ pub(in crate::customer) fn inspect_effect_journal(
     };
     let parsed: SelectorEffectRecord = serde_json::from_str(&body)
         .map_err(|_| recovery_refusal("selector effect journal is malformed; retain evidence"))?;
-    if parsed.schema != 1 || parsed.staging_name.is_empty() || parsed.staging_name.contains('/') {
+    let target_confined = !parsed.target.as_os_str().is_empty()
+        && parsed
+            .target
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    let staging_confined = !parsed.staging_name.is_empty()
+        && !matches!(parsed.staging_name.as_str(), "." | "..")
+        && !parsed.staging_name.contains('/')
+        && !parsed.staging_name.contains('\\');
+    if parsed.schema != 1
+        || !staging_confined
+        || !target_confined
+        || validate_pending_identity(&parsed.pending).is_err()
+    {
         return Err(recovery_refusal(
             "selector effect journal fields are invalid; retain evidence",
         ));
@@ -367,19 +380,7 @@ pub(in crate::customer) fn remove_owned_unselected_release(
     expected_identity: Identity,
     selector: &Path,
 ) -> Result<(), CustomerError> {
-    if let Some(parent_path) = selector.parent().filter(|p| p.is_absolute())
-        && let Some(leaf) = selector.file_name()
-        && let Ok(Some(parent)) = open_directory_no_follow(parent_path, false)
-        && let Ok(st) = statat(&parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
-        && rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink
-        && let Ok(link) = rustix::fs::readlinkat(&parent, leaf, Vec::new())
-        && let Ok(link_str) = link.to_str()
-        && parent_path.join(link_str) == release_path
-    {
-        return Err(recovery_refusal(
-            "refusing removal of actively selected release directory",
-        ));
-    }
+    require_unselected(selector, expected_identity)?;
     let parent_dir_path = release_path
         .parent()
         .filter(|p| p.is_absolute())
@@ -417,6 +418,41 @@ pub(in crate::customer) fn remove_owned_unselected_release(
     releases_parent
         .sync_all()
         .map_err(|_| recovery_refusal("cannot sync releases parent after cleanup"))
+}
+
+fn require_unselected(selector: &Path, candidate: Identity) -> Result<(), CustomerError> {
+    let parent_path = selector
+        .parent()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| recovery_refusal("selector parent is invalid"))?;
+    let leaf = selector
+        .file_name()
+        .ok_or_else(|| recovery_refusal("selector name is invalid"))?;
+    let parent = open_directory_no_follow(parent_path, false)?
+        .ok_or_else(|| recovery_refusal("selector parent is unavailable"))?;
+    let entry = match statat(&parent, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(entry) => entry,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(_) => return Err(recovery_refusal("selector is unavailable")),
+    };
+    if rustix::fs::FileType::from_raw_mode(entry.st_mode) != rustix::fs::FileType::Symlink {
+        return Err(recovery_refusal("selector is not a symlink"));
+    }
+    let link = rustix::fs::readlinkat(&parent, leaf, Vec::new())
+        .map_err(|_| recovery_refusal("selector target is unavailable"))?;
+    let target = link
+        .to_str()
+        .map_err(|_| recovery_refusal("selector target is not UTF-8"))?;
+    let target = parent_path.join(target);
+    let selected = open_directory_no_follow(&target, false)?
+        .ok_or_else(|| recovery_refusal("selected release is unavailable"))?;
+    let metadata = selected
+        .metadata()
+        .map_err(|_| recovery_refusal("selected release identity is unavailable"))?;
+    if (metadata.dev(), metadata.ino()) == candidate {
+        return Err(recovery_refusal("refusing removal of selected release"));
+    }
+    Ok(())
 }
 
 fn clear_dir_recursive(dir: &File) -> Result<(), CustomerError> {
