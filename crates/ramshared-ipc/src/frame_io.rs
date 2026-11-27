@@ -76,7 +76,13 @@ pub fn read_frame<R: std::io::Read>(
 
 /// `read_exact` that distinguishes "peer closed early" from other stream
 /// failures, so a truncated frame is never mistaken for a clean empty body.
-fn read_exact_checked<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> Result<(), FrameError> {
+///
+/// Reused by both legacy framed control I/O and fixed-buffer pooled cache I/O
+/// (SPEC: the protocol specification §DT-4).
+pub(crate) fn read_exact_checked<R: std::io::Read>(
+    r: &mut R,
+    buf: &mut [u8],
+) -> Result<(), FrameError> {
     let mut filled = 0usize;
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {

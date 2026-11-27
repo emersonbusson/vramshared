@@ -11,6 +11,7 @@
 //!
 
 pub mod budget_observation;
+pub mod cache_wire;
 pub mod deadline;
 mod frame_io;
 pub mod gpu_catalog;
