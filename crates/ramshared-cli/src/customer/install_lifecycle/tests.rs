@@ -14,6 +14,8 @@ use super::*;
 use crate::customer::install_args::{InstallMode, InstallRequest};
 use crate::customer::install_units::UnitRuntimeStatus;
 
+mod native_observation;
+
 struct FakeUnits {
     states: BTreeMap<String, UnitRuntimeStatus>,
 }
@@ -220,6 +222,66 @@ fn observe_systemd_runtime_maps_active_enabled_and_boot_enrollment() {
 }
 
 #[test]
+fn legacy_unenrolled_install_observes_missing_prerequisites_only_while_inert() {
+    struct UnavailableBoot;
+    impl BootPolicyHost for UnavailableBoot {
+        fn enable_unit(&self, _unit: &str) -> Result<(), String> {
+            panic!("observation must never enable a unit")
+        }
+        fn disable_unit(&self, _unit: &str) -> Result<(), String> {
+            panic!("observation must never disable a unit")
+        }
+        fn unit_is_enabled(&self, unit: &str) -> Result<bool, String> {
+            Err(format!("{unit} unavailable"))
+        }
+    }
+    let mut units = FakeUnits {
+        states: [SUPERVISOR_UNIT, HOST_GATE_UNIT]
+            .into_iter()
+            .map(|unit| {
+                (
+                    unit.to_owned(),
+                    UnitRuntimeStatus {
+                        active_state: "inactive".to_owned(),
+                        file_state: String::new(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    assert_eq!(
+        observe_systemd_runtime(&units, &UnavailableBoot, false).unwrap(),
+        LiveRuntimeState::default()
+    );
+    assert!(observe_systemd_runtime(&units, &UnavailableBoot, true).is_err());
+    units.states.remove(HOST_GATE_UNIT);
+    assert!(observe_systemd_runtime(&units, &UnavailableBoot, false).is_err());
+}
+
+#[test]
+fn prepare_upgrade_quiesces_and_restores_a_standalone_host_gate() {
+    let mut lifecycle = FakeLifecycle::default();
+    let prior = LiveRuntimeState {
+        host_gate_active: true,
+        ..LiveRuntimeState::default()
+    };
+    assert!(prior.needs_upgrade_quiescence());
+    let PrepareUpgradeOutcome::Ready(saved) =
+        prepare_upgrade_from_state(prior, &mut lifecycle, false).unwrap()
+    else {
+        panic!("expected quiescence");
+    };
+    assert_eq!(lifecycle.events, [format!("stop:{HOST_GATE_UNIT}")]);
+    assert!(saved.was_host_gate_active);
+    lifecycle.events.clear();
+    assert_eq!(
+        restore_runtime(&saved, &mut lifecycle),
+        ActivationOutcome::Off
+    );
+    assert_eq!(lifecycle.events, [format!("start:{HOST_GATE_UNIT}")]);
+}
+
+#[test]
 fn activate_installed_units_starts_in_strict_order_and_fails_closed() {
     let mut host = FakeLifecycle::default();
     assert_eq!(
@@ -277,6 +339,7 @@ fn seamless_auto_update_defers_with_zero_mutations_when_drain_is_unsafe() {
         live: LiveRuntimeState {
             cascade_active: false,
             supervisor_active: true,
+            host_gate_active: false,
             health_active: true,
             health_enabled: true,
             boot_enrolled: true,
@@ -320,6 +383,7 @@ fn seamless_auto_update_drains_quiesces_and_reactivates_on_success() {
         live: LiveRuntimeState {
             cascade_active: true,
             supervisor_active: true,
+            host_gate_active: false,
             health_active: true,
             health_enabled: true,
             boot_enrolled: true,
@@ -372,6 +436,7 @@ fn seamless_auto_update_restores_prior_units_and_tiers_on_apply_failure() {
     let quiescence = UpgradeQuiescenceState {
         was_active: true,
         was_supervisor_active: true,
+        was_host_gate_active: false,
         was_boot_enrolled: true,
         was_health_active: true,
         was_health_enabled: true,
@@ -440,6 +505,7 @@ fn seamless_auto_update_handles_health_only_and_partial_disable_rollback() {
         live: LiveRuntimeState {
             cascade_active: false,
             supervisor_active: false,
+            host_gate_active: false,
             health_active: true,
             health_enabled: true,
             boot_enrolled: false,
@@ -490,6 +556,7 @@ fn seamless_auto_update_handles_health_only_and_partial_disable_rollback() {
     let mut failed_stop = FakeLifecycle {
         live: LiveRuntimeState {
             supervisor_active: true,
+            host_gate_active: false,
             health_active: true,
             ..Default::default()
         },

@@ -67,6 +67,117 @@ impl BootPolicyHost for FakeBootHost {
 }
 
 #[test]
+fn recovery_reuses_only_exact_approval_and_enrollment_tokens() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root =
+        std::env::temp_dir().join(format!("ramshared-token-recovery-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let _fixture = Fixture(root.clone());
+    let release = "v1.2.3";
+    let activation = root.join("activate-v1.2.3.token");
+    let ack = root.join("wsl2-nbd-ack-v1.2.3.token");
+    let host = FakeBootHost::all_disabled();
+
+    assert!(recover_activation_approval(&root, "../bad", Posture::Swap).is_err());
+    assert!(recover_enrollment(&host, &root, "../bad").is_err());
+    recover_activation_approval(&root, release, Posture::Writeback).unwrap();
+    let identity = std::fs::metadata(&activation).unwrap().ino();
+    recover_activation_approval(&root, release, Posture::Writeback).unwrap();
+    assert_eq!(std::fs::metadata(&activation).unwrap().ino(), identity);
+    assert!(recover_activation_approval(&root, release, Posture::Swap).is_err());
+    assert_eq!(std::fs::metadata(&activation).unwrap().ino(), identity);
+
+    recover_enrollment(&host, &root, release).unwrap();
+    let identity = std::fs::metadata(&ack).unwrap().ino();
+    recover_enrollment(&host, &root, release).unwrap();
+    assert_eq!(std::fs::metadata(&ack).unwrap().ino(), identity);
+    assert!(host.unit_is_enabled(HEALTH_UNIT).unwrap());
+    std::fs::remove_file(&ack).unwrap();
+    std::os::unix::fs::symlink(&activation, &ack).unwrap();
+    assert!(recover_enrollment(&host, &root, release).is_err());
+    assert!(std::fs::symlink_metadata(&ack).unwrap().is_symlink());
+
+    let failed = FakeBootHost {
+        fail_enable: Some(CASCADE_UNIT.to_owned()),
+        ..FakeBootHost::all_disabled()
+    };
+    assert!(recover_enrollment(&failed, &root, "v2.0.0").is_err());
+    assert!(!root.join("wsl2-nbd-ack-v2.0.0.token").exists());
+}
+
+#[test]
+fn recovered_boot_enable_failure_preserves_existing_acknowledgment() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = std::env::temp_dir().join(format!(
+        "ramshared-enrollment-custody-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let _fixture = Fixture(root.clone());
+    let release = "v1.2.3";
+    let token = root.join("wsl2-nbd-ack-v1.2.3.token");
+    let body = acknowledgment_body(release);
+    std::fs::write(&token, &body).unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let before = std::fs::metadata(&token).unwrap();
+
+    let mut host = FakeBootHost {
+        fail_enable: Some(HEALTH_UNIT.to_owned()),
+        ..FakeBootHost::all_disabled()
+    };
+    assert!(recover_enrollment(&host, &root, release).is_err());
+    assert!(host.state.borrow().values().all(|&enabled| !enabled));
+    assert_eq!(std::fs::metadata(&token).unwrap().ino(), before.ino());
+    assert_eq!(std::fs::read_to_string(&token).unwrap(), body);
+
+    host.fail_enable = None;
+    host.fail_observe = Some(HEALTH_UNIT.to_owned());
+    let error = recover_enrollment(&host, &root, release).unwrap_err();
+    assert!(error.detail.contains("synthetic observe failure"));
+    assert!(host.state.borrow().values().all(|&enabled| !enabled));
+    assert_eq!(std::fs::metadata(&token).unwrap().ino(), before.ino());
+
+    host.fail_observe = None;
+    recover_enrollment(&host, &root, release).unwrap();
+    assert!(host.state.borrow().values().all(|&enabled| enabled));
+    let after = std::fs::metadata(&token).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert_eq!(after.mode() & 0o7777, 0o400);
+    assert_eq!(std::fs::read_to_string(&token).unwrap(), body);
+}
+
+#[test]
+fn incomplete_boot_rollback_keeps_new_acknowledgment_for_recovery() {
+    let root = std::env::temp_dir().join(format!(
+        "ramshared-enrollment-incomplete-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let _fixture = Fixture(root.clone());
+    let release = "v1.2.3";
+    let token = root.join("wsl2-nbd-ack-v1.2.3.token");
+    let mut host = FakeBootHost {
+        fail_enable: Some(CASCADE_UNIT.to_owned()),
+        fail_disable: Some(HEALTH_UNIT.to_owned()),
+        ..FakeBootHost::all_disabled()
+    };
+
+    let error = recover_enrollment(&host, &root, release).unwrap_err();
+    assert!(error.detail.contains("ENROLLMENT_RESTORE_FAILED"));
+    assert_eq!(
+        std::fs::read_to_string(&token).unwrap(),
+        acknowledgment_body(release)
+    );
+
+    host.fail_enable = None;
+    host.fail_disable = None;
+    recover_enrollment(&host, &root, release).unwrap();
+    assert!(host.state.borrow().values().all(|&enabled| enabled));
+}
+
+#[test]
 fn approval_token_publishes_mode_0400_refuses_existing_and_rolls_back_safely() {
     let base = std::env::temp_dir().join(format!("ramshared-tokens-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);

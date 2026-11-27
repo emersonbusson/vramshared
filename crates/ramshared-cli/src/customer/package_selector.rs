@@ -20,7 +20,9 @@ mod transformation;
 mod tree_custody;
 #[cfg(test)]
 pub(super) use effect::{SelectorEffectHooks, publish_sealed_selector_with_hooks};
-pub(super) use effect::{SelectorEffectPhase, effect_journal_present, publish_sealed_selector};
+pub(super) use effect::{
+    SelectorEffectPhase, SelectorEffectRecord, effect_journal_present, publish_sealed_selector,
+};
 pub(super) use intent::record_prepared_intent;
 #[cfg(test)]
 pub(super) use intent::record_prepared_intent_with_hook;
@@ -28,7 +30,7 @@ pub(super) use intent::record_prepared_intent_with_hook;
 pub(super) use reconciliation::SelectorRecoveryOutcome;
 pub(super) use reconciliation::{
     SelectorRecoveryAction, inspect_effect_journal, reconcile_selector,
-    remove_owned_unselected_release,
+    remove_owned_unselected_release, settle_observed_publication,
 };
 pub(super) use sealing::finalize_and_seal_release;
 #[cfg(test)]

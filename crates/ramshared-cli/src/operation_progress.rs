@@ -181,7 +181,15 @@ pub(crate) fn read_live_operation_progress_from(
     now_unix_ms: u64,
 ) -> Option<OperationProgressV1> {
     let bytes = read_bounded_regular_file(path)?;
-    let record: OperationProgressV1 = serde_json::from_slice(&bytes).ok()?;
+    parse_live_operation_progress(&bytes, proc_root, now_unix_ms)
+}
+
+pub(crate) fn parse_live_operation_progress(
+    bytes: &[u8],
+    proc_root: &Path,
+    now_unix_ms: u64,
+) -> Option<OperationProgressV1> {
+    let record: OperationProgressV1 = serde_json::from_slice(bytes).ok()?;
     if !validate_record_shape(&record) {
         return None;
     }

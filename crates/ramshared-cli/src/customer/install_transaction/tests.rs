@@ -9,18 +9,20 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::process::geteuid;
 
+use super::super::install_units::MANAGED_UNITS;
+use super::super::transition::{OperationOwner, PackagePending, read_pending};
 use super::*;
 use crate::cascade::boot_policy_effect::{
     CASCADE_UNIT, HEALTH_UNIT, HOST_GATE_UNIT, SUPERVISOR_UNIT,
 };
 use crate::customer::install_fs::digest;
-use crate::customer::install_units::{UnitRuntimeStatus, WORKLOADS_SLICE_UNIT};
+use crate::customer::install_units::UnitRuntimeStatus;
 use crate::customer::package::{
     ManifestFormat, ManifestKind, ManifestMember, tests::pinned_manifest,
 };
@@ -30,8 +32,14 @@ use crate::customer::package_stage_journal::clear_stage_journal;
 use crate::customer::package_tree::clear_tree_journal;
 use crate::customer::transition::{PackageAction, acquire_transition, enroll_pending};
 use crate::installed_image::observe_installed_input_bundle_digest;
+use crate::installed_image::verify_release_manifest;
 use ramshared_block::platform::{PlatformKind, probe_platform};
 use ramshared_tier::memory_headroom::{HostSample, HostScope, MemorySample};
+
+mod committed_runtime;
+mod pending_selection;
+mod rollback_interruption;
+mod selector_effects;
 
 struct Fixture(PathBuf);
 impl Drop for Fixture {
@@ -249,7 +257,10 @@ fn build_signed_bundle(home: &Path, bundle: &Path, release_ver: &str, suffix: &[
         .find(|m| m.role == "ramshared-cascade.service")
         .unwrap()
         .clone();
-    for extra_unit in [HEALTH_UNIT, WORKLOADS_SLICE_UNIT] {
+    for extra_unit in MANAGED_UNITS
+        .into_iter()
+        .filter(|&unit| unit != CASCADE_UNIT)
+    {
         let mut u = unit_sample.clone();
         u.role = extra_unit.to_owned();
         u.source = format!("packaging/systemd/{extra_unit}");
@@ -510,7 +521,7 @@ fn real_openpgp_end_to_end_install_rollback_upgrade_and_auto_update() {
     .unwrap();
     std::fs::set_permissions(&env.default_policy, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let ver1 = "v0.15.0-10-gaaaa1111";
+    let ver1 = "v1.0.3-rc.10";
     let b1 = env.default_bundle_root.join("pkg-1/release");
     let sha1 = build_signed_bundle(&home, &b1, ver1, b"v1");
     let mut mem = || live_test_memory();
@@ -657,8 +668,61 @@ fn real_openpgp_end_to_end_install_rollback_upgrade_and_auto_update() {
     );
     assert!(read_pending(&env.transition).unwrap().is_none());
 
+    // The scheduled updater can encounter an older signed stable release.
+    let older = env.default_bundle_root.join("older/release");
+    let _older_hash = build_signed_bundle(&home, &older, "v1.0.2", b"older");
+    for (path, secs) in [(&b1, 1_700_000_000), (&older, 1_700_000_050)] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+    let reloads = units.reloads;
+    out.clear();
+    err.clear();
+    assert_eq!(
+        run_with(
+            &["--auto-update".into(), "--json".into()],
+            &env,
+            &mut units,
+            &boot,
+            &mut mem,
+            &mut out,
+            &mut err,
+        ),
+        0,
+        "{}",
+        String::from_utf8_lossy(&err),
+    );
+    let scheduled: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(scheduled["state"], "up_to_date");
+    assert_eq!(scheduled["running"], ver1);
+    assert_eq!(scheduled["candidate"], "v1.0.2");
+    assert_eq!(
+        run_with(
+            &[
+                "--auto-update".into(),
+                "--bundle-root".into(),
+                env.default_bundle_root.display().to_string(),
+            ],
+            &env,
+            &mut units,
+            &boot,
+            &mut mem,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        ),
+        4,
+    );
+    assert_eq!(units.reloads, reloads);
+    assert!(read_pending(&env.transition).unwrap().is_none());
+    assert_eq!(
+        observe_installed_input_bundle_digest(&env.selector_path()).as_deref(),
+        Some(sha1.as_str()),
+    );
+
     // 4. Full OpenPGP Upgrade via --auto-update from ver1 -> ver2!
-    let ver2 = "v0.15.0-11-gbbbb2222";
+    let ver2 = "v1.0.3";
     let b2 = env.default_bundle_root.join("pkg-2/release");
     let sha2 = build_signed_bundle(&home, &b2, ver2, b"v2");
     for (p, secs) in [(&b1, 1_700_000_000i64), (&b2, 1_700_000_100i64)] {
@@ -693,6 +757,7 @@ fn real_openpgp_end_to_end_install_rollback_upgrade_and_auto_update() {
         0
     );
     let chk_val: serde_json::Value = serde_json::from_slice(&chk_out).unwrap();
+    assert_eq!(chk_val["order"], "newer");
     assert_eq!(chk_val["update_available"], true);
     assert_eq!(chk_val["trust"], "verified");
 
@@ -803,11 +868,9 @@ fn real_openpgp_end_to_end_install_rollback_upgrade_and_auto_update() {
         4
     );
 
-    // 6. Attended --reconcile-rollback clears an interrupted pending + release directory cleanly.
+    // 6. Rollback clears an interrupted pending record before tree creation.
     let ver3 = "v0.15.0-12-gcccc3333";
     let g = acquire_transition(OperationOwner::Package, &env.transition).unwrap();
-    let orphan_dir = env.releases_dir().join(ver3);
-    std::fs::create_dir_all(&orphan_dir).unwrap();
     enroll_pending(
         &g,
         &PackagePending {
@@ -834,7 +897,6 @@ fn real_openpgp_end_to_end_install_rollback_upgrade_and_auto_update() {
         0
     );
     assert!(String::from_utf8_lossy(&rec_out).contains("RECONCILED_ROLLBACK"));
-    assert!(!orphan_dir.exists());
     assert!(read_pending(&env.transition).unwrap().is_none());
 }
 
@@ -1325,10 +1387,44 @@ fn install_args_plan_reconcile_and_apply_error_paths_cover_all_refusals() {
         0
     );
 
-    // Simulated interruption right after sealing & publishing ver3 -> --reconcile-complete recovers!
+    // Interrupt an occupied upgrade after publication and partway through enrollment.
     let ver3 = "v0.15.0-22-geeee3333";
     let b3 = base.join("isolated-v3/release");
     let sha3 = build_signed_bundle(&home, &b3, ver3, b"v3");
+    let upgrade_args = vec![
+        "--approve-nbd-product-install".into(),
+        ver3.into(),
+        "--approve-manifest-sha256".into(),
+        sha3.clone(),
+        "--lower-sink".into(),
+        base.join("sink").display().to_string(),
+        "--posture".into(),
+        "writeback".into(),
+        "--enroll-default".into(),
+        "--bundle-root".into(),
+        b3.display().to_string(),
+        "--previous-bundle".into(),
+        b2.display().to_string(),
+    ];
+    let (_, drain) = verify_install(
+        &parse_install_args(&upgrade_args).unwrap(),
+        &env,
+        &units,
+        None,
+    )
+    .unwrap();
+    let lock = InstallerLock::acquire(&env.transition).unwrap();
+    lock.fixture_record_drained(
+        drain.unwrap(),
+        crate::customer::install_lifecycle::LiveRuntimeState {
+            cascade_active: true,
+            active_managed_swap: true,
+            boot_enrolled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    lock.record_package_plan(true).unwrap();
     {
         let pending = PackagePending {
             target_release: Some(ver3.into()),
@@ -1437,12 +1533,48 @@ fn install_args_plan_reconcile_and_apply_error_paths_cover_all_refusals() {
             "2026-11-22T09:00:00Z",
         )
         .unwrap();
-        let _ =
+        crate::customer::install_units::inspect_and_stage_units(
+            sealed.root_path(),
+            Some(&env.releases_dir().join(ver2)),
+            &env.product_root,
+            &env.systemd_dir,
+            &[],
+            &mut units,
+        )
+        .unwrap();
+        let mut effect =
             crate::customer::package_selector::publish_sealed_selector(&intent, &sealed).unwrap();
+        effect.phase = crate::customer::package_selector::SelectorEffectPhase::SelectorPublished;
+        crate::customer::transition_custody::write_journal_record(
+            admitted.guard(),
+            std::ffi::OsStr::new("package-selector-effect.json"),
+            "test selector publication",
+            &serde_json::to_string(&effect).unwrap(),
+        )
+        .unwrap();
     }
+    drop(lock);
+    let ack = env.approval_dir.join(format!("wsl2-nbd-ack-{ver3}.token"));
+    std::fs::write(&ack, format!("accept-wsl2-nbd:{ver3}\n")).unwrap();
+    std::fs::set_permissions(&ack, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let reconciled_state = std::rc::Rc::new(std::cell::RefCell::new(SharedSystemdState {
+        retain_drain_custody: true,
+        enabled: BTreeMap::from([(HOST_GATE_UNIT.to_owned(), true)]),
+        ..Default::default()
+    }));
+    let mut recovery_units = StatefulUnitHost {
+        state: reconciled_state.clone(),
+    };
+    let recovery_boot = StatefulBootHost {
+        state: reconciled_state.clone(),
+    };
+    let mut recovery_lifecycle = StatefulLifecycleHost {
+        state: reconciled_state.clone(),
+    };
     let mut rc_out = Vec::new();
+    let mut rc_err = Vec::new();
     assert_eq!(
-        run_with(
+        run_with_lifecycle(
             &[
                 "--reconcile-complete".into(),
                 "--bundle-root".into(),
@@ -1451,16 +1583,28 @@ fn install_args_plan_reconcile_and_apply_error_paths_cover_all_refusals() {
                 keyring.to_str().unwrap().into(),
             ],
             &env,
-            &mut units,
-            &boot,
+            &mut recovery_units,
+            &recovery_boot,
+            &mut recovery_lifecycle,
             &mut mem,
             &mut rc_out,
-            &mut Vec::new(),
+            &mut rc_err,
         ),
-        0
+        0,
+        "{}",
+        String::from_utf8_lossy(&rc_err)
     );
     assert!(String::from_utf8_lossy(&rc_out).contains("RECONCILED_COMPLETE"));
+    assert!(String::from_utf8_lossy(&rc_out).contains("ACTIVATION=ACTIVE"));
     assert!(read_pending(&env.transition).unwrap().is_none());
+    assert!(reconciled_state.borrow().active_managed_swap);
+    assert!(
+        InstallerLock::acquire(&env.transition)
+            .unwrap()
+            .active_inputs()
+            .unwrap()
+            .is_none()
+    );
 
     // Simulate effect journal present for --reconcile-rollback, and test broken selector symlink + missing binary.
     let _ = sha1;
@@ -1511,392 +1655,6 @@ fn install_args_plan_reconcile_and_apply_error_paths_cover_all_refusals() {
             &mut Vec::new(),
         ),
         4
-    );
-}
-
-#[test]
-fn install_transaction_plan_root_untrusted_and_reconcile_effect_edges() {
-    use std::os::unix::fs::symlink;
-
-    let base = std::env::temp_dir().join(format!("ramshared-tx-edges-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(base.join("etc")).unwrap();
-    std::fs::create_dir_all(base.join("systemd")).unwrap();
-    std::fs::create_dir_all(base.join("sink")).unwrap();
-    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::set_permissions(base.join("etc"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _fix = Fixture(base.clone());
-
-    let env = test_env(&base);
-    let home = base.join("gnupg");
-    let keyring = base.join("etc/release-keyring.gpg");
-    let _agent = create_signing_key(&home, &keyring);
-    let sink_str = base.join("sink").to_str().unwrap().to_owned();
-    let mut mem = || live_test_memory();
-    let mut units = FakeUnitHost::inactive_all();
-    let boot = FakeBootHost::all_disabled();
-
-    // Non-root guard refusal when require_root=true (if running unprivileged).
-    if rustix::process::geteuid().as_raw() != 0 {
-        let mut root_env = test_env(&base);
-        root_env.require_root = true;
-        assert_eq!(
-            run_with(
-                &["--reconcile-rollback".into()],
-                &root_env,
-                &mut units,
-                &boot,
-                &mut mem,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            ),
-            3
-        );
-    }
-
-    // --plan via parent packages dir, missing release-manifest.json, bad RELEASE_VERSION, legacy approval in plan.
-    let ver1 = "v0.15.0-30-gffff1111";
-    let b1 = env.default_bundle_root.join("pkg-1/release");
-    let sha1 = build_signed_bundle(&home, &b1, ver1, b"e1");
-    assert_eq!(
-        run_with(
-            &[
-                "--plan".into(),
-                "--approve-legacy-unit-replacement".into(),
-                "0".repeat(64)
-            ],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        0
-    );
-    let incomplete = env.default_bundle_root.join("pkg-bad/release");
-    std::fs::create_dir_all(&incomplete).unwrap();
-    std::fs::write(incomplete.join("RELEASE_VERSION"), "v0.15.0-31-gbad0001\n").unwrap();
-    assert_eq!(
-        run_with(
-            &[
-                "--plan".into(),
-                "--bundle-root".into(),
-                incomplete.to_str().unwrap().into()
-            ],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        2
-    );
-    std::fs::write(incomplete.join("RELEASE_VERSION"), "not valid!\n").unwrap();
-    assert_eq!(
-        run_with(
-            &[
-                "--plan".into(),
-                "--bundle-root".into(),
-                incomplete.to_str().unwrap().into()
-            ],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        2
-    );
-
-    // Auto-update with untrusted keyring refuses with exit 3, and invalid RELEASE_VERSION refuses with exit 2.
-    let wrong_keyring = base.join("etc/wrong-keyring.gpg");
-    let wrong_home = base.join("gnupg-wrong");
-    let _wrong_agent = create_signing_key(&wrong_home, &wrong_keyring);
-    std::fs::write(
-        &env.default_policy,
-        format!(
-            "enabled=1\nlower_sink={sink_str}\nbundle_root={}\nrelease_keyring={}\n",
-            b1.parent().unwrap().parent().unwrap().display(),
-            wrong_keyring.display(),
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&env.default_policy, std::fs::Permissions::from_mode(0o644)).unwrap();
-    std::fs::remove_dir_all(env.default_bundle_root.join("pkg-bad")).unwrap();
-    assert_eq!(
-        run_with(
-            &["--auto-update".into()],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        3
-    );
-
-    // MemoryUnavailable during apply refuses cleanly (exit 6).
-    let mut no_mem = || None;
-    assert_eq!(
-        run_with(
-            &[
-                "--approve-nbd-product-install".into(),
-                ver1.into(),
-                "--approve-manifest-sha256".into(),
-                sha1.clone(),
-                "--lower-sink".into(),
-                sink_str.clone(),
-                "--posture".into(),
-                "writeback".into(),
-                "--keyring".into(),
-                keyring.to_str().unwrap().into(),
-                "--bundle-root".into(),
-                b1.to_str().unwrap().into(),
-            ],
-            &env,
-            &mut units,
-            &boot,
-            &mut no_mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        6
-    );
-
-    // Wrong keyring / missing release-manifest in apply.
-    assert_eq!(
-        run_with(
-            &[
-                "--approve-nbd-product-install".into(),
-                ver1.into(),
-                "--approve-manifest-sha256".into(),
-                sha1.clone(),
-                "--lower-sink".into(),
-                sink_str.clone(),
-                "--posture".into(),
-                "writeback".into(),
-                "--keyring".into(),
-                wrong_keyring.to_str().unwrap().into(),
-                "--bundle-root".into(),
-                b1.to_str().unwrap().into(),
-            ],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        3
-    );
-
-    // Install v1 cleanly so we can exercise upgrade --previous-bundle error & --reconcile-rollback with effect journal.
-    assert_eq!(
-        run_with(
-            &[
-                "--approve-nbd-product-install".into(),
-                ver1.into(),
-                "--approve-manifest-sha256".into(),
-                sha1.clone(),
-                "--lower-sink".into(),
-                sink_str.clone(),
-                "--posture".into(),
-                "writeback".into(),
-                "--keyring".into(),
-                keyring.to_str().unwrap().into(),
-                "--bundle-root".into(),
-                b1.to_str().unwrap().into(),
-            ],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        0
-    );
-
-    let ver2 = "v0.15.0-31-gffff2222";
-    let b2 = base.join("isolated/v2/release");
-    let sha2 = build_signed_bundle(&home, &b2, ver2, b"e2");
-    assert_eq!(
-        run_with(
-            &[
-                "--approve-nbd-product-install".into(),
-                ver2.into(),
-                "--approve-manifest-sha256".into(),
-                sha2.clone(),
-                "--lower-sink".into(),
-                sink_str.clone(),
-                "--posture".into(),
-                "writeback".into(),
-                "--previous-bundle".into(),
-                b2.to_str().unwrap().into(),
-                "--keyring".into(),
-                keyring.to_str().unwrap().into(),
-                "--bundle-root".into(),
-                b2.to_str().unwrap().into(),
-            ],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        ),
-        4
-    );
-
-    // Test --reconcile-rollback when selector effect journal exists!
-    {
-        let pending = PackagePending {
-            target_release: Some(ver2.into()),
-            action: PackageAction::Upgrade,
-            old_hash: sha1,
-            new_hash: sha2.clone(),
-            issued_unix: 30,
-        };
-        let mut observe = || {
-            Ok(crate::customer::package_transition::PackageObservation {
-                snapshot: crate::customer::package_admission::LifecycleSnapshot {
-                    state: CustomerState::InstalledOff,
-                    owner: crate::customer::package_admission::LifecycleOwnership::Owned,
-                    guarded_hooks: true,
-                },
-                release: crate::customer::plan::ReleaseIdentity::new(ver1),
-                old_hash: pending.old_hash.clone(),
-                new_hash: sha2.clone(),
-            })
-        };
-        let sig1 = crate::customer::package_trust::verify_bundle_with_keyring(
-            &b1,
-            &keyring,
-            env.owner_uid,
-        )
-        .unwrap();
-        let sig2 = crate::customer::package_trust::verify_bundle_with_keyring(
-            &b2,
-            &keyring,
-            env.owner_uid,
-        )
-        .unwrap();
-        let decl1 =
-            crate::customer::package_source::DeclaredBundle::open_verified(&b1, &sig1).unwrap();
-        let decl2 =
-            crate::customer::package_source::DeclaredBundle::open_verified(&b2, &sig2).unwrap();
-        let tmpl1 = decl1
-            .member(
-                "cascade.conf.example",
-                crate::release_identity::MAX_SEALED_TEXT_BYTES,
-            )
-            .unwrap();
-        let req = crate::customer::package_source::stream::MemoryRequirement {
-            work_bytes: 1024 * 1024,
-            guest_reserve_bytes: 16 * 1024 * 1024,
-            host_reserve_bytes: 16 * 1024 * 1024,
-            max_age_ms: 5000,
-        };
-        let streamed2 = decl2
-            .verify_streamed(
-                crate::customer::package_source::MEMBER_LIMIT as u64,
-                512 * 1024 * 1024,
-                &req,
-                &mut mem,
-            )
-            .unwrap();
-        let admitted = crate::customer::package_transition::begin_verified_package_held(
-            &env.transition,
-            &pending,
-            Some(&streamed2),
-            Some(&sig2),
-            &mut observe,
-            &mut mem,
-        )
-        .unwrap();
-        std::fs::create_dir_all(env.stage_dir()).unwrap();
-        let rel_meta = std::fs::metadata(env.releases_dir()).unwrap();
-        let prep_paths = crate::customer::package_prepare::PreparePaths {
-            stage: &env.stage_dir(),
-            parent: &env.releases_dir(),
-            parent_identity: (rel_meta.dev(), rel_meta.ino()),
-            name: ver2,
-            reserve_bytes: INSTALL_RESERVE_BYTES,
-        };
-        let prepared = crate::customer::package_prepare::prepare_admitted(
-            &admitted,
-            &pending,
-            &decl2,
-            &sig2,
-            &prep_paths,
-        )
-        .unwrap();
-        let sink = SinkWitness::observe(&sink_str).unwrap();
-        let prev_ev = crate::customer::package_selector::PreviousEvidence {
-            signature: &sig1,
-            transformation: Some(crate::customer::package_selector::PreviousTransformation {
-                role: "cascade.conf.example",
-                template: &tmpl1,
-                sink: &sink,
-            }),
-        };
-        let intent = crate::customer::package_selector::record_prepared_intent(
-            &admitted,
-            &pending,
-            &decl2,
-            &prepared,
-            &sig2,
-            Some(&prev_ev),
-            &env.selector_path(),
-        )
-        .unwrap();
-        let sealed = crate::customer::package_selector::finalize_and_seal_release(
-            &intent,
-            &sink,
-            "2026-11-22T09:00:00Z",
-        )
-        .unwrap();
-        let _ =
-            crate::customer::package_selector::publish_sealed_selector(&intent, &sealed).unwrap();
-    }
-    let mut rb_out = Vec::new();
-    assert_eq!(
-        run_with(
-            &["--reconcile-rollback".into()],
-            &env,
-            &mut units,
-            &boot,
-            &mut mem,
-            &mut rb_out,
-            &mut Vec::new(),
-        ),
-        0
-    );
-    assert!(String::from_utf8_lossy(&rb_out).contains("RECONCILED_ROLLBACK"));
-    assert_eq!(
-        read_release_version(&env.selector_path()).as_deref(),
-        Some(ver1)
-    );
-
-    // Also test resolve_bundle_dir when path is symlink-free absent dir -> exit 6.
-    let symlink_bad = base.join("link-release");
-    symlink(&b1, &symlink_bad).unwrap();
-    let _ = run_with(
-        &[
-            "--plan".into(),
-            "--bundle-root".into(),
-            symlink_bad.to_str().unwrap().into(),
-        ],
-        &env,
-        &mut units,
-        &boot,
-        &mut mem,
-        &mut Vec::new(),
-        &mut Vec::new(),
     );
 }
 
@@ -2168,6 +1926,7 @@ struct SharedSystemdState {
     drain_reason: String,
     fail_start_on: Option<&'static str>,
     fail_sync: bool,
+    retain_drain_custody: bool,
     events: Vec<String>,
 }
 
@@ -2234,6 +1993,14 @@ struct StatefulLifecycleHost {
 }
 
 impl LifecycleHost for StatefulLifecycleHost {
+    fn upgrade_stop(&self) -> Option<crate::customer::install_drain::systemd::SystemStop<'_>> {
+        self.state.borrow().retain_drain_custody.then(|| {
+            crate::customer::install_drain::systemd::SystemStop::new(Path::new(
+                "/test/unused-systemctl",
+            ))
+        })
+    }
+
     fn observe_live_state(
         &self,
         unit_host: &dyn UnitHost,
@@ -2738,7 +2505,7 @@ fn attended_install_recognizes_active_upgrade_preserves_config_and_reactivates_t
     let ver3 = "v0.15.0-22-gcccc3333";
     let b1 = env.default_bundle_root.join("pkg-1/release");
     let sha1 = build_signed_bundle(&home, &b1, ver1, b"u-v1");
-    let b2 = env.default_bundle_root.join("pkg-2/release");
+    let b2 = base.join("candidate-staging/pkg-2/release");
     let sha2 = build_signed_bundle(&home, &b2, ver2, b"u-v2");
     let b3 = env.default_bundle_root.join("pkg-3/release");
     let sha3 = build_signed_bundle(&home, &b3, ver3, b"u-v3");
@@ -2868,22 +2635,46 @@ fn attended_install_recognizes_active_upgrade_preserves_config_and_reactivates_t
     assert!(shared.borrow().events.is_empty());
     assert!(shared.borrow().active_managed_swap);
 
+    let upgrade_args = [
+        "--approve-nbd-product-install".into(),
+        ver2.into(),
+        "--approve-manifest-sha256".into(),
+        sha2,
+        "--lower-sink".into(),
+        sink_str.clone(),
+        "--posture".into(),
+        "writeback".into(),
+        "--bundle-root".into(),
+        b2.to_str().unwrap().into(),
+    ];
+    let archive_entry = env.default_bundle_root.join("pkg-1");
+    let hidden_entry = base.join("prior-unavailable");
+    std::fs::rename(&archive_entry, &hidden_entry).unwrap();
     out.clear();
     err.clear();
     assert_eq!(
         run_with_lifecycle(
-            &[
-                "--approve-nbd-product-install".into(),
-                ver2.into(),
-                "--approve-manifest-sha256".into(),
-                sha2,
-                "--lower-sink".into(),
-                sink_str.clone(),
-                "--posture".into(),
-                "writeback".into(),
-                "--bundle-root".into(),
-                b2.to_str().unwrap().into(),
-            ],
+            &upgrade_args,
+            &env,
+            &mut units,
+            &boot,
+            &mut lifecycle,
+            &mut mem,
+            &mut out,
+            &mut err,
+        ),
+        3
+    );
+    assert!(String::from_utf8_lossy(&err).contains("PREVIOUS_BUNDLE_UNAVAILABLE"));
+    assert!(shared.borrow().events.is_empty());
+    assert!(shared.borrow().active_managed_swap);
+    std::fs::rename(&hidden_entry, &archive_entry).unwrap();
+
+    out.clear();
+    err.clear();
+    assert_eq!(
+        run_with_lifecycle(
+            &upgrade_args,
             &env,
             &mut units,
             &boot,
@@ -2908,6 +2699,7 @@ fn attended_install_recognizes_active_upgrade_preserves_config_and_reactivates_t
     assert_eq!(shared.borrow().active.get(CASCADE_UNIT), Some(&true));
 
     // 4. Failed attended upgrade restores prior release and reactivates all units/tiers.
+    std::fs::rename(b2.parent().unwrap(), env.default_bundle_root.join("pkg-2")).unwrap();
     shared.borrow_mut().fail_sync = true;
     out.clear();
     err.clear();

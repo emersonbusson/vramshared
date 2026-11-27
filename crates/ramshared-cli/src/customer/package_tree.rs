@@ -7,6 +7,7 @@
 // File: crates/ramshared-cli/src/customer/package_tree.rs
 //! Durable ownership of an exclusive private release directory tree.
 
+pub(super) mod rollback;
 mod space;
 
 use std::collections::{BTreeMap, BTreeSet};

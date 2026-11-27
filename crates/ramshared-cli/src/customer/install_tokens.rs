@@ -31,6 +31,9 @@ use crate::readiness::Decision;
 
 const MAX_TOKEN_BYTES: usize = 512;
 
+mod recovery;
+pub(super) use recovery::{recover_activation_approval, recover_enrollment};
+
 pub(super) struct ApprovalTokenCustody {
     approval_dir: PathBuf,
     token_name: String,
@@ -85,11 +88,7 @@ pub(super) fn publish_activation_approval(
             CustomerState::InstalledOff,
         ));
     }
-    let posture_str = match posture {
-        Posture::Writeback => "writeback",
-        Posture::Swap => "swap",
-    };
-    let body = format!("activate:{release}:posture={posture_str}\n");
+    let body = approval_body(release, posture);
     let token_name = format!("activate-{release}.token");
     let dir = ensure_dir_no_follow(
         approval_dir,
@@ -118,6 +117,18 @@ pub(super) fn publish_activation_approval(
         token_name,
         token_identity: token_id,
     })
+}
+
+fn approval_body(release: &str, posture: Posture) -> String {
+    let mode = match posture {
+        Posture::Writeback => "writeback",
+        Posture::Swap => "swap",
+    };
+    format!("activate:{release}:posture={mode}\n")
+}
+
+fn acknowledgment_body(release: &str) -> String {
+    format!("accept-wsl2-nbd:{release}\n")
 }
 
 pub(super) fn cleanup_owned_prior_approvals(
@@ -165,7 +176,7 @@ pub(super) fn apply_default_enrollment(
             warning: "enrollment-acknowledgment",
         });
     }
-    let ack_body = format!("accept-wsl2-nbd:{release}\n");
+    let ack_body = acknowledgment_body(release);
     let staging = format!(".{ack_name}.{}.staging", getpid().as_raw_pid());
     let ack_id = place_atomic_regular_in_dir(
         &dir,
@@ -177,14 +188,17 @@ pub(super) fn apply_default_enrollment(
         "cannot sync approval directory",
     )?;
 
+    let acknowledgment = NewEnrollmentAcknowledgment {
+        approval_dir,
+        name: &ack_name,
+        identity: ack_id,
+    };
     if !enable_enrolled_boot_or_rollback(
         host,
-        approval_dir,
         release,
-        &ack_name,
-        ack_id,
         prior_policy,
         prior_health,
+        Some(acknowledgment),
     )? {
         return Ok(EnrollmentOutcome::Warned {
             warning: "enrollment-boot-policy",
@@ -198,14 +212,18 @@ pub(super) fn apply_default_enrollment(
     Ok(EnrollmentOutcome::Enrolled { warnings })
 }
 
+struct NewEnrollmentAcknowledgment<'a> {
+    approval_dir: &'a Path,
+    name: &'a str,
+    identity: Identity,
+}
+
 fn enable_enrolled_boot_or_rollback(
     host: &impl BootPolicyHost,
-    approval_dir: &Path,
     release: &str,
-    ack_name: &str,
-    ack_id: Identity,
     prior_policy: BootPolicyObservation,
     prior_health: bool,
+    new_acknowledgment: Option<NewEnrollmentAcknowledgment<'_>>,
 ) -> Result<bool, CustomerError> {
     let plan = BootPolicyPlan {
         policy: BootPolicy::On,
@@ -223,24 +241,18 @@ fn enable_enrolled_boot_or_rollback(
             )
         })
     }) {
-        rollback_enrollment(
-            host,
-            approval_dir,
-            ack_name,
-            ack_id,
-            prior_policy,
-            prior_health,
-        )
-        .map_err(|rb_err| {
-            token_error(
-                CustomerReason::RecoveryRequired,
-                format!(
-                    "{}; {}; NBD_INSTALL_ROLLBACK=ENROLLMENT_RESTORE_FAILED",
-                    err.detail, rb_err.detail
-                ),
-                CustomerState::RecoveryRequired,
-            )
-        })?;
+        rollback_enrollment(host, prior_policy, prior_health, new_acknowledgment).map_err(
+            |rb_err| {
+                token_error(
+                    CustomerReason::RecoveryRequired,
+                    format!(
+                        "{}; {}; NBD_INSTALL_ROLLBACK=ENROLLMENT_RESTORE_FAILED",
+                        err.detail, rb_err.detail
+                    ),
+                    CustomerState::RecoveryRequired,
+                )
+            },
+        )?;
         return Ok(false);
     }
     Ok(true)
@@ -263,17 +275,24 @@ fn cleanup_stale_ack_tokens(approval_dir: &Path, keep_name: &str) -> Result<(), 
 
 fn rollback_enrollment(
     host: &impl BootPolicyHost,
-    approval_dir: &Path,
-    ack_name: &str,
-    ack_id: Identity,
     prior_policy: BootPolicyObservation,
     prior_health: bool,
+    new_acknowledgment: Option<NewEnrollmentAcknowledgment<'_>>,
 ) -> Result<(), CustomerError> {
     restore_boot_set(host, prior_policy)?;
     if !prior_health {
-        let _ = host.disable_unit(HEALTH_UNIT);
+        host.disable_unit(HEALTH_UNIT).map_err(|detail| {
+            token_error(
+                CustomerReason::RecoveryRequired,
+                format!("cannot restore boot state for {HEALTH_UNIT}: {detail}"),
+                CustomerState::RecoveryRequired,
+            )
+        })?;
     }
-    let dir = open_directory_no_follow(approval_dir, false)?.ok_or_else(|| {
+    let Some(acknowledgment) = new_acknowledgment else {
+        return Ok(());
+    };
+    let dir = open_directory_no_follow(acknowledgment.approval_dir, false)?.ok_or_else(|| {
         token_error(
             CustomerReason::RecoveryRequired,
             "approval dir disappeared during enrollment rollback",
@@ -282,8 +301,8 @@ fn rollback_enrollment(
     })?;
     verify_and_unlink_regular_in_dir(
         &dir,
-        ack_name,
-        ack_id,
+        acknowledgment.name,
+        acknowledgment.identity,
         "acknowledgment token replaced before rollback",
         "cannot unlink acknowledgment token on rollback",
         "cannot sync approval dir after enrollment rollback",

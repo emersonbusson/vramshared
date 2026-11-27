@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Author: Emerson Busson
 // Email: emersonbusson@gmail.com
 // GitHub: https://github.com/emersonbusson
@@ -41,7 +42,7 @@ use manifest::{direct_install_metadata_path, direct_install_timestamp_path};
 pub(crate) use manifest::{
     effective_tui_reexec_origin, is_utc_timestamp, observe_installed_input_bundle_digest,
     read_installed_identity_uncached, read_versioned_release_identity, valid_sha256,
-    verify_release_manifest,
+    verify_committed_release, verify_release_manifest,
 };
 #[cfg(test)]
 use manifest::{read_direct_install_identity, read_install_timestamp_for_executable};

@@ -26,12 +26,25 @@ use super::install_fs::{
 use super::transition_custody::{open_directory_no_follow, validate_directory};
 use super::{CustomerError, CustomerReason, CustomerState};
 use crate::bounded_process::run_capture_command;
-use crate::cascade::boot_policy_effect::{CASCADE_UNIT, HEALTH_UNIT};
+use crate::cascade::boot_policy_effect::{
+    CASCADE_UNIT, HEALTH_UNIT, HOST_GATE_UNIT, SUPERVISOR_UNIT,
+};
 use crate::installed_image::valid_sha256;
 
+mod active_slice;
+
+pub(super) use active_slice::check_slice_before_drain;
+use active_slice::preserves_active_workloads_slice;
+
 pub(super) const WORKLOADS_SLICE_UNIT: &str = "ramshared-workloads.slice";
-pub(super) const MANAGED_UNITS: [&str; 3] = [CASCADE_UNIT, HEALTH_UNIT, WORKLOADS_SLICE_UNIT];
-const MAX_UNIT_FILE_BYTES: usize = 64 * 1024;
+pub(super) const MANAGED_UNITS: [&str; 5] = [
+    HOST_GATE_UNIT,
+    SUPERVISOR_UNIT,
+    CASCADE_UNIT,
+    HEALTH_UNIT,
+    WORKLOADS_SLICE_UNIT,
+];
+pub(super) const MAX_UNIT_FILE_BYTES: usize = 64 * 1024;
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,11 +237,18 @@ pub(crate) fn parse_legacy_unit_approval(raw: &str) -> Result<LegacyUnitApproval
     })
 }
 
-pub(super) fn check_units_inactive_and_disabled(host: &dyn UnitHost) -> Result<(), CustomerError> {
+fn check_units_inactive_and_disabled(
+    host: &dyn UnitHost,
+    allow_active_slice: bool,
+) -> Result<(), CustomerError> {
     for unit in MANAGED_UNITS {
         let status = host.query_unit(unit)?;
         match status.active_state.as_str() {
             "inactive" | "failed" => {}
+            "active"
+                if unit == WORKLOADS_SLICE_UNIT
+                    && status.file_state == "static"
+                    && allow_active_slice => {}
             "active" | "reloading" | "activating" | "deactivating" => {
                 return Err(unit_error(
                     CustomerReason::ActiveSession,
@@ -290,6 +310,24 @@ enum PriorUnitSpec {
     Legacy { bytes: Vec<u8>, hash: String },
 }
 
+pub(super) fn check_install_units(
+    host: &dyn UnitHost,
+    release_root: &Path,
+    prior_release_root: Option<&Path>,
+    product_root: &Path,
+    systemd_dir: &Path,
+    approvals: &[LegacyUnitApproval],
+) -> Result<(), CustomerError> {
+    let plans = plan_units(
+        release_root,
+        prior_release_root,
+        product_root,
+        systemd_dir,
+        approvals,
+    )?;
+    check_units_inactive_and_disabled(host, preserves_active_workloads_slice(&plans))
+}
+
 pub(super) fn validate_unit_plan(
     release_root: &Path,
     prior_release_root: Option<&Path>,
@@ -343,7 +381,6 @@ pub(super) fn inspect_and_stage_units_with_hooks(
     host: &mut dyn UnitHost,
     hooks: &mut UnitInstallHooks<'_>,
 ) -> Result<UnitInstallCustody, CustomerError> {
-    check_units_inactive_and_disabled(host)?;
     let plans = plan_units(
         release_root,
         prior_release_root,
@@ -351,6 +388,7 @@ pub(super) fn inspect_and_stage_units_with_hooks(
         systemd_dir,
         approvals,
     )?;
+    check_units_inactive_and_disabled(host, preserves_active_workloads_slice(&plans))?;
     let needs_legacy_dir = plans
         .iter()
         .any(|p| matches!(p.prior, PriorUnitSpec::Legacy { .. }));

@@ -149,7 +149,7 @@ fn active_enabled_and_unknown_units_refuse_before_writes() {
                 file_state: file.into(),
             }),
         );
-        let err = check_units_inactive_and_disabled(&host).unwrap_err();
+        let err = check_units_inactive_and_disabled(&host, false).unwrap_err();
         assert!(err.detail.contains(expected_code), "{err}");
     }
     assert!(
@@ -203,6 +203,13 @@ fn owned_upgrade_fresh_install_and_rollback_preserve_prior_units() {
         format!("[Unit]\nDescription={WORKLOADS_SLICE_UNIT} v2\n")
     );
 
+    for unit in [HOST_GATE_UNIT, SUPERVISOR_UNIT] {
+        assert_eq!(
+            std::fs::read(sys.join(unit)).unwrap(),
+            std::fs::read(next.join("systemd").join(unit)).unwrap()
+        );
+    }
+
     // Reload + sync failure triggers full unit rollback + second daemon-reload.
     host.fail_sync = true;
     assert!(custody.reload_and_sync(&mut host).is_err());
@@ -210,6 +217,8 @@ fn owned_upgrade_fresh_install_and_rollback_preserve_prior_units() {
     assert_eq!(host.reloads, 2);
     assert!(!sys.join(CASCADE_UNIT).exists());
     assert!(!sys.join(HEALTH_UNIT).exists());
+    assert!(!sys.join(HOST_GATE_UNIT).exists());
+    assert!(!sys.join(SUPERVISOR_UNIT).exists());
     assert_eq!(
         std::fs::read_to_string(sys.join(WORKLOADS_SLICE_UNIT)).unwrap(),
         format!("[Unit]\nDescription={WORKLOADS_SLICE_UNIT} v1\n")
@@ -390,7 +399,7 @@ fn unit_status_parsing_layout_errors_and_symlink_rollback_refusals() {
     .err()
     .unwrap();
     assert!(err.detail.contains("injected failure"));
-    assert_eq!(after_link_calls, 3);
+    assert_eq!(after_link_calls, MANAGED_UNITS.len());
     assert!(!sys.join(CASCADE_UNIT).exists());
 
     // SystemUnitHost live query checks safely when querying a nonexistent unit.
@@ -436,4 +445,64 @@ fn unit_status_parsing_layout_errors_and_symlink_rollback_refusals() {
     .err()
     .unwrap();
     assert!(err_rb.detail.contains("RELEASE_RETAINED"));
+}
+
+#[test]
+fn active_static_slice_accepts_only_owned_metadata_updates() {
+    let base = std::env::temp_dir().join(format!("ramshared-active-slice-{}", std::process::id()));
+    std::fs::create_dir(&base).unwrap();
+    let _fixture = Fixture(base.clone());
+    let product = base.join("product");
+    let sys = base.join("systemd");
+    let prior = product.join("prior");
+    let release = product.join("candidate");
+    std::fs::create_dir(&sys).unwrap();
+    write_release_units(&prior, "v1");
+    write_release_units(&release, "v2");
+
+    let old = "# Public
+[Unit]
+Description=Workloads
+";
+    let new = "# Private
+# Source metadata
+[Unit]
+Description=Workloads
+";
+    let live = sys.join(WORKLOADS_SLICE_UNIT);
+    let candidate = release.join("systemd").join(WORKLOADS_SLICE_UNIT);
+    std::fs::write(prior.join("systemd").join(WORKLOADS_SLICE_UNIT), old).unwrap();
+    std::fs::write(&live, old).unwrap();
+    std::fs::write(&candidate, new).unwrap();
+    let mut host = FakeUnitHost::inactive_all();
+    host.statuses.insert(
+        WORKLOADS_SLICE_UNIT.to_owned(),
+        Ok(UnitRuntimeStatus {
+            active_state: "active".into(),
+            file_state: "static".into(),
+        }),
+    );
+
+    check_slice_before_drain(&host, &release, Some(&prior), &product, &sys, &[]).unwrap();
+    check_install_units(&host, &release, Some(&prior), &product, &sys, &[]).unwrap();
+    let mut installed =
+        inspect_and_stage_units(&release, Some(&prior), &product, &sys, &[], &mut host).unwrap();
+    assert_eq!(std::fs::read_to_string(&live).unwrap(), new);
+    installed.rollback(&mut host).unwrap();
+    assert_eq!(std::fs::read_to_string(&live).unwrap(), old);
+
+    std::fs::write(
+        &candidate,
+        "[Unit]
+Description=Changed
+",
+    )
+    .unwrap();
+    for prior_root in [Some(prior.as_path()), None] {
+        assert!(
+            check_slice_before_drain(&host, &release, prior_root, &product, &sys, &[]).is_err()
+        );
+        assert!(check_install_units(&host, &release, prior_root, &product, &sys, &[]).is_err());
+    }
+    assert_eq!(std::fs::read_to_string(&live).unwrap(), old);
 }

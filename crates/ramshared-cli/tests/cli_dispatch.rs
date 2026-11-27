@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Author: Emerson Busson
 // Email: emersonbusson@gmail.com
 // GitHub: https://github.com/emersonbusson
@@ -954,7 +955,7 @@ fn cli_install_status_and_refusals() {
 
     let no_policy = run_cli(&[
         "install",
-        "--auto-update",
+        "--check",
         "--policy",
         "/var/nonexistent-ramshared-policy/auto-update.conf",
     ]);

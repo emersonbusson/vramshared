@@ -64,12 +64,31 @@ fn is_canonical_uint(seg: &str) -> bool {
         && !(seg.len() > 1 && seg.starts_with('0'))
 }
 
-fn cmp_uint(a: &str, b: &str) -> Ordering {
-    (a.len(), a).cmp(&(b.len(), b))
+fn uint_key(value: &str) -> (usize, &str) {
+    (value.len(), value)
 }
 
-/// Parse `vMAJOR.MINOR.PATCH[-COUNT-gHASH][-dirty|+dirty]`.
-fn parse_release_parts(value: &str) -> Option<(&str, &str, &str, &str, bool)> {
+struct ReleaseParts<'a> {
+    version: [&'a str; 3],
+    rc: Option<&'a str>,
+    count: &'a str,
+    dirty: bool,
+}
+
+impl<'a> ReleaseParts<'a> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Stable releases sort after every RC with the same version numbers.
+        let rc_key = |rc: Option<&'a str>| (rc.is_none(), rc.map(uint_key));
+        self.version
+            .map(uint_key)
+            .cmp(&other.version.map(uint_key))
+            .then_with(|| rc_key(self.rc).cmp(&rc_key(other.rc)))
+            .then_with(|| uint_key(self.count).cmp(&uint_key(other.count)))
+    }
+}
+
+/// Parse `vMAJOR.MINOR.PATCH[-rc.N][-COUNT-gHASH][-dirty|+dirty]`.
+fn parse_release_parts(value: &str) -> Option<ReleaseParts<'_>> {
     if value.is_empty() || value.len() > 128 {
         return None;
     }
@@ -80,8 +99,7 @@ fn parse_release_parts(value: &str) -> Option<(&str, &str, &str, &str, bool)> {
     } else {
         (value, false)
     };
-    let (base, count) = if let Some((prefix, hash_with_g)) = core.rsplit_once('-') {
-        let hash = hash_with_g.strip_prefix('g')?;
+    let (base, count) = if let Some((prefix, hash)) = core.rsplit_once("-g") {
         if !(4..=64).contains(&hash.len()) || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
@@ -92,6 +110,11 @@ fn parse_release_parts(value: &str) -> Option<(&str, &str, &str, &str, bool)> {
         (base, count)
     } else {
         (core, "0")
+    };
+    let (base, rc) = match base.split_once("-rc.") {
+        Some((tag, rc)) if is_canonical_uint(rc) => (tag, Some(rc)),
+        Some(_) => return None,
+        None => (base, None),
     };
     let tag_nums = base.strip_prefix('v')?;
     let mut parts = tag_nums.split('.');
@@ -105,27 +128,28 @@ fn parse_release_parts(value: &str) -> Option<(&str, &str, &str, &str, bool)> {
     {
         return None;
     }
-    Some((major, minor, patch, count, is_dirty))
+    Some(ReleaseParts {
+        version: [major, minor, patch],
+        rc,
+        count,
+        dirty: is_dirty,
+    })
 }
 
 /// Strictly compares `candidate` vs `running` (`release_is_newer` single authority).
-/// Supports exact SemVer tags (`v1.0.0`, `v1.0.1`) and `git describe` strings
-/// (`v1.0.0-1-g<hash>`), refusing dirty candidates and malformed inputs.
+/// Supports stable tags, `-rc.N` tags and `git describe` identities derived from
+/// either kind of tag. Refuses dirty candidates and malformed inputs.
 pub(crate) fn release_is_newer(candidate: &str, running: &str) -> ReleaseOrder {
-    let Some((c_maj, c_min, c_pat, c_cnt, cand_dirty)) = parse_release_parts(candidate) else {
+    let Some(candidate) = parse_release_parts(candidate) else {
         return ReleaseOrder::Unknown;
     };
-    if cand_dirty {
+    if candidate.dirty {
         return ReleaseOrder::Unknown;
     }
-    let Some((r_maj, r_min, r_pat, r_cnt, _)) = parse_release_parts(running) else {
+    let Some(running) = parse_release_parts(running) else {
         return ReleaseOrder::Unknown;
     };
-    match cmp_uint(c_maj, r_maj)
-        .then_with(|| cmp_uint(c_min, r_min))
-        .then_with(|| cmp_uint(c_pat, r_pat))
-        .then_with(|| cmp_uint(c_cnt, r_cnt))
-    {
+    match candidate.cmp(&running) {
         Ordering::Greater => ReleaseOrder::Newer,
         Ordering::Less => ReleaseOrder::Older,
         Ordering::Equal => ReleaseOrder::Equal,
@@ -196,6 +220,22 @@ pub(super) fn find_newest_bundle(bundle_root: &Path) -> Result<Option<PathBuf>, 
         }
     }
     Ok(best.map(|(_, p)| p))
+}
+
+/// Look for the selected input digest in candidate staging and the policy archive.
+pub(super) fn find_previous_bundle(
+    search_root: &Path,
+    policy_path: &Path,
+    owner_uid: u32,
+    expected_manifest_sha256: &str,
+) -> Result<Option<PathBuf>, CustomerError> {
+    if let Some(path) = find_bundle_by_manifest_sha256(search_root, expected_manifest_sha256) {
+        return Ok(Some(path));
+    }
+    Ok(read_auto_update_policy(policy_path, Some(owner_uid))?
+        .and_then(|policy| policy.bundle_root)
+        .filter(|root| root != search_root)
+        .and_then(|root| find_bundle_by_manifest_sha256(&root, expected_manifest_sha256)))
 }
 
 /// Locate a signed bundle under `bundle_root` matching `expected_manifest_sha256`.
