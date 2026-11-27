@@ -541,6 +541,13 @@ fn admit_apply_transaction<'a>(
     };
     check_units(unit_host)?;
 
+    // Create the public selector's parent before its children. Implicit
+    // ancestors of the confined installer paths are created owner-only.
+    ensure_dir_no_follow(
+        &env.product_root,
+        0o755,
+        "NBD_INSTALL_REASON=PRODUCT_ROOT_INVALID",
+    )?;
     let releases_dir = ensure_dir_no_follow(
         &env.releases_dir(),
         0o755,

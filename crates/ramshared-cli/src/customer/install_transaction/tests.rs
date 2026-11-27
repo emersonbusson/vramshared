@@ -551,6 +551,7 @@ fn real_openpgp_end_to_end_install_rollback_upgrade_and_auto_update() {
         String::from_utf8_lossy(&err)
     );
     assert!(String::from_utf8_lossy(&out).contains("NBD_INSTALL_STATE=PLAN"));
+    assert!(!env.product_root.exists());
 
     // 2. Legacy unit without approval refuses; with reload/sync failure rolls back cleanly!
     let legacy_unit = env.systemd_dir.join(CASCADE_UNIT);
@@ -651,6 +652,14 @@ fn real_openpgp_end_to_end_install_rollback_upgrade_and_auto_update() {
     let out_s = String::from_utf8_lossy(&out);
     assert!(out_s.contains("NBD_INSTALL_STATE=INSTALLED"));
     assert!(out_s.contains("NBD_INSTALL_ENABLED=1"));
+    assert_eq!(
+        std::fs::metadata(&env.product_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
     assert!(
         env.approval_dir
             .join(format!("activate-{ver1}.token"))

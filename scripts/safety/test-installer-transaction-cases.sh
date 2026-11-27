@@ -42,7 +42,7 @@ test_native_installer_transaction_tests_present() {
     ! grep -Fq 'inspect_and_stage_units' "$customer_dir/install_apply.rs" ||
     ! grep -Fq 'publish_activation_approval' "$customer_dir/install_apply.rs" ||
     ! grep -Fq 'apply_default_enrollment' "$customer_dir/install_apply.rs" ||
-    ! grep -Fq 'reconcile_selector' "$customer_dir/install_transaction.rs"; then
+    ! grep -Fq 'reconcile_selector(guard, pending' "$customer_dir/install_transaction/reconciliation.rs"; then
     fail 'native_installer_transaction_tests_present missing native transaction owners'
     return
   fi

@@ -37,5 +37,6 @@ PrivateTmp=true
 # scheduled run would report NO-BUNDLE forever.
 ProtectHome=read-only
 ProtectSystem=full
-ReadWritePaths=/opt/ramshared /var/log/ramshared /etc/ramshared /etc/systemd/system
+LogsDirectory=ramshared
+ReadWritePaths=/opt/ramshared /etc/systemd/system -/etc/ramshared
 TimeoutStartSec=900

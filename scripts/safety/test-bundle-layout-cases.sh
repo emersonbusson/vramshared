@@ -78,7 +78,8 @@ test_sealed_nbd_bundle_and_lifecycle_wiring() {
   fi
   local rust_install_dir="$REPO_ROOT/crates/ramshared-cli/src/customer"
   if ! grep -Fq 'verify_declared_payload_identity' "$rust_install_dir/install_apply.rs" ||
-    ! grep -Fq 'check_units_inactive_and_disabled' "$rust_install_dir/install_apply.rs" ||
+    ! grep -Fq 'check_install_units(' "$rust_install_dir/install_apply.rs" ||
+    ! grep -Fq 'check_units_inactive_and_disabled(host' "$rust_install_dir/install_units.rs" ||
     ! grep -Fq 'publish_activation_approval' "$rust_install_dir/install_tokens.rs" ||
     ! grep -Fq 'apply_default_enrollment' "$rust_install_dir/install_tokens.rs" ||
     ! grep -Fq '0o400' "$rust_install_dir/install_tokens.rs" ||
