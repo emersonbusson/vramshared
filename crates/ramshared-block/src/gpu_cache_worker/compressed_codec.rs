@@ -259,8 +259,7 @@ impl<'p, P: VramProvider + 'p> GpuCacheWorker<'p, P> {
                 error,
                 ramshared_vram::device_codec::CodecError::DeadlineExceeded
             ) {
-                self.compressed.note_codec_timeout();
-                self.disabled = true;
+                self.disable_after_codec_deadline("compression");
             }
             return Err(codec_error_text(&error));
         }
@@ -304,8 +303,7 @@ impl<'p, P: VramProvider + 'p> GpuCacheWorker<'p, P> {
             result,
             Err(ramshared_vram::device_codec::CodecError::DeadlineExceeded)
         ) {
-            self.compressed.note_codec_timeout();
-            self.disabled = true;
+            self.disable_after_codec_deadline("decompression");
         }
         result.map_err(|error| codec_error_text(&error))
     }
