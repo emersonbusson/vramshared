@@ -15,10 +15,12 @@ RequiresMountsFor=/opt/ramshared
 
 [Service]
 Type=oneshot
-# The script refuses without /etc/ramshared/auto-update.conf, and refuses
-# again unless that file says enabled=1. This unit does not supply the
-# authorization; it only schedules the check.
-ExecStart=/opt/ramshared/current/scripts/safety/auto-update.sh
+# The native installer validates the installed update policy and release keyring.
+Environment=RAMSHARED_SCHEDULED_UPDATE=1
+ExecStart=/opt/ramshared/current/bin/ramshared install --auto-update
+# Keep failed and successful local wakes within the same bounded hold.
+ExecStopPost=/usr/bin/sleep 2
+NonBlocking=true
 Nice=19
 IOSchedulingClass=idle
 # Auto-update verifies OpenPGP trust before any effect. When the cascade is
@@ -36,4 +38,4 @@ PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=full
 ReadWritePaths=/opt/ramshared /var/log/ramshared /etc/ramshared /etc/systemd/system
-TimeoutStartSec=600
+TimeoutStartSec=900

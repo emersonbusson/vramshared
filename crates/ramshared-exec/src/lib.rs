@@ -16,6 +16,7 @@ pub mod bounded_process;
 mod capture;
 pub mod inherited_lease;
 pub mod retained_process;
+pub mod systemd_wake;
 
 pub use bounded_process::{
     BoundedOutput, DEFAULT_OUTPUT_LIMIT, ProcessSpawnError, configure_process_group,

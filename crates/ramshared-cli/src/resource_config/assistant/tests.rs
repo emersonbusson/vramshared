@@ -104,6 +104,7 @@ fn checklist_classifies_optimal_partial_and_degraded_hosts() {
         cascade_service_enabled: Some(true),
         auto_update_timer_enabled: Some(true),
         auto_update_conf: AutoUpdateFileState {
+            source: None,
             present: true,
             enabled: Some(true),
             lower_sink: Some("/mnt/c/ProgramData/RamShared/nbd-lower-sink".into()),
@@ -172,7 +173,7 @@ fn auto_update_write_preserves_keys_is_idempotent_and_refuses_symlinks() {
     let conf = dir.join("auto-update.conf");
     std::fs::write(
         &conf,
-        "enabled=0\nlower_sink=/mnt/c/ProgramData/RamShared/nbd-lower-sink\nbundle_root=/opt/ramshared/bundles\nrelease_keyring=/etc/ramshared/release-keyring.gpg\n",
+        "enabled=0\nsource=github\nlower_sink=/mnt/c/ProgramData/RamShared/nbd-lower-sink\nbundle_root=/opt/ramshared/bundles\nrelease_keyring=/etc/ramshared/release-keyring.gpg\n",
     )
     .unwrap();
 
@@ -183,6 +184,7 @@ fn auto_update_write_preserves_keys_is_idempotent_and_refuses_symlinks() {
     assert_eq!(first, second);
     assert_eq!(content_first, content_second);
     assert_eq!(first.enabled, Some(true));
+    assert_eq!(first.source.as_deref(), Some("github"));
     assert_eq!(
         first.lower_sink.as_deref(),
         Some("/mnt/c/ProgramData/RamShared/nbd-lower-sink")
@@ -211,6 +213,7 @@ fn post_install_summary_names_single_wizard_command_when_pending() {
         cascade_service_enabled: Some(true),
         auto_update_timer_enabled: Some(true),
         auto_update_conf: AutoUpdateFileState {
+            source: None,
             present: true,
             enabled: Some(true),
             ..AutoUpdateFileState::default()
@@ -241,6 +244,7 @@ fn renders_stable_text_and_json_without_tty() {
         cascade_service_enabled: Some(true),
         auto_update_timer_enabled: Some(false),
         auto_update_conf: AutoUpdateFileState {
+            source: None,
             present: true,
             enabled: Some(true),
             ..AutoUpdateFileState::default()

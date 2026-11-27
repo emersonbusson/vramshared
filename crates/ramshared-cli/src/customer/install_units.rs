@@ -32,6 +32,7 @@ use crate::cascade::boot_policy_effect::{
 use crate::installed_image::valid_sha256;
 
 mod active_slice;
+pub(super) mod update;
 
 pub(super) use active_slice::check_slice_before_drain;
 use active_slice::preserves_active_workloads_slice;
@@ -63,6 +64,9 @@ pub(super) trait UnitHost {
     fn query_unit(&self, unit: &str) -> Result<UnitRuntimeStatus, CustomerError>;
     fn daemon_reload(&mut self) -> Result<(), CustomerError>;
     fn sync_selected_release(&mut self) -> Result<(), CustomerError>;
+    fn enable_update_schedule(&mut self) -> Result<(), CustomerError> {
+        Ok(())
+    }
 }
 
 pub(super) struct SystemUnitHost;
@@ -132,6 +136,10 @@ impl UnitHost for SystemUnitHost {
             "NBD_INSTALL_REASON=SYSTEMD_DAEMON_RELOAD_FAILED",
         )
         .map(|_| ())
+    }
+
+    fn enable_update_schedule(&mut self) -> Result<(), CustomerError> {
+        update::enable()
     }
 
     fn sync_selected_release(&mut self) -> Result<(), CustomerError> {
@@ -212,7 +220,9 @@ impl UnitInstallCustody {
 pub(crate) fn parse_legacy_unit_approval(raw: &str) -> Result<LegacyUnitApproval, CustomerError> {
     let trimmed = raw.trim();
     if let Some((unit, digest_hex)) = trimmed.split_once(':') {
-        if !MANAGED_UNITS.contains(&unit) || !valid_sha256(digest_hex) {
+        if !(MANAGED_UNITS.contains(&unit) || update::UPDATE_UNITS.contains(&unit))
+            || !valid_sha256(digest_hex)
+        {
             return Err(unit_error(
                 CustomerReason::UnsupportedSurface,
                 format!("NBD_INSTALL_REASON=LEGACY_UNIT_APPROVAL_INVALID ({raw})"),
@@ -537,8 +547,12 @@ fn plan_units(
 
     check_legacy_root_absent_or_dir(product_root)?;
 
-    let mut out = Vec::with_capacity(MANAGED_UNITS.len());
-    for unit in MANAGED_UNITS {
+    let update_group = update::group_for_install(&release_units_dir, prior_units_dir.as_ref())?;
+    let mut out = Vec::with_capacity(MANAGED_UNITS.len() + update_group.len());
+    for unit in MANAGED_UNITS
+        .into_iter()
+        .chain(update_group.iter().copied())
+    {
         let new_bytes =
             read_bounded_regular_at(&release_units_dir, OsStr::new(unit), MAX_UNIT_FILE_BYTES)
                 .ok_or_else(|| {

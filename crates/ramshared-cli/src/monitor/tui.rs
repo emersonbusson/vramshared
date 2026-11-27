@@ -7,6 +7,7 @@
 //! Interactive ratatui event loop and update re-exec handling.
 
 mod handoff;
+mod update_wake;
 
 use super::*;
 #[cfg(all(unix, test))]
@@ -33,6 +34,7 @@ pub(super) fn run_tui(options: &MonitorOptions) -> Result<(), MonitorError> {
     let mut allow_reexec = true;
     let mut runtime_notice = None;
     let mut active_handoff = read_handoff_env();
+    update_wake::notify(process_origin, active_handoff.is_some());
 
     loop {
         let mut terminal = ratatui::init();

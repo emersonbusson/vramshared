@@ -49,10 +49,12 @@ use crate::release_identity::read_release_version;
 mod published_source;
 mod reconciliation;
 mod runtime_recovery;
+mod scheduled;
 use reconciliation::{
     finish_pending_drain, prepare_timer_runtime_request, recovered_request, run_reconcile,
 };
 use runtime_recovery::resume_committed_install;
+pub(crate) use scheduled::SOCKET_PATH;
 
 pub(super) const INSTALL_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -121,7 +123,18 @@ pub(crate) fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Writ
     let env = InstallEnvironment::production();
     let mut unit_host = SystemUnitHost;
     let boot_host = SystemBootPolicyHost;
-    let mut lifecycle = SystemLifecycleHost::production();
+    let scheduled = scheduled::is_invocation(args);
+    if scheduled {
+        match scheduled::prepare(&env) {
+            Ok(false) => return 0,
+            Ok(true) => {}
+            Err(err) => {
+                let _ = writeln!(stderr, "{err}");
+                return err.exit_code();
+            }
+        }
+    }
+    let mut lifecycle = SystemLifecycleHost::production(scheduled);
     let mut host_mem_cache = WslInstallHostMemoryCache::new();
     let mut live_mem = || host_mem_cache.observe_install_memory();
     run_with_lifecycle(

@@ -20,8 +20,12 @@ name = "ramshared_exec"
 path = "src/lib.rs"
 
 [dependencies]
+libc = "0.2"
 rustix = { version = "1.1.4", features = ["process", "fs"] }
 
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+[dev-dependencies]
+tempfile = "3.27.0"

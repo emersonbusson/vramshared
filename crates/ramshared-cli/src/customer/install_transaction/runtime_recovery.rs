@@ -24,6 +24,7 @@ use super::super::install_lifecycle::{
     observe_committed_activation,
 };
 use super::super::install_tokens::EnrollmentOutcome;
+use super::super::install_units::update::{UPDATE_SOCKET_UNIT, UPDATE_UNITS, arm_if_enrolled};
 use super::super::install_units::{MANAGED_UNITS, MAX_UNIT_FILE_BYTES, UnitHost};
 use super::super::package_trust::VerifiedSignature;
 use super::super::release_ordering::read_enrolled_posture;
@@ -42,7 +43,7 @@ pub(super) fn resume_committed_install(
     env: &InstallEnvironment,
     lock: Option<&InstallerLock>,
     signature: Option<&VerifiedSignature>,
-    unit_host: &dyn UnitHost,
+    unit_host: &mut dyn UnitHost,
     boot_host: &dyn BootPolicyHost,
     lifecycle: &mut dyn LifecycleHost,
     stdout: &mut dyn Write,
@@ -92,6 +93,20 @@ pub(super) fn resume_committed_install(
     let activation = observe_committed_activation(unit_host, inputs.no_activate)?;
     verify_selected_runtime(env, &inputs, &witness, posture)?;
     lock.clear_finished(Some(&inputs), true)?;
+    if env.require_root
+        && let Err(err) = arm_if_enrolled(
+            &env.releases_dir().join(&inputs.candidate_release),
+            &env.default_policy,
+            env.owner_uid,
+            unit_host,
+        )
+    {
+        let _ = writeln!(
+            stdout,
+            "NBD_INSTALL_WARNING=update-schedule: {}",
+            err.detail
+        );
+    }
     Ok(Some((committed, activation)))
 }
 
@@ -130,7 +145,9 @@ pub(super) fn verify_committed_selection(
     .ok_or_else(|| recovery_refusal("committed release seal no longer verifies"))?;
     let unit_dir = open_directory_no_follow(&env.systemd_dir, false)?
         .ok_or_else(|| recovery_refusal("committed systemd directory is missing"))?;
-    for unit in MANAGED_UNITS {
+    let update = hashes.contains_key(&format!("systemd/{UPDATE_SOCKET_UNIT}"));
+    let update_group = UPDATE_UNITS.into_iter().filter(|_| update);
+    for unit in MANAGED_UNITS.into_iter().chain(update_group) {
         let expected = hashes.get(&format!("systemd/{unit}"));
         if expected.is_none()
             || read_bounded_regular_at(&unit_dir, OsStr::new(unit), MAX_UNIT_FILE_BYTES)

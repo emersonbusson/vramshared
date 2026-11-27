@@ -178,6 +178,7 @@ unit|ramshared-workloads-cron.slice|0644|scripts/safety/systemd/ramshared-worklo
 unit|ramshared-host-gate.service|0644|scripts/safety/systemd/ramshared-host-gate.service|deb,bundle,rpm,arch|
 unit|ramshared-supervisor.service|0644|scripts/safety/systemd/ramshared-supervisor.service|deb,bundle,rpm,arch|
 unit|ramshared-auto-update.service|0644|scripts/safety/systemd/ramshared-auto-update.service|deb,bundle,rpm,arch|
+unit|ramshared-auto-update.socket|0644|scripts/safety/systemd/ramshared-auto-update.socket|deb,bundle,rpm,arch|
 unit|ramshared-auto-update.timer|0644|scripts/safety/systemd/ramshared-auto-update.timer|deb,bundle,rpm,arch|
 unit-template|ramshared-cron-workload.service.in|0644|scripts/safety/systemd/ramshared-cron-workload.service.in|deb,bundle,rpm,arch|
 dropin|docker.service.d/10-ramshared-control.conf|0644|scripts/safety/systemd/docker.service.d/10-ramshared-control.conf|deb,bundle,rpm,arch|

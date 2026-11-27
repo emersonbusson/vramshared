@@ -30,13 +30,15 @@ const UNIT_OP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(in crate::customer) struct SystemLifecycleHost {
     systemctl_bin: std::path::PathBuf,
     systemd_marker: std::path::PathBuf,
+    scheduled: bool,
 }
 
 impl SystemLifecycleHost {
-    pub(in crate::customer) fn production() -> Self {
+    pub(in crate::customer) fn production(scheduled: bool) -> Self {
         Self {
             systemctl_bin: std::path::PathBuf::from(resolve_systemctl_bin()),
             systemd_marker: std::path::PathBuf::from("/run/systemd/system"),
+            scheduled,
         }
     }
 
@@ -48,6 +50,7 @@ impl SystemLifecycleHost {
         Self {
             systemctl_bin,
             systemd_marker,
+            scheduled: false,
         }
     }
 
@@ -133,7 +136,7 @@ fn run_systemctl_unit_with(
 
 impl LifecycleHost for SystemLifecycleHost {
     fn upgrade_stop(&self) -> Option<SystemStop<'_>> {
-        Some(SystemStop::new(&self.systemctl_bin))
+        Some(SystemStop::new(&self.systemctl_bin).with_scheduled_window(self.scheduled))
     }
 
     fn observe_live_state(
