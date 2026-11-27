@@ -102,8 +102,9 @@ pub fn project_systems(bytes: &[u8]) -> Result<Vec<VmIdentity>, String> {
         if row.system_type != "VirtualMachine" {
             continue;
         }
-        let state = row.state.ok_or("native VM state is unavailable")?;
-        if state != "Running" {
+        // HCS omits State for some created VMs. A route always requires
+        // an explicit Running state, including for an unclassified guest.
+        if row.state.as_deref() != Some("Running") {
             continue;
         }
         if row.stopped == Some(true) {
