@@ -12,8 +12,8 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::IoError;
 
-const STRIPES: usize = 256;
-const STRIPE_BYTES: u64 = 64 * 1024;
+pub(super) const STRIPES: usize = 256;
+pub(super) const STRIPE_BYTES: u64 = 64 * 1024;
 
 pub(super) struct RangeLocks([RwLock<()>; STRIPES]);
 
@@ -24,7 +24,11 @@ impl Default for RangeLocks {
 }
 
 impl RangeLocks {
-    fn touched(offset: u64, len: usize) -> [bool; STRIPES] {
+    pub(super) fn stripe_index(offset: u64) -> usize {
+        ((offset / STRIPE_BYTES) % STRIPES as u64) as usize
+    }
+
+    pub(super) fn touched(offset: u64, len: usize) -> [bool; STRIPES] {
         let mut selected = [false; STRIPES];
         if len == 0 {
             return selected;

@@ -150,3 +150,40 @@ fn inventory_serialized_shape_preserves_cli_records() {
         serde_json::json!({"mount_id":41,"parent_mount_id":1,"major_minor":"8:0","root":"/","mountpoint":"/data","mount_options":["rw"],"filesystem":"ext4","source":"/dev/vda","super_options":["rw"],"read_only":false,"total_bytes":100,"available_bytes":80,"capacity_observed_unix_ms":1000,"host_backing":null})
     );
 }
+
+#[test]
+fn hyperv_vmbus_scsi_disk_without_tran_qualifies_while_unknown_null_tran_refuses() {
+    let json = r#"{"blockdevices":[
+        {"name":"sdc","path":"/dev/sdc","type":"disk","size":4294967296,"fstype":"ext4","uuid":"818f7adf-11ac-476c-b390-5dafd250e56d","mountpoints":["/origin"],"maj:min":"8:32","wwn":"0x60022480ae6f672eb5a12a0030df5092","ro":false,"rm":false,"tran":null,"subsystems":"block:scsi:vmbus:acpi","model":"Virtual Disk"},
+        {"name":"sdd","path":"/dev/sdd","type":"disk","size":4294967296,"fstype":"ext4","uuid":"11111111-1111-1111-1111-111111111111","mountpoints":["/mystery"],"maj:min":"8:48","wwn":"0x60022480111111111111111111111111","ro":false,"rm":false,"tran":null,"subsystems":"block:unknown","model":"Unknown"}
+    ]}"#;
+    let devices = parse_lsblk_json(json).unwrap();
+    assert_eq!(devices[0].transport.as_deref(), Some("scsi"));
+    assert_eq!(devices[1].transport, None);
+
+    let ok_mount = MountInfo {
+        mount_id: 50,
+        parent_mount_id: 1,
+        major_minor: "8:32".into(),
+        root: "/".into(),
+        mountpoint: "/origin".into(),
+        mount_options: vec!["rw".into()],
+        filesystem: "ext4".into(),
+        source: "/dev/sdc".into(),
+        super_options: vec!["rw".into()],
+        read_only: false,
+        total_bytes: Some(4_000_000_000),
+        available_bytes: Some(3_000_000_000),
+        capacity_observed_unix_ms: Some(1000),
+        host_backing: None,
+    };
+    assert!(origin_mount_eligibility(&devices[0], &ok_mount).is_ok());
+
+    let bad_mount = MountInfo {
+        major_minor: "8:48".into(),
+        mountpoint: "/mystery".into(),
+        source: "/dev/sdd".into(),
+        ..ok_mount
+    };
+    assert!(origin_mount_eligibility(&devices[1], &bad_mount).is_err());
+}
