@@ -1,0 +1,21 @@
+# Author: Emerson Busson
+# Email: emersonbusson@gmail.com
+# GitHub: https://github.com/emersonbusson
+# LinkedIn: https://www.linkedin.com/in/emersonbusson
+# Source: https://github.com/emersonbusson/vramshared
+# File: scripts/safety/systemd/ramshared-auto-update.socket
+[Unit]
+Description=Local activation socket for signed RamShared updates
+PartOf=ramshared-auto-update.timer
+
+[Socket]
+ListenStream=/run/ramshared-update/wake.sock
+DirectoryMode=0755
+SocketMode=0222
+Backlog=1
+FileDescriptorName=update-wake
+FlushPending=yes
+RemoveOnStop=yes
+TriggerLimitIntervalSec=0
+PollLimitIntervalSec=2s
+PollLimitBurst=1

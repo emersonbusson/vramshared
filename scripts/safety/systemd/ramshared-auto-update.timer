@@ -7,6 +7,8 @@
 [Unit]
 Description=Check for a newer RamShared sealed release
 Documentation=file:///opt/ramshared/current/RELEASE_VERSION
+Wants=ramshared-auto-update.socket
+After=ramshared-auto-update.socket
 
 [Timer]
 # Off-minute on purpose: a fleet of hosts that all check at :00 stampedes

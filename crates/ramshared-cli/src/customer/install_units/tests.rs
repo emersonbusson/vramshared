@@ -506,3 +506,41 @@ Description=Changed
     }
     assert_eq!(std::fs::read_to_string(&live).unwrap(), old);
 }
+
+#[test]
+fn signed_update_group_is_atomic_and_legacy_bundles_remain_installable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let product = base.join("product");
+    let sys = base.join("systemd");
+    let prior = base.join("prior");
+    let candidate = base.join("candidate");
+    write_release_units(&prior, "prior");
+    write_release_units(&candidate, "candidate");
+    std::fs::create_dir(&sys).unwrap();
+    let mut host = FakeUnitHost::inactive_all();
+
+    let legacy = plan_units(&candidate, Some(&prior), &product, &sys, &[]).unwrap();
+    assert_eq!(legacy.len(), MANAGED_UNITS.len());
+    std::fs::write(
+        candidate.join("systemd").join(update::UPDATE_SOCKET_UNIT),
+        b"socket",
+    )
+    .unwrap();
+    assert!(plan_units(&candidate, Some(&prior), &product, &sys, &[]).is_err());
+    for unit in update::UPDATE_UNITS {
+        std::fs::write(candidate.join("systemd").join(unit), unit).unwrap();
+    }
+    let mut placed =
+        inspect_and_stage_units(&candidate, Some(&prior), &product, &sys, &[], &mut host).unwrap();
+    for unit in update::UPDATE_UNITS {
+        assert_eq!(std::fs::read(sys.join(unit)).unwrap(), unit.as_bytes());
+    }
+    assert!(plan_units(&prior, Some(&candidate), &product, &sys, &[]).is_err());
+    placed.rollback(&mut host).unwrap();
+    assert!(
+        update::UPDATE_UNITS
+            .iter()
+            .all(|unit| !sys.join(unit).exists())
+    );
+}

@@ -82,6 +82,7 @@ pub(crate) struct ChecklistItem {
 pub(crate) struct AutoUpdateFileState {
     pub(crate) present: bool,
     pub(crate) enabled: Option<bool>,
+    pub(crate) source: Option<String>,
     pub(crate) lower_sink: Option<String>,
     pub(crate) bundle_root: Option<String>,
     pub(crate) release_keyring: Option<String>,
@@ -508,6 +509,7 @@ pub(crate) fn parse_auto_update_conf(text: &str) -> AutoUpdateFileState {
                     _ => None,
                 };
             }
+            "source" if !v.is_empty() => state.source = Some(v.to_string()),
             "lower_sink" if !v.is_empty() => state.lower_sink = Some(v.to_string()),
             "bundle_root" if !v.is_empty() => state.bundle_root = Some(v.to_string()),
             "release_keyring" if !v.is_empty() => state.release_keyring = Some(v.to_string()),
@@ -520,6 +522,9 @@ pub(crate) fn parse_auto_update_conf(text: &str) -> AutoUpdateFileState {
 pub(crate) fn render_auto_update_conf(existing: &AutoUpdateFileState, enabled: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "enabled={}", if enabled { 1 } else { 0 });
+    if let Some(source) = existing.source.as_deref() {
+        let _ = writeln!(out, "source={source}");
+    }
     if let Some(sink) = existing.lower_sink.as_deref() {
         let _ = writeln!(out, "lower_sink={sink}");
     }

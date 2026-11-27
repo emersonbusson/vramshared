@@ -541,6 +541,13 @@ fn admit_apply_transaction<'a>(
     };
     check_units(unit_host)?;
 
+    // Create the public selector's parent before its children. Implicit
+    // ancestors of the confined installer paths are created owner-only.
+    ensure_dir_no_follow(
+        &env.product_root,
+        0o755,
+        "NBD_INSTALL_REASON=PRODUCT_ROOT_INVALID",
+    )?;
     let releases_dir = ensure_dir_no_follow(
         &env.releases_dir(),
         0o755,
@@ -690,7 +697,7 @@ pub(super) fn execute_verified_apply(
                         recovery_err(format!("cannot retain committed runtime: {error}"))
                     })?;
             }
-            finish_committed_apply(
+            let committed = finish_committed_apply(
                 env,
                 &prior,
                 &selector,
@@ -701,7 +708,22 @@ pub(super) fn execute_verified_apply(
                 inputs.posture,
                 enroll_outcome,
                 stdout,
-            )
+            )?;
+            if env.require_root
+                && let Err(err) = super::install_units::update::arm_if_enrolled(
+                    &env.releases_dir().join(inputs.approved_ver),
+                    &env.default_policy,
+                    env.owner_uid,
+                    unit_host,
+                )
+            {
+                let _ = writeln!(
+                    stdout,
+                    "NBD_INSTALL_WARNING=update-schedule: {}",
+                    err.detail
+                );
+            }
+            Ok(committed)
         }
         Err(err) => {
             match rollback_failed_apply(

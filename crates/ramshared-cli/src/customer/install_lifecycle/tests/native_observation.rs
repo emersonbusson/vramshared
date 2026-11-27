@@ -15,7 +15,7 @@ use crate::customer::install_units::SystemUnitHost;
 #[test]
 #[ignore = "requires root and live systemd; observes the installer without changing services"]
 fn native_lifecycle_reports_the_current_drain_admission() {
-    let host = SystemLifecycleHost::production();
+    let host = SystemLifecycleHost::production(false);
     let units = SystemUnitHost;
     let boot = SystemBootPolicyHost;
     let stop = host.upgrade_stop().unwrap();

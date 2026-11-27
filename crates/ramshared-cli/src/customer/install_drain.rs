@@ -39,7 +39,6 @@ use systemd::{ObservedUnit, StopHost, StopProcess, WaitForProgress};
 const RECEIPT_NAME: &str = "upgrade-drain.json";
 const RECEIPT_LABEL: &str = "upgrade drain receipt";
 const LOCK_NAME: &str = "installer.lock";
-const OBSERVATION_WINDOW: Duration = Duration::from_secs(180);
 const STALL_WINDOW: Duration = Duration::from_secs(45);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 static STAGING_SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -498,7 +497,7 @@ impl InstallerLock {
                         progress.observe(Instant::now(), process, systemd.progress().as_ref());
                     }
                     let now = Instant::now();
-                    if progress.expired(now, OBSERVATION_WINDOW, STALL_WINDOW) {
+                    if progress.expired(now, systemd.observation_window(), STALL_WINDOW) {
                         return Ok(DrainOutcome::Deferred(format!("DRAIN_PENDING_JOB_{job}")));
                     }
                     std::thread::sleep(POLL_INTERVAL);

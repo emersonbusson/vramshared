@@ -78,11 +78,15 @@ pub(in crate::customer) trait StopHost {
     fn observe(&self) -> Result<ObservedUnit, CustomerError>;
     fn no_managed_lifecycle(&self) -> bool;
     fn progress(&self) -> Option<OperationProgressV1>;
+    fn observation_window(&self) -> Duration {
+        Duration::from_secs(180)
+    }
 }
 
 pub(in crate::customer) struct SystemStop<'a> {
     systemctl: &'a Path,
     unit: &'a str,
+    scheduled: bool,
 }
 
 impl<'a> SystemStop<'a> {
@@ -90,11 +94,21 @@ impl<'a> SystemStop<'a> {
         Self {
             systemctl,
             unit: CASCADE_UNIT,
+            scheduled: false,
         }
+    }
+
+    pub(in crate::customer) fn with_scheduled_window(mut self, scheduled: bool) -> Self {
+        self.scheduled = scheduled;
+        self
     }
 }
 
 impl StopHost for SystemStop<'_> {
+    fn observation_window(&self) -> Duration {
+        Duration::from_secs(if self.scheduled { 540 } else { 180 })
+    }
+
     fn submit(&self) -> Result<NonZeroU32, CustomerError> {
         let mut cmd = Command::new("/usr/bin/busctl");
         cmd.args([
@@ -267,6 +281,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_scheduled_updater_extends_the_hard_drain_observation_window() {
+        let normal = SystemStop::new(Path::new("/usr/bin/true"));
+        assert_eq!(normal.observation_window(), Duration::from_secs(180));
+        let scheduled = normal.with_scheduled_window(true);
+        assert_eq!(scheduled.observation_window(), Duration::from_secs(540));
+    }
+
+    #[test]
     fn parses_the_exact_systemd_job_reply_and_unit_state() {
         let reply = r#"{"type":"o","data":["/org/freedesktop/systemd1/job/14491"]}"#;
         assert_eq!(job_from_reply(reply).unwrap().get(), 14491);
@@ -403,6 +425,7 @@ mod tests {
         start.args(["start", "--", &unit.name]);
         capture(&mut start, "start disposable installer test unit").unwrap();
         let host = SystemStop {
+            scheduled: false,
             systemctl: Path::new("/usr/bin/systemctl"),
             unit: &unit.name,
         };

@@ -171,7 +171,8 @@ test_native_installer_admission_tests_present() {
   local customer_dir="$REPO_ROOT/crates/ramshared-cli/src/customer"
   if ! grep -Fq 'verify_candidate_trust' "$customer_dir/install_apply.rs" ||
     ! grep -Fq 'verify_declared_payload_identity' "$customer_dir/install_apply.rs" ||
-    ! grep -Fq 'check_units_inactive_and_disabled' "$customer_dir/install_apply.rs" ||
+    ! grep -Fq 'check_install_units(' "$customer_dir/install_apply.rs" ||
+    ! grep -Fq 'check_units_inactive_and_disabled(host' "$customer_dir/install_units.rs" ||
     ! grep -Fq 'read_enrolled_posture' "$customer_dir/install_transaction.rs" ||
     ! grep -Fq 'validate_unit_plan' "$customer_dir/install_units.rs"; then
     fail 'native_installer_admission_tests_present missing expected Rust owners'

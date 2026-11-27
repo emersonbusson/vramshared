@@ -89,7 +89,8 @@ pub(super) fn ensure_dir_no_follow(
         .map_err(|e| unsup_err(format!("{error_tag}: {}", e.detail)))?
         .ok_or_else(|| unsup_err(error_tag))?;
     if !existed {
-        let _ = fchmod(&dir, Mode::from_raw_mode(mode));
+        fchmod(&dir, Mode::from_raw_mode(mode))
+            .map_err(|e| unsup_err(format!("{error_tag}: cannot set directory mode: {e}")))?;
     }
     validate_directory(&dir, error_tag)
         .map_err(|e| unsup_err(format!("{error_tag}: {}", e.detail)))?;
