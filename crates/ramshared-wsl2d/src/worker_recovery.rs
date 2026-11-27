@@ -11,6 +11,7 @@ use super::{
     WorkerProcessControl, WorkerSpawnParams, worker_startup,
 };
 use ramshared_block::{AuthoritativeOriginBackend, DisabledCache, FileOrigin, IpcCacheClient};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -102,6 +103,7 @@ pub(super) fn reap_exited_gpu_worker(runtime: &mut IsolatedWorkerRuntime) {
 pub(super) fn gpu_cache_unavailable_reason(
     state: OriginCacheState,
     worker_exited: bool,
+    exit: Option<(u32, ExitStatus)>,
 ) -> Option<String> {
     if !worker_exited
         || matches!(
@@ -111,10 +113,16 @@ pub(super) fn gpu_cache_unavailable_reason(
     {
         return None;
     }
-    Some(format!(
-        "the isolated GPU cache worker exited while the cache was {}",
-        state.as_str()
-    ))
+    Some(match exit {
+        Some((pid, status)) => format!(
+            "the isolated GPU cache worker exited while the cache was {} (pid {pid}, {status})",
+            state.as_str()
+        ),
+        None => format!(
+            "the isolated GPU cache worker exited while the cache was {}",
+            state.as_str()
+        ),
+    })
 }
 
 /// Rebuild a dead GPU worker, or retain origin fallback during a retry cooldown.
@@ -205,25 +213,29 @@ fn recover_selected_worker<S: NbdRuntimeStarter + ?Sized>(
         runtime.permanent_fallback_logged = false;
     }
 
-    let dead =
+    let recover_worker =
         worker_recovery_requested(state, worker_exited, lease_live, runtime.lease_lost_release);
-    if !dead {
-        reap_exited_gpu_worker(runtime);
-        // SPEC DT-3: a worker that exited while the cache is not serving is a
-        // **fact about the cache's ability to serve**, and it is the one the
-        // operator needs: without it the status document carries a bare "the
-        // cache is off" and the cause is silent. The cause is recorded once
-        // per worker, so a long-lived daemon does not repeat it every pass.
-        if runtime.unavailable_reason.is_none()
-            && let Some(reason) = gpu_cache_unavailable_reason(state, worker_exited)
+    if runtime.unavailable_reason.is_none() && worker_exited {
+        let exit = runtime
+            .supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.child.as_ref())
+            .and_then(|child| match child {
+                WorkerChildHandle::Process(process) => {
+                    process.exit_status().map(|status| (process.id(), status))
+                }
+                #[cfg(test)]
+                WorkerChildHandle::Thread { .. } => None,
+            });
+        if (!recover_worker || exit.is_some())
+            && let Some(reason) = gpu_cache_unavailable_reason(state, worker_exited, exit)
         {
-            runtime.unavailable_reason = Some(reason.clone());
-            eprintln!(
-                "[ramsharedd] isolated GPU cache worker exited (cache {}); \
-                 the GPU cache is unavailable and the origin remains authoritative",
-                state.as_str()
-            );
+            eprintln!("[ramsharedd] {reason}; the origin remains authoritative");
+            runtime.unavailable_reason = Some(reason);
         }
+    }
+    if !recover_worker {
+        reap_exited_gpu_worker(runtime);
         return;
     }
 
@@ -269,6 +281,10 @@ fn recover_selected_worker<S: NbdRuntimeStarter + ?Sized>(
         // this on every serve job; unguarded, one announcement became
         // 1,043,543 lines of log written from the loop that serves swap.
         if note_permanent_fallback(runtime) {
+            let attempts = runtime.budget.respawns_since_healthy;
+            runtime.unavailable_reason.get_or_insert_with(|| {
+                format!("GPU cache is in retry cooldown after {attempts} worker respawns")
+            });
             eprintln!(
                 "[ramsharedd] isolated GPU cache worker left {} after {} respawns; \
                      origin fallback continues during a bounded retry cooldown",

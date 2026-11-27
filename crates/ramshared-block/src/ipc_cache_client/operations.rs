@@ -12,6 +12,25 @@ fn capped_deadline(deadline: Instant, local_timeout: Duration) -> io::Result<Ins
     Ok(deadline.min(deadline_after(local_timeout)?))
 }
 
+pub(super) fn read_response_failure(kind: ErrorKind) -> &'static str {
+    match kind {
+        // On Linux, SO_RCVTIMEO expiry on a blocking socket is WouldBlock.
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => "timed out",
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe => "peer disconnected",
+        _ => "I/O failed",
+    }
+}
+
+impl IpcCacheClient {
+    fn fail_read_response(&mut self, part: &str, error: &io::Error) {
+        let failure = read_response_failure(error.kind());
+        self.fail(format_args!("read response {part} {failure}: {error}"));
+    }
+}
+
 impl BoundedCache for IpcCacheClient {
     fn read_until(&mut self, offset: u64, destination: &mut [u8], deadline: Instant) -> CacheRead {
         if Instant::now() >= deadline {
@@ -71,8 +90,8 @@ impl BoundedCache for IpcCacheClient {
         }
 
         let mut hdr_buf = [0u8; FRAME_HEADER_LEN];
-        if read_exact_until(&mut self.socket, &mut hdr_buf, deadline).is_err() {
-            self.fail("read response timed out");
+        if let Err(error) = read_exact_until(&mut self.socket, &mut hdr_buf, deadline) {
+            self.fail_read_response("header", &error);
             return CacheRead::Failed;
         }
 
@@ -100,8 +119,8 @@ impl BoundedCache for IpcCacheClient {
                     self.fail("read response payload length mismatched");
                     return CacheRead::Failed;
                 }
-                if read_exact_until(&mut self.socket, destination, deadline).is_err() {
-                    self.fail("read response payload timed out");
+                if let Err(error) = read_exact_until(&mut self.socket, destination, deadline) {
+                    self.fail_read_response("payload", &error);
                     return CacheRead::Failed;
                 }
                 CacheRead::Hit

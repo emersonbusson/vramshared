@@ -37,6 +37,7 @@ GUEST_MEM_AVAILABLE_KIB=""
 GUEST_SWAP_FREE_KIB=""
 GUEST_PSI_FULL_AVG10=""
 MEM_MAX_BYTES=""
+WRITEBACK_STATS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -137,7 +138,9 @@ need_root() {
 }
 
 read_used() {
-  python3 - <<'PY'
+  python3 - "$WRITEBACK_STATS" <<'PY'
+import sys
+
 z=n=d=0
 with open("/proc/swaps") as f:
     next(f, None)
@@ -153,6 +156,10 @@ with open("/proc/swaps") as f:
             n += used
         else:
             d += used
+if sys.argv[1]:
+    with open(sys.argv[1], encoding="ascii") as f:
+        _, _, writes = map(int, f.read().split())
+    n = writes * 4
 print(f"{z} {n} {d}")
 PY
 }
@@ -204,18 +211,29 @@ if [[ ! -f /proc/pressure/memory ]]; then
 fi
 
 read -r PZ PN PD <<<"$(read_prios)"
-if [[ -z "${PZ:-}" || -z "${PN:-}" || -z "${PD:-}" || "$PZ" -lt 0 || "$PN" -lt 0 || "$PD" -eq -1 ]]; then
-  log "FAIL: need live zram + nbd + disk (sudo ramshared up first) prios=z:$PZ n:$PN d:$PD"
-  swapon --show || true
-  exit 1
-fi
-if ! (( PZ > PN && PN > PD )); then
+if (( PN == -1 )); then
+  mapfile -t active_zram < <(awk '$1 ~ /^\/dev\/zram[0-9]+$/ {print $1}' /proc/swaps)
+  if ((${#active_zram[@]} != 1 || PZ < 0 || PD == -1 || PZ <= PD)); then
+    log "FAIL: writeback requires one active zram tier above fallback swap"
+    exit 1
+  fi
+  zram_sys="/sys/block/${active_zram[0]##*/}"
+  backing_dev=$(cat -- "$zram_sys/backing_dev")
+  if [[ ! "$backing_dev" =~ ^/dev/nbd[0-9]+$ || ! -b "$backing_dev" || ! -r "$zram_sys/bd_stat" ]]; then
+    log "FAIL: active zram has no measurable NBD writeback target"
+    exit 1
+  fi
+  WRITEBACK_STATS="$zram_sys/bd_stat"
+  log "baseline writeback: zram=$PZ backing=$backing_dev fallback=$PD"
+elif ! (( PZ >= 0 && PN >= 0 && PD != -1 && PZ > PN && PN > PD )); then
   log "FAIL: priority not zram($PZ) > nbd($PN) > disk($PD)"
   exit 1
+else
+  log "baseline prios ok: zram=$PZ nbd=$PN disk=$PD"
 fi
-log "baseline prios ok: zram=$PZ nbd=$PN disk=$PD"
-read -r UZ0 UN0 UD0 <<<"$(read_used)"
-log "baseline used_kb: zram=$UZ0 nbd=$UN0 disk=$UD0"
+usage=$(read_used)
+read -r UZ0 UN0 UD0 <<<"$usage"
+log "baseline KiB: zram_swap=$UZ0 nbd_swap_or_backing_writes=$UN0 fallback_swap=$UD0"
 
 if ! guard_guest_pressure preflight; then
   log "FAIL: $GUARD_FAILURE"
@@ -239,7 +257,7 @@ cleanup() {
   elif [[ -n "$WORKER" ]]; then
     wait "$WORKER" 2>/dev/null || worker_rc=$?
   fi
-  log "final used_kb: $(read_used)"
+  log "final KiB (zram swap, NBD swap or backing writes, fallback swap): $(read_used)"
   swapon --show || true
   if [[ -n "$GUARD_FAILURE" ]]; then
     log "FAIL: $GUARD_FAILURE"
@@ -395,14 +413,15 @@ while kill -0 "$WORKER" 2>/dev/null && (( t < MAX_SEC )); do
     log "FAIL: $GUARD_FAILURE"
     exit 1
   fi
-  read -r z n d <<<"$(read_used)"
+  usage=$(read_used)
+  read -r z n d <<<"$usage"
   if [[ -z "$first_z" ]] && (( z > UZ0 + TH )); then
     first_z=$t
     log "FIRST USE zram t=${t}s used_kb=$z"
   fi
   if [[ -z "$first_n" ]] && (( n > UN0 + TH )); then
     first_n=$t
-    log "FIRST USE nbd/VRAM t=${t}s used_kb=$n"
+    log "FIRST USE NBD t=${t}s swap_or_backing_write_kib=$n"
   fi
   if [[ -z "$first_d" ]] && (( d > DISK_TH )); then
     first_d=$t
@@ -415,7 +434,7 @@ while kill -0 "$WORKER" 2>/dev/null && (( t < MAX_SEC )); do
       log "FAIL: nbd before zram (n=$first_n z=$first_z)"
       exit 1
     fi
-    if [[ -n "$first_d" ]]; then
+    if [[ -n "$first_d" ]] && { [[ -z "$WRITEBACK_STATS" ]] || (( need_disk )); }; then
       if (( first_d < first_n )); then
         log "FAIL: disk before nbd (d=$first_d n=$first_n)"
         exit 1
@@ -425,7 +444,11 @@ while kill -0 "$WORKER" 2>/dev/null && (( t < MAX_SEC )); do
         exit 1
       fi
     fi
-    log "PASS order zram_first=${first_z}s nbd_first=${first_n}s disk_first=${first_d:-none}"
+    if [[ -n "$WRITEBACK_STATS" ]]; then
+      log "PASS writeback zram_first=${first_z}s backing_write_first=${first_n}s fallback_first=${first_d:-none}"
+    else
+      log "PASS order zram_first=${first_z}s nbd_first=${first_n}s disk_first=${first_d:-none}"
+    fi
     exit 0
   fi
 done

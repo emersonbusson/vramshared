@@ -53,7 +53,7 @@ impl Drop for Permit {
     fn drop(&mut self) {
         let probe = self.0.probe.as_ref().unwrap();
         assert!(!same_descriptor(probe.fd, &probe.identity) && !probe.socket.exists());
-        assert!(probe.resources.exited.load(Ordering::Acquire));
+        assert!(probe.resources.exit_status.get().is_some());
         assert!(
             !probe.resources.stop_active.load(Ordering::Acquire)
                 && !probe.resources.reaper_active.load(Ordering::Acquire)

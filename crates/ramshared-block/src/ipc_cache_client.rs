@@ -498,7 +498,7 @@ impl IpcCacheClient {
         self.last_mutation_at = None;
     }
 
-    fn fail(&mut self, reason: &'static str) {
+    fn fail(&mut self, reason: impl std::fmt::Display) {
         eprintln!("[ramsharedd] isolated GPU cache unavailable: {reason}");
         self.state = CacheState::Unavailable;
         self.cached_bytes = 0;
