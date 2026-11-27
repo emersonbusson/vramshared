@@ -185,6 +185,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check Out Release Source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-source.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+
       - name: Download Distribution Packages
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -220,6 +228,16 @@ jobs:
             exit 1
           fi
 
+          ../source/scripts/package/render-release-notes.sh \
+            --tag "$RELEASE_TAG" \
+            --repo "$GH_REPO" \
+            --changelog ../source/CHANGELOG.md \
+            --git-dir ../source \
+            --out ../release-notes.md
+
           shopt -s failglob
-          gh release create "$RELEASE_TAG" --target "$TARGET_COMMIT" --generate-notes \
+          gh release create "$RELEASE_TAG" \
+            --target "$TARGET_COMMIT" \
+            --title "vRamShared $RELEASE_TAG" \
+            --notes-file ../release-notes.md \
             ./*.deb ./*.rpm ./*.tar.gz SHA256SUMS.txt

@@ -68,6 +68,8 @@ jobs:
             scripts/package/build-linux-bundle.sh \
             scripts/package/build-deb-package.sh \
             scripts/package/build-rpm-package.sh \
+            scripts/package/render-release-notes.sh \
+            scripts/package/test-render-release-notes.sh \
             scripts/kernel/build-wsl-kernel.sh; do
             bash -n "$script"
           done
@@ -78,6 +80,7 @@ jobs:
           ./scripts/ci/check-kernel-checkpatch.sh --provision
           bash scripts/ci/test-kernel-gate-flags.sh
           bash scripts/ci/test-kernel-gate-honesty.sh
+          bash scripts/package/test-render-release-notes.sh
           bash scripts/safety/test-guest-pressure-runtime-guard.sh
           bash scripts/safety/test-cascade-pressure-probe-static.sh
           bash scripts/safety/test-ramshared-guest-memory-admission.sh
