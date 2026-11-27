@@ -6,7 +6,7 @@
 # File: packaging/arch/PKGBUILD
 # Maintainer: Emerson Busson
 pkgname=ramshared
-pkgver=1.0.4
+pkgver=1.0.5
 pkgrel=1
 pkgdesc="Hardware-accelerated VRAM memory tiering & low-level kernel block drivers"
 # AUD-42: only architectures the product has qualified are advertised. A
