@@ -77,6 +77,7 @@ fn client_banner_prefers_pending_and_falls_back_to_the_carried_hint() {
     // Pending: the selected release differs from the one running.
     assert_eq!(
         client_banner(
+            ProcessInstallOrigin::ActiveRelease,
             Some("v0.14.1-584-g0649a3a4"),
             Some("v0.14.1-593-g38c38651"),
             Some("v0.14.0-111-gdeadbeef"),
@@ -88,6 +89,7 @@ fn client_banner_prefers_pending_and_falls_back_to_the_carried_hint() {
     // Just took it: nothing pending, the hint names where we came from.
     assert_eq!(
         client_banner(
+            ProcessInstallOrigin::ActiveRelease,
             Some("v0.14.1-593-g38c38651"),
             Some("v0.14.1-593-g38c38651"),
             Some("v0.14.1-584-g0649a3a4"),
@@ -99,11 +101,35 @@ fn client_banner_prefers_pending_and_falls_back_to_the_carried_hint() {
     // Settled: no pending transition and no carried hint.
     assert_eq!(
         client_banner(
+            ProcessInstallOrigin::ActiveRelease,
             Some("v0.14.1-593-g38c38651"),
             Some("v0.14.1-593-g38c38651"),
             None,
         ),
         None
+    );
+}
+
+#[test]
+fn standalone_preview_has_no_installed_update_banner() {
+    assert_eq!(
+        client_banner(
+            ProcessInstallOrigin::Unknown,
+            Some("v1.0.3-rc.11"),
+            Some("v1.0.3-rc.10"),
+            Some("v1.0.2"),
+        ),
+        None
+    );
+    assert_eq!(
+        client_banner(
+            ProcessInstallOrigin::ActiveRelease,
+            Some("v1.0.3-rc.10"),
+            Some("v1.0.3-rc.11"),
+            None,
+        )
+        .as_deref(),
+        Some("Update installed · v1.0.3-rc.10 → v1.0.3-rc.11")
     );
 }
 
@@ -803,7 +829,15 @@ fn client_banner_is_empty_when_nothing_is_pending_or_completed() {
         completed_update_notice(Some("v0.15.0"), "v0.15.0"),
         ClientUpdateNotice::None
     );
-    assert_eq!(client_banner(Some("v0.15.0"), Some("v0.15.0"), None), None);
+    assert_eq!(
+        client_banner(
+            ProcessInstallOrigin::ActiveRelease,
+            Some("v0.15.0"),
+            Some("v0.15.0"),
+            None
+        ),
+        None
+    );
 }
 
 #[test]
