@@ -8,6 +8,9 @@
 
 use std::time::Duration;
 
+mod storage;
+pub(crate) use storage::driver_status;
+
 use windows_service::service::{
     Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceFailureActions,
     ServiceFailureResetPeriod, ServiceInfo, ServiceSidType, ServiceState,
@@ -51,6 +54,7 @@ pub(crate) fn stop_product_for_mutation() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 use ramshared_winsvc::InstallMode;
+use ramshared_winsvc::authority_runtime::storage_effect;
 use ramshared_winsvc::config::WinDriveConfig;
 use ramshared_winsvc::package::{
     ArtifactRole, ProductManifestV1, StartPolicy, validate_cross_config,
@@ -123,139 +127,19 @@ pub(crate) fn install(
     )?;
     let final_root = staged.root;
 
-    // Publication is part of install, not a lab follow-up: a package that
-    // never reached the driver store would leave services pointing at a
-    // driver the host cannot load. This runs before the SCM mutation, so a
-    // refusal (typically a non-elevated process) leaves the old services
-    // untouched and the new version directory inert.
-    let driver_plan =
-        ramshared_winsvc::installation::driver_store::plan_publication(&final_root, &candidate)?;
-    let published = ramshared_winsvc::installation::driver_store::publish(&driver_plan)?;
-    // The receipt names the OEM INF the store created. Without it a
-    // rollback could never remove that exact package again. Recording it
-    // is part of publication, so a failed write takes the package back.
-    // A package the prior receipt already names is kept: the restored
-    // version may be running those exact bytes, and an unreadable receipt
-    // cannot prove otherwise.
-    let previous_names =
-        ramshared_winsvc::installation::driver_store::read_receipts(&driver_receipts_path())
-            .map(|receipts| {
-                receipts.map(|receipts| {
-                    receipts
-                        .packages
-                        .into_iter()
-                        .map(|package| package.oem_inf)
-                        .collect::<Vec<_>>()
-                })
-            })
-            .map_err(|error| error.to_string());
-    let retire_unrecorded = ramshared_winsvc::installation::compensation::may_retire_unrecorded(
-        previous_names,
-        &published.oem_inf,
-    );
-    if let Err(error) = ramshared_winsvc::installation::driver_store::record_published(
-        &driver_receipts_path(),
-        &published,
-    ) {
-        let failures = ramshared_winsvc::installation::compensation::compensate_candidate(
-            ramshared_winsvc::installation::compensation::CandidateEffects {
-                root_device_created: false,
-                retire_package: retire_unrecorded,
-            },
-            || Ok(()),
-            || {
-                ramshared_winsvc::installation::driver_store::remove(&published.oem_inf)
-                    .map_err(|error| error.to_string())
-            },
-        );
-        return Err(
-            ramshared_winsvc::installation::compensation::rollback_message(
-                "candidate publication not recorded",
-                &error.to_string(),
-                &failures,
-            )
-            .into(),
-        );
+    let storage = storage_effect(mode, || {
+        storage::prepare(&final_root, &candidate, old.as_ref(), versions)
+    })?;
+    if mode == InstallMode::AuthorityOnly {
+        validate_installed_configs(&final_root, &candidate)?;
     }
-    // A failed candidate may be taken back only when the restored version
-    // does not run the same package. A repair of identical bytes keeps it;
-    // an unreadable old tree also keeps it rather than guess.
-    let retire_candidate = match old.as_ref() {
-        None => true,
-        Some(manifest) => {
-            match ramshared_winsvc::installation::driver_store::plan_publication(
-                &versions.join(manifest.version_directory()),
-                manifest,
-            ) {
-                Ok(plan) => plan.inf_sha256 != published.inf_sha256,
-                Err(_) => false,
-            }
-        }
-    };
-    // The INF binds to a root-enumerated device that the driver store does
-    // not create. Register exactly one before the SCM mutation, so a
-    // refusal leaves the old services running and every new effect inert.
-    let mut created_root = false;
-    let pre_scm = (|| -> Result<
-        ramshared_winsvc::installation::receipt::InstallReceipt,
-        Box<dyn std::error::Error>,
-    > {
-        let root_plan =
-            ramshared_winsvc::installation::root_device::plan_from_inf_file(&driver_plan.inf_path)?;
-        let owned = ramshared_winsvc::installation::root_device::ensure_owned_root(&root_plan)?;
-        created_root = owned.created;
-        // One last read of the version-owned configs before any SCM
-        // mutation. Staging already validated them, but this is the commit
-        // boundary: a failure here leaves the old services running.
-        let broker = ramshared_winbroker::BrokerConfigV1::from_toml(&std::fs::read(
-            final_root.join(
-                &candidate
-                    .artifact(ArtifactRole::BrokerConfig)?
-                    .relative_path,
-            ),
-        )?)?;
-        let winsvc = WinDriveConfig::from_reader(&std::fs::read(
-            final_root.join(
-                &candidate
-                    .artifact(ArtifactRole::WinsvcConfig)?
-                    .relative_path,
-            ),
-        )?)?;
-        validate_cross_config(&broker, &winsvc)?;
-        // The receipt is the product's own record of the tuple it
-        // installed. It names the exact device and package and keeps the
-        // restart bit, so status can report a pending driver instead of a
-        // false reload. Its write is the final step of the registration
-        // closure: a failure there must roll the services back rather than
-        // leave a new version active under a failed result.
-        Ok(ramshared_winsvc::installation::receipt::InstallReceipt {
-            schema: ramshared_winsvc::installation::receipt::RECEIPT_SCHEMA,
-            version: candidate.version.clone(),
-            commit: candidate.commit.clone(),
-            root_instance: owned.instance_id.clone(),
-            oem_inf: published.oem_inf.clone(),
-            reboot_required: published.reboot_required,
-            boot_epoch_unix: ramshared_winsvc::installation::receipt::current_boot_epoch(),
-        })
-    })();
-    let receipt = match pre_scm {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            let failures =
-                compensate_install_candidate(created_root, retire_candidate, &published.oem_inf);
-            return Err(
-                ramshared_winsvc::installation::compensation::rollback_message(
-                    "candidate install effects rolled back",
-                    &error.to_string(),
-                    &failures,
-                )
-                .into(),
-            );
-        }
+    let rollback_storage = || {
+        storage
+            .as_ref()
+            .map_or_else(Vec::new, storage::Candidate::rollback)
     };
     if let Err(error) = stop_product_for_mutation() {
-        let failures =
-            compensate_install_candidate(created_root, retire_candidate, &published.oem_inf);
+        let failures = rollback_storage();
         return Err(
             ramshared_winsvc::installation::compensation::rollback_message(
                 "candidate install did not stop the running product",
@@ -269,8 +153,7 @@ pub(crate) fn install(
         && let Err(error) =
             crate::authority_service::ensure_no_external_authority_holder(None, false)
     {
-        let failures =
-            compensate_install_candidate(created_root, retire_candidate, &published.oem_inf);
+        let failures = rollback_storage();
         return Err(
             ramshared_winsvc::installation::compensation::rollback_message(
                 "candidate install detected competing control authority holder",
@@ -289,7 +172,9 @@ pub(crate) fn install(
         let broker_sid = ramshared_winsvc::service_identity::service_sid(BROKER_SERVICE_NAME)?;
         protect_version_directory(&final_root, Some(&broker_sid))?;
         crate::windows_svc::write_active_manifest(&candidate)?;
-        ramshared_winsvc::installation::receipt::write(&install_receipt_path(), &receipt)?;
+        if let Some(storage) = &storage {
+            storage.write_receipt()?;
+        }
         Ok(())
     })();
     if let Err(error) = register_result {
@@ -327,8 +212,7 @@ pub(crate) fn install(
         // package is only removed when the restored version does not run
         // the same bytes; skipping the attempt would leave either behind
         // with no error naming it.
-        let failures =
-            compensate_install_candidate(created_root, retire_candidate, &published.oem_inf);
+        let failures = rollback_storage();
         return Err(
             ramshared_winsvc::installation::compensation::registration_rollback_message(
                 &error.to_string(),
@@ -338,37 +222,9 @@ pub(crate) fn install(
             .into(),
         );
     }
-    Ok(receipt.reboot_required)
-}
-
-/// Undo the candidate effects in the order the store requires: the owned
-/// root device first, then the package the restored version does not run.
-fn compensate_install_candidate(
-    created_root: bool,
-    retire_candidate: bool,
-    oem_inf: &str,
-) -> Vec<String> {
-    use ramshared_winsvc::installation::compensation::{CandidateEffects, compensate_candidate};
-    compensate_candidate(
-        CandidateEffects {
-            root_device_created: created_root,
-            retire_package: retire_candidate,
-        },
-        || {
-            ramshared_winsvc::installation::root_device::remove_owned_root()
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        },
-        || {
-            ramshared_winsvc::installation::driver_store::remove_one_recorded(
-                &driver_receipts_path(),
-                oem_inf,
-                ramshared_winsvc::installation::driver_store::remove,
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-        },
-    )
+    Ok(storage
+        .as_ref()
+        .is_some_and(storage::Candidate::reboot_required))
 }
 
 fn validate_installed_configs(

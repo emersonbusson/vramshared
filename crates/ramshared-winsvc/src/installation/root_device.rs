@@ -409,10 +409,7 @@ mod tests {
 
     use super::*;
 
-    const REAL_INF: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../drivers/windows/ramshared/ramshared.inf"
-    );
+    const REAL_INF: &str = include_str!("../../../../drivers/windows/ramshared/ramshared.inf");
 
     fn owned(instance: &str) -> ObservedDevice {
         ObservedDevice {
@@ -485,8 +482,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_reads_the_shipped_inf() {
-        let plan = plan_from_inf_file(Path::new(REAL_INF)).unwrap();
+    fn plan_accepts_the_shipped_inf() {
+        let plan = plan_from_inf(REAL_INF).unwrap();
         assert_eq!(plan.hardware_id, OWNED_HARDWARE_ID);
         assert_eq!(
             plan.class_guid,
