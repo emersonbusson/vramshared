@@ -17,6 +17,7 @@ url="https://github.com/emersonbusson/vramshared"
 license=('GPL2')
 # gnupg provides gpgv for the scheduled release-signature gate.
 depends=('systemd' 'glibc' 'gnupg')
+makedepends=('cargo')
 optdepends=(
     'cuda: NVIDIA GPU hardware DMA acceleration'
     'vulkan-icd-loader: Vulkan GPU cache provider for compatible adapters'
@@ -31,9 +32,7 @@ sha256sums=("${_source_sha256}")
 
 build() {
     cd "$srcdir/$pkgname-$pkgver" 2>/dev/null || cd "$srcdir"
-    if command -v cargo >/dev/null 2>&1; then
-        cargo build --release --locked -p ramshared-cli -p ramshared-wsl2d
-    fi
+    cargo build --release --locked -p ramshared-cli -p ramshared-wsl2d
 }
 
 # stage_arch_member <root> <kind> <role> <mode> <source>
