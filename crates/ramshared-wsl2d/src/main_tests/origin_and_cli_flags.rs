@@ -81,6 +81,7 @@ fn origin_and_cache_failures_are_sticky_until_exact_recovery() {
         serve_threads: serve_pool::DEFAULT_SERVE_THREADS,
         serve_requests_total: 0,
         cache_unavailable_reason: None,
+        pooled_cache: None,
     };
     let serialized = serde_json::to_value(&status).unwrap();
     assert_eq!(serialized["origin_state"], "FAILED");
@@ -128,7 +129,7 @@ fn origin_and_cache_failures_are_sticky_until_exact_recovery() {
 #[test]
 // TestName: serve_threads_defaults_to_four_and_refuses_out_of_range
 // invariant check(boundary): the flag's edges are 1 and 16, and every value
-// outside them is refused before any thread starts (SPEC DT-6).
+// outside them is refused before any thread starts.
 fn serve_threads_defaults_to_four_and_refuses_out_of_range() {
     let default = AppArgs::parse_from(&daemon_argv(&["ramsharedd"])).expect("default argv");
     assert_eq!(

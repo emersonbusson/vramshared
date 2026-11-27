@@ -102,6 +102,7 @@ fn context() -> PublicationContext<'static> {
             unavailable_reason: None,
         },
         control_admission: None,
+        pooled_session: None,
     }
 }
 

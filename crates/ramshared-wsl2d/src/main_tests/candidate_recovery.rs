@@ -320,6 +320,7 @@ fn pressure_release_recovers_real_candidate_under_live_supervisor() {
             serve_requests_total: 0,
             worker: workers.observation(true, None),
             control_admission: None,
+            pooled_session: None,
         },
     );
     assert_eq!(released, vec![(0, false)]);

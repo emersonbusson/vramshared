@@ -95,6 +95,7 @@ fn daemon_publishes_live_worker_telemetry() {
         serve_threads: serve_pool::DEFAULT_SERVE_THREADS,
         serve_requests_total: 0,
         cache_unavailable_reason: None,
+        pooled_cache: None,
     };
 
     write_origin_cache_status(&status_path, &status).unwrap();
@@ -217,6 +218,7 @@ fn unmeasured_occupancy_publishes_as_null_and_an_empty_cache_as_zero() {
         serve_threads: serve_pool::DEFAULT_SERVE_THREADS,
         serve_requests_total: 0,
         cache_unavailable_reason: None,
+        pooled_cache: None,
     };
 
     write_origin_cache_status(&status_path, &base).expect("write unmeasured occupancy status");
@@ -295,6 +297,7 @@ fn an_unreadable_clock_publishes_as_null_and_never_as_the_unix_epoch() {
         serve_threads: serve_pool::DEFAULT_SERVE_THREADS,
         serve_requests_total: 0,
         cache_unavailable_reason: None,
+        pooled_cache: None,
     };
 
     write_origin_cache_status(&status_path, &base).expect("write unmeasured clock status");
@@ -414,6 +417,7 @@ fn concurrent_cache_status_publishes_never_exchange_documents() {
         serve_threads: serve_pool::DEFAULT_SERVE_THREADS,
         serve_requests_total: 0,
         cache_unavailable_reason: None,
+        pooled_cache: None,
     };
 
     for round in 0..64u32 {
@@ -574,6 +578,7 @@ fn a_sub_kib_headroom_keeps_its_remainder_on_the_budget_record() {
         serve_threads: serve_pool::DEFAULT_SERVE_THREADS,
         serve_requests_total: 0,
         cache_unavailable_reason: None,
+        pooled_cache: None,
     };
 
     write_origin_cache_status(&status_path, &status).expect("write headroom remainder status");
@@ -655,6 +660,7 @@ fn origin_cache_io_publishes_every_measured_counter_and_invents_no_sibling() {
         serve_threads: serve_pool::DEFAULT_SERVE_THREADS,
         serve_requests_total: 0,
         cache_unavailable_reason: None,
+        pooled_cache: None,
     };
     write_origin_cache_status(&status_path, &status).expect("write origin I/O status");
     let parsed: serde_json::Value =

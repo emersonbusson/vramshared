@@ -143,6 +143,7 @@ impl OriginServeBackend<'_> {
                     .workers
                     .observation(critical_reclaim, admission_reason.as_deref()),
                 control_admission: admission,
+                pooled_session: self.runtime.pooled_session.as_deref(),
             },
         );
         self.runtime
