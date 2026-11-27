@@ -623,31 +623,7 @@ pub(crate) mod win {
             None => serde_json::json!({"active": false}),
         };
         let (driver_json, driver_label) =
-            match ramshared_winsvc::installation::receipt::read(&install_receipt_path())? {
-                None => (
-                    serde_json::json!({"state": "unrecorded"}),
-                    "unrecorded".to_string(),
-                ),
-                Some(receipt) => {
-                    let observed =
-                        ramshared_winsvc::installation::receipt::observe(&receipt.oem_inf);
-                    let state = ramshared_winsvc::installation::receipt::reconcile_active(
-                        &receipt,
-                        &observed,
-                        &manifest.version,
-                        &manifest.commit,
-                    );
-                    (
-                        serde_json::json!({
-                            "state": state.as_str(),
-                            "oem_inf": receipt.oem_inf,
-                            "root_instance": receipt.root_instance,
-                            "reboot_required": receipt.reboot_required
-                        }),
-                        state.as_str().to_string(),
-                    )
-                }
-            };
+            crate::main_install::driver_status(&manifest, consumer_mode)?;
         let mut watchdog =
             ramshared_winsvc::watchdog::wsl_scm_watchdog::WslScmWatchdog::new(BrokerServiceProbe);
         let watchdog_health = watchdog.tick();

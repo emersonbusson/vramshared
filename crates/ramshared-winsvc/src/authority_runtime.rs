@@ -12,6 +12,17 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Run an effect owned by the Windows storage mode.
+pub fn storage_effect<T, E>(
+    mode: InstallMode,
+    effect: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    match mode {
+        InstallMode::Storage => effect().map(Some),
+        InstallMode::AuthorityOnly => Ok(None),
+    }
+}
+
 /// CLI argument passed by SCM when launching `RamSharedWinSvc` in authority-only mode.
 pub const AUTHORITY_SERVICE_ARG: &str = "authority-service";
 
@@ -98,12 +109,32 @@ where
 mod tests {
     use super::{
         AUTHORITY_SERVICE_ARG, authority_launch_arguments, detect_installed_consumer_mode,
-        supervise, validate_authority_control_config,
+        storage_effect, supervise, validate_authority_control_config,
     };
     use crate::InstallMode;
     use crate::vsock_lease::ControlPlaneTask;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn authority_install_mode_skips_storage_effects() {
+        let mut calls = 0;
+        let mut would_publish_driver = || {
+            calls += 1;
+            Err::<(), _>("driver trust failure")
+        };
+        assert_eq!(
+            storage_effect(InstallMode::AuthorityOnly, &mut would_publish_driver),
+            Ok(None)
+        );
+        assert_eq!(
+            storage_effect(InstallMode::Storage, would_publish_driver),
+            Err("driver trust failure")
+        );
+        assert_eq!(calls, 1);
+        let recorded = storage_effect(InstallMode::Storage, || Ok::<_, &str>("oem70.inf"));
+        assert_eq!(recorded, Ok(Some("oem70.inf")));
+    }
 
     #[test]
     fn stop_before_start_never_publishes_running_and_joins_worker() {

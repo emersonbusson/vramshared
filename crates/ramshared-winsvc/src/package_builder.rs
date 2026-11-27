@@ -715,10 +715,8 @@ heartbeat_secs = 5
 
     #[test]
     fn package_owner_generates_monotonic_driver_ver_and_proves_receipt_supersession() {
-        let repo_inf_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../drivers/windows/ramshared/ramshared.inf");
-        let repo_inf = std::fs::read_to_string(&repo_inf_path).unwrap();
-        let initial_ver = parse_inf_driver_ver(&repo_inf).unwrap();
+        let repo_inf = include_str!("../../../drivers/windows/ramshared/ramshared.inf");
+        let initial_ver = parse_inf_driver_ver(repo_inf).unwrap();
         assert_eq!(
             initial_ver,
             InfDriverVer {
@@ -730,7 +728,7 @@ heartbeat_secs = 5
         );
 
         let root_v1 = package_dir("supersede-v1");
-        std::fs::write(root_v1.join("ramshared.inf"), &repo_inf).unwrap();
+        std::fs::write(root_v1.join("ramshared.inf"), repo_inf).unwrap();
         std::fs::write(root_v1.join("ramshared.sys"), b"storport-binary-v8").unwrap();
         let manifest_v1 = write_manifest(
             &root_v1,
@@ -745,13 +743,13 @@ heartbeat_secs = 5
         let plan_v1 =
             crate::installation::driver_store::plan_publication(&root_v1, &manifest_v1).unwrap();
 
-        let (bumped_inf, next_ver) = bump_inf_driver_ver(&repo_inf, None).unwrap();
+        let (bumped_inf, next_ver) = bump_inf_driver_ver(repo_inf, None).unwrap();
         assert_eq!(next_ver.version, [10, 0, 26200, 9]);
         assert!(next_ver.supersedes(&initial_ver));
         assert!(!initial_ver.supersedes(&next_ver));
 
         let root_v2 = package_dir("supersede-v2");
-        std::fs::write(root_v2.join("ramshared.inf"), &repo_inf).unwrap();
+        std::fs::write(root_v2.join("ramshared.inf"), repo_inf).unwrap();
         assert_eq!(
             run_package_cli(&crate::runtime::ProductCommand::BumpInfDriverVer {
                 inf: root_v2.join("ramshared.inf").to_string_lossy().into_owned(),
@@ -816,7 +814,7 @@ heartbeat_secs = 5
         assert_eq!(receipts.packages.len(), 2);
 
         // Also cover refusal branches on malformed/regressing DriverVer inputs.
-        assert!(bump_inf_driver_ver(&repo_inf, Some((8, 8, 2026))).is_err());
+        assert!(bump_inf_driver_ver(repo_inf, Some((8, 8, 2026))).is_err());
         assert!(parse_inf_driver_ver("[Version]\nSignature=\"$Windows NT$\"\n").is_err());
         assert!(
             parse_inf_driver_ver(
