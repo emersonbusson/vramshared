@@ -30,7 +30,7 @@ macro_rules! observation {
                     inode: 1,
                 },
                 limit_bytes: None,
-                current_bytes: 0,
+                current_bytes: Some(0),
                 sampled_at_unix_ms: now,
             }]),
             guest_reserve_bytes: 100,
@@ -357,7 +357,7 @@ fn shared_ceiling_includes_host_commit_and_cgroup_ancestors() {
             inode: 1,
         },
         limit_bytes: Some(350),
-        current_bytes: 100,
+        current_bytes: Some(100),
         sampled_at_unix_ms: now,
     }];
     sample.cgroups = Some(&groups);
@@ -428,7 +428,7 @@ fn newer_guest_cannot_mask_an_older_cgroup_budget() {
             inode: 1,
         },
         limit_bytes: Some(200),
-        current_bytes: 0,
+        current_bytes: Some(0),
         sampled_at_unix_ms: now,
     }];
     first.cgroups = Some(&groups);
@@ -441,7 +441,7 @@ fn newer_guest_cannot_mask_an_older_cgroup_budget() {
             inode: 1,
         },
         limit_bytes: Some(900),
-        current_bytes: 0,
+        current_bytes: Some(0),
         sampled_at_unix_ms: now - 500,
     }];
     second.cgroups = Some(&older_groups);
@@ -485,7 +485,7 @@ fn changed_cgroup_shape_or_host_scope_does_not_reuse_epoch_custody() {
             inode: 2,
         },
         limit_bytes: None,
-        current_bytes: 0,
+        current_bytes: Some(0),
         sampled_at_unix_ms: changed.guest.sampled_at_unix_ms,
     }];
     changed.cgroups = Some(&group);
@@ -511,7 +511,7 @@ fn newer_observations_can_increase_shared_ceiling() {
             inode: 1,
         },
         limit_bytes: None,
-        current_bytes: 0,
+        current_bytes: Some(0),
         sampled_at_unix_ms: sample.guest.sampled_at_unix_ms,
     }];
     sample.cgroups = Some(&first_groups);
@@ -541,7 +541,7 @@ fn replaced_cgroup_at_same_position_cannot_inherit_observation_custody() {
             inode: 10,
         },
         limit_bytes: Some(200),
-        current_bytes: 0,
+        current_bytes: Some(0),
         sampled_at_unix_ms: now - 500,
     }];
     first.cgroups = Some(&original);
@@ -553,7 +553,7 @@ fn replaced_cgroup_at_same_position_cannot_inherit_observation_custody() {
             inode: 11,
         },
         limit_bytes: Some(900),
-        current_bytes: 0,
+        current_bytes: Some(0),
         sampled_at_unix_ms: now,
     }];
     replacement.cgroups = Some(&other);

@@ -411,7 +411,7 @@ fn cancelled_creator_retains_host_memory_until_its_child_is_gone() {
                 inode: 1
             },
             limit_bytes: None,
-            current_bytes: 0,
+            current_bytes: Some(0),
             sampled_at_unix_ms: now,
         }]),
         guest_reserve_bytes: 0,
@@ -577,7 +577,7 @@ fn guarded_registry_refuses_handoff_when_memory_authority_is_revoked() {
                 inode: 1,
             },
             limit_bytes: None,
-            current_bytes: 0,
+            current_bytes: Some(0),
             sampled_at_unix_ms: now,
         }]),
         guest_reserve_bytes: 0,

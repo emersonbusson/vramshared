@@ -34,7 +34,7 @@ fn pool() -> SharedMemoryReservations {
                 inode: 1
             },
             limit_bytes: None,
-            current_bytes: 0,
+            current_bytes: Some(0),
             sampled_at_unix_ms: now,
         }]),
         guest_reserve_bytes: 0,

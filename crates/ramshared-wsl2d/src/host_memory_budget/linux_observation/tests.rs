@@ -37,13 +37,13 @@ fn adapter_preserves_cgroup_identity_limits_and_sample_time() {
             inode: 8,
         },
         limit_bytes: Some(900),
-        current_bytes: 400,
+        current_bytes: Some(400),
         sampled_at_unix_ms: 123,
     };
     let result = map_group(source);
     assert_eq!(result.identity.device, 7);
     assert_eq!(result.identity.inode, 8);
     assert_eq!(result.limit_bytes, Some(900));
-    assert_eq!(result.current_bytes, 400);
+    assert_eq!(result.current_bytes, Some(400));
     assert_eq!(result.sampled_at_unix_ms, 123);
 }

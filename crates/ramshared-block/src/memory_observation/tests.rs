@@ -51,7 +51,7 @@ fn hierarchy_includes_root_and_every_visible_ancestor() {
     assert_eq!(samples[0].limit_bytes, None);
     assert_eq!(samples[1].limit_bytes, Some(500));
     assert_eq!(samples[2].limit_bytes, Some(300));
-    assert_eq!(samples[2].current_bytes, 50);
+    assert_eq!(samples[2].current_bytes, Some(50));
     for (sample, path) in samples.iter().zip(["", "parent", "parent/child"]) {
         let metadata = std::fs::metadata(fixture.0.join(path)).unwrap();
         assert_eq!(sample.identity.device, metadata.dev());
@@ -115,4 +115,40 @@ fn replaced_directory_at_same_path_changes_cgroup_identity() {
     let after = fixture_cgroups(&fixture.0, "0::/child\n", 2).unwrap();
     assert_eq!(before[0].identity, after[0].identity);
     assert_ne!(before[1].identity, after[1].identity);
+}
+
+#[test]
+fn global_root_without_metrics_preserves_descendant_limits() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.0.join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+    fixture.group("parent", "500\n", "130\n");
+    let samples = fixture_cgroups(&fixture.0, "0::/parent\n", 1234).unwrap();
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].limit_bytes, None);
+    assert_eq!(samples[0].current_bytes, None);
+    assert_eq!(samples[1].limit_bytes, Some(500));
+    assert_eq!(samples[1].current_bytes, Some(130));
+}
+
+#[test]
+fn only_the_global_root_may_omit_memory_metrics() {
+    let fixture = Fixture::new();
+    let root = &fixture.0;
+    std::fs::write(root.join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+    std::fs::write(root.join("cgroup.type"), "domain\n").unwrap();
+    assert!(fixture_cgroups(root, "0::/\n", 1).is_err());
+
+    std::fs::remove_file(root.join("cgroup.type")).unwrap();
+    std::fs::write(root.join("memory.current"), "1\n").unwrap();
+    assert!(fixture_cgroups(root, "0::/\n", 1).is_err());
+    std::fs::remove_file(root.join("memory.current")).unwrap();
+
+    let child = root.join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::copy(
+        root.join("cgroup.controllers"),
+        child.join("cgroup.controllers"),
+    )
+    .unwrap();
+    assert!(fixture_cgroups(root, "0::/child\n", 1).is_err());
 }
