@@ -13,11 +13,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Windows userspace service for StorPort CUDA VRAM disk (SPEC windows-storport-cuda-vram)"
+description = "Windows userspace service for StorPort CUDA VRAM disk"
 
 [[bin]]
 name = "ramshared-winsvc"
 path = "src/main.rs"
+
+[[bin]]
+name = "ramshared-pooled-cache"
+path = "src/bin/ramshared-pooled-cache.rs"
 
 [lib]
 name = "ramshared_winsvc"

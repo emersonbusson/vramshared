@@ -54,11 +54,29 @@ fn run_inner(
     status_slot: Arc<Mutex<Option<ServiceStatusHandle>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     diag_line("SCM authority-service starting");
+    let _pooled_ready = pooled_cache_placement_authorized(
+        ramshared_winsvc::pooled_cache::allocation::RolePlacement {
+            intent: ramshared_winsvc::pooled_cache::allocation::GuestPlacementIntent::Independent,
+            custody:
+                ramshared_winsvc::pooled_cache::allocation::GuestCustodyState::RunningUnconsented,
+        },
+        ramshared_winsvc::pooled_cache::allocation::RolePlacement {
+            intent: ramshared_winsvc::pooled_cache::allocation::GuestPlacementIntent::Independent,
+            custody: ramshared_winsvc::pooled_cache::allocation::GuestCustodyState::ControlledOff {
+                sealed_boot_path: false,
+            },
+        },
+        Some(std::process::id()),
+        true,
+    )
+    .is_ok();
     let path = vsock_config_path();
     let product = std::env::current_exe()?;
     let mut task = spawn_configured_listener(Some(&path), &product)?
         .ok_or("configured control-plane task is absent")?;
-    ramshared_winsvc::authority_runtime::supervise(
+    let pooled_server =
+        ramshared_winsvc::pooled_cache::server::spawn_if_configured(Arc::clone(&stop));
+    let supervise_res = ramshared_winsvc::authority_runtime::supervise(
         &mut task,
         &stop,
         || {
@@ -73,7 +91,12 @@ fn run_inner(
             Ok(())
         },
         std::thread::sleep,
-    )?;
+    );
+    stop.store(true, Ordering::Release);
+    if let Some(handle) = pooled_server {
+        let _ = handle.join();
+    }
+    supervise_res?;
     diag_line("SCM authority-service stopping -> Stopped");
     let _guard = status_slot
         .lock()
@@ -212,6 +235,23 @@ pub(crate) fn authority_control_status() -> (bool, bool, bool) {
             .is_ok();
     let permit_active = is_authority_permit_active();
     (config_present, vsock_ready, permit_active)
+}
+
+/// Fail closed for pooled adapter cache placement whenever an external authority holder
+/// or competing native storage allocator is active.
+pub(crate) fn pooled_cache_placement_authorized(
+    wsl: ramshared_winsvc::pooled_cache::allocation::RolePlacement,
+    secondary: ramshared_winsvc::pooled_cache::allocation::RolePlacement,
+    allow_service_pid: Option<u32>,
+    service_running: bool,
+) -> Result<(), ramshared_winsvc::pooled_cache::allocation::AllocationRefusal> {
+    let competing =
+        ensure_no_external_authority_holder(allow_service_pid, service_running).is_err();
+    let mut admission = ramshared_winsvc::pooled_cache::allocation::PoolAdmission::new(
+        ramshared_vram::ReserveFloorPolicy::sealed(),
+        "scm-authority",
+    );
+    admission.authorize_placement(wsl, secondary, competing)
 }
 
 /// Observed SCM configuration and runtime state for `RamSharedWinSvc`.
