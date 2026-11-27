@@ -460,6 +460,9 @@ pub(super) fn format_tier1_compression(sample: Option<&ZramCompression>) -> Stri
     let Some(sample) = sample else {
         return "not measured".to_string();
     };
+    let Some((original, compressed)) = sample.resident_compression() else {
+        return "not measured".to_string();
+    };
     let compressor = sample.compressor.as_deref().filter(|name| !name.is_empty());
     let compressor = compressor.unwrap_or("compressor unreported");
     // The wire field keeps the kernel's own column name (`huge_pages`); the
@@ -476,22 +479,21 @@ pub(super) fn format_tier1_compression(sample: Option<&ZramCompression>) -> Stri
     // sees the same columns in the same order.
     let body = format!(
         "({} -> {} B, cost {} B, {compressor}, {huge_pages})",
-        sample.orig_data_bytes, sample.compr_data_bytes, sample.mem_used_bytes
+        original, compressed, sample.mem_used_bytes
     );
     let ratio_text = match sample.compression_ratio() {
         Some(ratio) => format!("{ratio:.2}:1 at peak"),
-        None if sample.orig_data_bytes == 0 && sample.compr_data_bytes == 0 => {
+        None if original == 0 && sample.backed_data_bytes.is_some_and(|bytes| bytes > 0) => {
+            return "no resident pages (backing storage in use)".to_string();
+        }
+        None if original == 0 && compressed == 0 => {
             return "holding nothing (no ratio yet)".to_string();
         }
-        None if sample.compr_data_bytes == 0 => {
+        None if compressed == 0 => {
             // The bytes say every stored page was same-filled; a measured
             // `same_pages` of zero says none was. A sample that disagrees
             // with itself supports no classification.
-            if !all_stored_pages_same_filled(
-                sample.orig_data_bytes,
-                sample.compr_data_bytes,
-                sample.same_pages,
-            ) {
+            if !all_stored_pages_same_filled(original, compressed, sample.same_pages) {
                 return "not measured".to_string();
             }
             "all same-filled at peak".to_string()

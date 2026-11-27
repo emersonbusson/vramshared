@@ -21,6 +21,7 @@ fn compression_row_never_reports_an_unmeasured_sample_as_a_zero() {
     // the memory-events counters: absence stays absent.
     let missing_field = serde_json::json!({
         "orig_data_bytes": 4096_u64,
+        "backed_data_bytes": 0_u64,
         "ratio": 4.0,
     });
     assert_eq!(
@@ -30,6 +31,7 @@ fn compression_row_never_reports_an_unmeasured_sample_as_a_zero() {
 
     let junk = serde_json::json!({
         "orig_data_bytes": "4096",
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024,
         "ratio": 4.0,
     });
@@ -50,6 +52,7 @@ fn compression_row_derives_the_ratio_from_the_two_byte_counts() {
     // lie is not echoed.
     let liar = serde_json::json!({
         "orig_data_bytes": 4096_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024_u64,
         "mem_used_bytes": 1200_u64,
         "ratio": 99.0,
@@ -65,6 +68,7 @@ fn compression_row_derives_the_ratio_from_the_two_byte_counts() {
     // false. This used to demote a complete measurement to `not measured`.
     let broken_ratio = serde_json::json!({
         "orig_data_bytes": 4096_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024_u64,
         "mem_used_bytes": 1200_u64,
         "ratio": 0.0,
@@ -75,6 +79,7 @@ fn compression_row_derives_the_ratio_from_the_two_byte_counts() {
     );
     let missing_ratio = serde_json::json!({
         "orig_data_bytes": 4096_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024_u64,
         "mem_used_bytes": 1200_u64,
         "ratio": null,
@@ -94,6 +99,7 @@ fn compression_row_derives_the_ratio_from_the_two_byte_counts() {
     ] {
         let sample = serde_json::json!({
             "orig_data_bytes": orig,
+            "backed_data_bytes": 0_u64,
             "compr_data_bytes": compr,
             "mem_used_bytes": 1_u64,
         });
@@ -108,6 +114,7 @@ fn compression_row_derives_the_ratio_from_the_two_byte_counts() {
     // bigger — and is printed, never refused as if it were nonsense.
     let expanded = serde_json::json!({
         "orig_data_bytes": 100_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 120_u64,
         "mem_used_bytes": 130_u64,
     });
@@ -139,6 +146,7 @@ fn compression_row_separates_emptiness_same_filled_and_an_impossible_pair() {
     // the one arm that may say "holding nothing".
     let empty = serde_json::json!({
         "orig_data_bytes": 0_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
     });
     assert_eq!(
@@ -152,6 +160,7 @@ fn compression_row_separates_emptiness_same_filled_and_an_impossible_pair() {
     // state rather than claiming no measurement.
     let all_same_filled = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
         "mem_used_bytes": 12_u64,
     });
@@ -189,6 +198,7 @@ fn compression_row_separates_emptiness_same_filled_and_an_impossible_pair() {
     // only pair the kernel cannot produce.
     let torn_orig = serde_json::json!({
         "orig_data_bytes": 0_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
     });
     assert_eq!(compression_row(Some(&torn_orig), 20, false), "not measured");
@@ -202,6 +212,7 @@ fn compression_row_separates_emptiness_same_filled_and_an_impossible_pair() {
 fn compression_row_refuses_the_same_filled_name_when_the_counter_contradicts_it() {
     let contradicted = serde_json::json!({
         "orig_data_bytes": 12288_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
         "mem_used_bytes": 4096_u64,
         "huge_pages": 0,
@@ -219,6 +230,7 @@ fn compression_row_refuses_the_same_filled_name_when_the_counter_contradicts_it(
     // measured", never a measured zero.
     let corroborated = serde_json::json!({
         "orig_data_bytes": 12288_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
         "mem_used_bytes": 4096_u64,
         "same_pages": 3,
@@ -229,6 +241,7 @@ fn compression_row_refuses_the_same_filled_name_when_the_counter_contradicts_it(
     );
     let unreported = serde_json::json!({
         "orig_data_bytes": 12288_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
         "mem_used_bytes": 4096_u64,
     });
@@ -249,6 +262,7 @@ fn compression_row_refuses_the_same_filled_name_when_the_counter_contradicts_it(
 fn compression_row_freezes_the_derived_ratio_and_keeps_the_level_figures() {
     let sample = serde_json::json!({
         "orig_data_bytes": 4_u64 * 1024 * 1024 * 1024,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024_u64 * 1024 * 1024,
         "mem_used_bytes": 1342177280_u64,
         "huge_pages": 12,
@@ -288,6 +302,7 @@ fn compression_row_freezes_the_derived_ratio_and_keeps_the_level_figures() {
 fn compression_row_keeps_its_absence_wordings_when_the_sample_is_stale() {
     let missing = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
     });
     assert_eq!(
         compression_row(Some(&missing), 20, true),
@@ -297,6 +312,7 @@ fn compression_row_keeps_its_absence_wordings_when_the_sample_is_stale() {
 
     let empty = serde_json::json!({
         "orig_data_bytes": 0_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
     });
     assert_eq!(
@@ -315,6 +331,7 @@ fn compression_row_keeps_its_absence_wordings_when_the_sample_is_stale() {
 fn compression_row_freezes_the_same_filled_classification_with_the_ratio() {
     let sample = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
         "mem_used_bytes": 12_u64,
     });
@@ -339,6 +356,7 @@ fn compression_row_freezes_the_same_filled_classification_with_the_ratio() {
 fn compression_row_names_an_optional_counter_it_cannot_read() {
     let base = serde_json::json!({
         "orig_data_bytes": 4096_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024_u64,
         "mem_used_bytes": 1200_u64,
     });
@@ -416,6 +434,7 @@ fn compression_row_names_an_optional_counter_it_cannot_read() {
 fn compression_row_never_prints_the_same_filled_or_compaction_counters() {
     let sample = serde_json::json!({
         "orig_data_bytes": 4096_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024_u64,
         "mem_used_bytes": 1200_u64,
         "huge_pages": 3,
@@ -445,6 +464,7 @@ fn compression_row_distinguishes_holding_nothing_from_not_measured() {
     // all — while printing `1.00:1` would invent a compression claim.
     let empty = serde_json::json!({
         "orig_data_bytes": 0_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 0_u64,
         "mem_used_bytes": 0_u64,
         "huge_pages": 0,
@@ -463,6 +483,7 @@ fn compression_row_distinguishes_holding_nothing_from_not_measured() {
 fn compression_row_reports_an_unavailable_huge_pages_counter_as_unreported() {
     let sample = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "mem_used_bytes": 1200_u64,
         "huge_pages": null,
@@ -657,4 +678,38 @@ fn utilization_row_marks_an_aged_reading_stale_instead_of_erasing_it() {
     // window and not a boolean the caller fudges.
     let edge = utilization_row(Some(&aged), 20, false, 1_000 + GPU_BUDGET_MAX_AGE_MS);
     assert!(edge.contains("47%"), "got: {edge}");
+}
+
+#[test]
+fn compression_row_reports_only_resident_data_during_writeback() {
+    let sample = serde_json::json!({
+        "orig_data_bytes": 774696960_u64,
+        "backed_data_bytes": 729382912_u64,
+        "compr_data_bytes": 11820671_u64,
+        "mem_used_bytes": 15101952_u64,
+        "ratio": 65.537,
+    });
+    let row = compression_row(Some(&sample), 20, false);
+    assert!(row.contains("3.83:1"), "{row}");
+    assert!(!row.contains("65.54:1"), "{row}");
+    assert_eq!(compression_saved_pct(Some(&sample)), Some(73));
+
+    let mut legacy = sample.clone();
+    legacy
+        .as_object_mut()
+        .expect("compression object")
+        .remove("backed_data_bytes");
+    assert_eq!(compression_row(Some(&legacy), 20, false), "not measured");
+    assert_eq!(compression_saved_pct(Some(&legacy)), None);
+
+    let written_back = serde_json::json!({
+        "orig_data_bytes": 8192_u64,
+        "backed_data_bytes": 8192_u64,
+        "compr_data_bytes": 0,
+        "same_pages": 0,
+    });
+    assert_eq!(
+        compression_row(Some(&written_back), 20, false),
+        "no resident pages (backing storage in use)"
+    );
 }

@@ -439,6 +439,7 @@ fn main_dashboard_distinguishes_guest_and_fresh_host_available_memory() {
         "zram_compression".to_string(),
         json!({
             "orig_data_bytes": 2u64 * GIB,
+            "backed_data_bytes": 0_u64,
             "compr_data_bytes": 1100u64 * MIB,
             "mem_used_bytes": 1120u64 * MIB,
             "huge_pages": 24500u64,
@@ -522,6 +523,7 @@ fn compression_summary_keeps_only_complete_fields() {
         "zram_compression".into(),
         json!({
             "orig_data_bytes": 2u64 * GIB,
+            "backed_data_bytes": 0_u64,
             "compr_data_bytes": 1100u64 * MIB,
             "mem_used_bytes": 1120u64 * MIB,
             "huge_pages": 24500u64,
@@ -544,6 +546,7 @@ fn compression_summary_keeps_only_complete_fields() {
         "zram_compression".into(),
         json!({
             "orig_data_bytes": u64::MAX,
+            "backed_data_bytes": 0_u64,
             "compr_data_bytes": 0u64
         }),
     );

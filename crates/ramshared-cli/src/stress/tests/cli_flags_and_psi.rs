@@ -18,6 +18,7 @@ fn tier1_compression_line_names_the_host_cost_beside_the_compressed_form() {
     // wrong figure.
     let sample = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(2),
@@ -42,6 +43,7 @@ fn tier1_compression_line_names_the_host_cost_beside_the_compressed_form() {
     // cost is still measured and still printed.
     let unreported = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: None,
@@ -58,6 +60,7 @@ fn tier1_compression_line_names_the_host_cost_beside_the_compressed_form() {
     // disagreeing about what a sample carries.
     let named = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(2),
@@ -96,6 +99,7 @@ fn tier1_compression_line_names_the_host_cost_beside_the_compressed_form() {
     // printed, never refused.
     let expanded = ZramCompression {
         orig_data_bytes: 830,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(0),
@@ -120,6 +124,7 @@ fn tier1_compression_line_separates_emptiness_same_filled_and_an_impossible_pair
     // vocabulary.
     let all_same_filled = ZramCompression {
         orig_data_bytes: 4096,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 0,
         mem_used_bytes: 64,
         huge_pages: Some(0),
@@ -152,6 +157,7 @@ fn tier1_compression_line_separates_emptiness_same_filled_and_an_impossible_pair
     // page size. A tear or corruption has no reading.
     let torn = ZramCompression {
         orig_data_bytes: 0,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(0),
@@ -168,6 +174,7 @@ fn tier1_compression_line_separates_emptiness_same_filled_and_an_impossible_pair
 fn tier1_compression_line_refuses_the_same_filled_name_when_the_counter_contradicts_it() {
     let contradicted = ZramCompression {
         orig_data_bytes: 12288,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 0,
         mem_used_bytes: 4096,
         huge_pages: Some(0),

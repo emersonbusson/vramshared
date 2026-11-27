@@ -459,6 +459,7 @@ fn benchmark_archiving_and_formatting_tests() {
         tier1_zram_pct: Some(50),
         tier1_zram_compression: Some(ZramCompression {
             orig_data_bytes: 30_912_512,
+            backed_data_bytes: Some(0),
             compr_data_bytes: 10_297_603,
             mem_used_bytes: 11_972_608,
             huge_pages: Some(169),

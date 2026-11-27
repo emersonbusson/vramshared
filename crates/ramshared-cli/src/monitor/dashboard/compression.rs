@@ -8,6 +8,7 @@
 
 use super::super::i18n::{DashboardPhrase, dashboard_phrase};
 use super::{Language, Observation, fmt_bytes, text};
+use crate::zram_compression::{compression_ratio_of, resident_compression_from_status};
 use ratatui::text::Line;
 
 const ZRAM_PAGE_BYTES: u64 = 4096;
@@ -18,19 +19,21 @@ pub(super) fn compression_line(
     width: usize,
 ) -> Option<String> {
     let zram = observation.value("zram_compression")?;
-    let original = zram.get("orig_data_bytes")?.as_u64()?;
-    let stored = zram.get("compr_data_bytes")?.as_u64()?;
+    let Some((original, stored)) = resident_compression_from_status(zram) else {
+        let label = text(language).not_measured;
+        return Some(if Line::from(label).width() <= width {
+            label.to_string()
+        } else {
+            String::new()
+        });
+    };
     let cost = zram.get("mem_used_bytes").and_then(|value| value.as_u64());
     let pages = zram.get("huge_pages").and_then(|value| value.as_u64());
     let compressor = zram
         .get("compressor")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
-    let ratio = if stored > 0 {
-        Some(original as f64 / stored as f64)
-    } else {
-        None
-    };
+    let ratio = compression_ratio_of(original, stored);
     let text = text(language);
     let ratio = ratio.map_or_else(
         || text.not_measured.to_string(),

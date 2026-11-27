@@ -276,6 +276,7 @@ fn halting_sample_still_counts_toward_zram_compression() -> std::io::Result<()> 
     };
     let saturated = ZramCompression {
         orig_data_bytes: 30_000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 10_000,
         mem_used_bytes: 12_000,
         huge_pages: Some(16),
@@ -347,6 +348,7 @@ fn ramp_keeps_the_most_saturated_compression_sample() -> std::io::Result<()> {
     };
     let small = ZramCompression {
         orig_data_bytes: 1_000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 400,
         mem_used_bytes: 512,
         huge_pages: Some(0),
@@ -355,6 +357,7 @@ fn ramp_keeps_the_most_saturated_compression_sample() -> std::io::Result<()> {
     };
     let saturated = ZramCompression {
         orig_data_bytes: 30_000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 10_000,
         mem_used_bytes: 12_000,
         huge_pages: Some(16),

@@ -276,6 +276,7 @@ fn status_json_publishes_zram_compression_and_never_invents_a_zero() {
     let mut snapshot = base();
     snapshot.zram_compression = Some(ZramCompression {
         orig_data_bytes: 3_000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1_000,
         mem_used_bytes: 1_200,
         huge_pages: Some(2),
@@ -301,6 +302,7 @@ fn status_json_publishes_zram_compression_and_never_invents_a_zero() {
     // zero-incompressibles or zero-identity count the device never reported.
     snapshot.zram_compression = Some(ZramCompression {
         orig_data_bytes: 3_000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1_000,
         mem_used_bytes: 1_200,
         huge_pages: None,

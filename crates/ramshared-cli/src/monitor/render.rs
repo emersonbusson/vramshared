@@ -48,7 +48,7 @@ use crate::installed_image::{
 };
 use crate::release_coherence::{client_banner, previous_release_hint};
 use crate::zram_compression::{
-    ZramCompression, all_stored_pages_same_filled, compression_ratio_of,
+    all_stored_pages_same_filled, compression_ratio_of, resident_compression_from_status,
 };
 use ramshared_vram::{GpuBudgetSource, GpuUtilizationTelemetry, TELEMETRY_MAX_AGE_MS};
 
@@ -356,9 +356,7 @@ pub(super) fn gpu_used_pct(gpu: Option<&GpuObservation>) -> Option<u64> {
 /// larger than `orig` is a tear and is `None` too, never clamped into a
 /// plausible-looking number.
 pub(super) fn compression_saved_pct(field: Option<&Value>) -> Option<u64> {
-    let compression: ZramCompression = serde_json::from_value(field?.clone()).ok()?;
-    let orig = compression.orig_data_bytes;
-    let compr = compression.compr_data_bytes;
+    let (orig, compr) = resident_compression_from_status(field?)?;
     if orig == 0 || compr > orig {
         return None;
     }
