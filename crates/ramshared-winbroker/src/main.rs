@@ -146,9 +146,10 @@ mod tests {
                 config: PathBuf::from(r"\\localhost\pipe\ramshared\broker.toml"),
             })
         );
-        assert!(super::is_absolute_config(Path::new(
-            "/etc/ramshared/broker.toml"
-        )));
+        assert_eq!(
+            super::is_absolute_config(Path::new("/etc/ramshared/broker.toml")),
+            cfg!(not(windows)),
+        );
         assert!(!super::is_absolute_config(Path::new(
             "relative/broker.toml"
         )));
