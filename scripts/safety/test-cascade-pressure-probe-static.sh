@@ -75,9 +75,12 @@ require(campaign_gate < campaign_gate_exit < root_launch < sudo_launch,
 
 runtime_call = source.index("refresh_pressure_cgroup_limits runtime")
 sleep_call = source.rindex("sleep 1", 0, runtime_call)
-swap_observation = source.index('read -r z n d <<<"$(read_used)"', runtime_call)
+swap_observation = source.index('usage=$(read_used)', runtime_call)
 require(sleep_call < runtime_call < swap_observation,
         "runtime_guard_must_run_each_second_before_tier_observation")
+require('WRITEBACK_STATS="$zram_sys/bd_stat"' in source and
+        '_, _, writes = map(int, f.read().split())' in source,
+        "writeback_must_measure_backing_writes_separately_from_fallback_swap")
 
 require('rmdir -- "$CG"' not in source and 'cgroup.subtree_control' not in source,
         "cleanup_must_leave_systemd_scope_and_parent_controllers_to_their_owner")
