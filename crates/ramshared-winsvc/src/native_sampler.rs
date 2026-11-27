@@ -15,11 +15,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const POLL: Duration = Duration::from_millis(10);
 const QUERY_BUDGET: Duration = Duration::from_millis((GPU_BUDGET_MAX_AGE_MS * 2) / 5);
+// PDH needs a full one-second counter window in addition to child startup.
+const ACTIVITY_QUERY_BUDGET: Duration = Duration::from_millis((GPU_BUDGET_MAX_AGE_MS * 4) / 5);
 const REFRESH_CADENCE: Duration = Duration::from_millis(GPU_BUDGET_MAX_AGE_MS / 5);
 const IDLE_REFRESH_CADENCE: Duration = Duration::from_millis(GPU_BUDGET_MAX_AGE_MS / 2);
 #[derive(Clone)]
 pub enum ProbeKind {
     Gpu,
+    GpuActivity,
     Vm,
     Storage(PathBuf),
     StorageDisk([u8; 16]),
@@ -79,6 +82,7 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
             OwnedThread::spawn(
                 match &kind {
                     ProbeKind::Gpu => "ramshared-native-gpu-sampler",
+                    ProbeKind::GpuActivity => "ramshared-native-gpu-activity-sampler",
                     ProbeKind::Vm => "ramshared-native-vm-sampler",
                     ProbeKind::Storage(_) | ProbeKind::StorageDisk(_) => {
                         "ramshared-native-storage-sampler"
@@ -109,6 +113,11 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
             .unwrap_or_else(|error| error.into_inner()) = entry;
     }
     fn run(&self, executable: PathBuf, kind: ProbeKind, stop: &StopSignal) {
+        let query_budget = if matches!(kind, ProbeKind::GpuActivity) {
+            ACTIVITY_QUERY_BUDGET
+        } else {
+            QUERY_BUDGET
+        };
         let mut next = Instant::now();
         let mut was_paused = false;
         let mut was_idle = false;
@@ -139,6 +148,9 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
                             let admission = custody.start(
                                 || match &kind {
                                     ProbeKind::Gpu => NativeProcess::spawn_identity(&executable),
+                                    ProbeKind::GpuActivity => {
+                                        NativeProcess::spawn_gpu_activity(&executable)
+                                    }
                                     ProbeKind::Vm => NativeProcess::spawn_vm_identity(&executable),
                                     ProbeKind::Storage(path) => {
                                         NativeProcess::spawn_storage(&executable, path)
@@ -149,7 +161,7 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
                                 },
                                 now,
                                 unix_ms(),
-                                QUERY_BUDGET,
+                                query_budget,
                             );
                             if let Err(error) = admission {
                                 self.record_failure(Some(error));
@@ -164,7 +176,9 @@ impl<R: ProbeReport + Send + 'static> NativeSampler<R> {
                     let failed = result.is_err();
                     self.record_failure(result.err());
                     let now = Instant::now();
-                    next = if failed && custody.snapshot_entry(now).is_none() {
+                    next = if failed && matches!(kind, ProbeKind::GpuActivity) {
+                        now + self.refresh_cadence()
+                    } else if failed && custody.snapshot_entry(now).is_none() {
                         now + POLL
                     } else {
                         next.max(now)

@@ -485,7 +485,7 @@ pub fn serve_handshake<S: Read + Write>(
     } else {
         None
     };
-    let storage = if high == ramshared_ipc::IPC_VERSION_5 {
+    let storage = if high >= ramshared_ipc::IPC_VERSION_5 {
         Some(StorageSession::new(
             secret,
             &transcript,

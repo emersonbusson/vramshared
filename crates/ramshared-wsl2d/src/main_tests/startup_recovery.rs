@@ -41,6 +41,7 @@ fn lease_loss_revokes_restricted_group_without_origin_io() {
         lease_seen: Arc::new(AtomicBool::new(true)),
         host_memory: Arc::new(Mutex::new(None)),
         host_catalog: ramshared_wsl2d::host_catalog::SharedHostCatalog::new(),
+        host_activity: Default::default(),
         host_storage: ramshared_wsl2d::host_storage_state::SharedHostStorage::new(),
     };
     release_cache_after_lease_loss(&backend, Some(&admission), None);
@@ -263,6 +264,7 @@ fn lease_return_cannot_accept_startup_cancelled_by_prior_loss() {
         lease_seen: Arc::new(AtomicBool::new(true)),
         host_memory: Arc::new(Mutex::new(None)),
         host_catalog: ramshared_wsl2d::host_catalog::SharedHostCatalog::new(),
+        host_activity: Default::default(),
         host_storage: ramshared_wsl2d::host_storage_state::SharedHostStorage::new(),
     };
     release_cache_after_lease_loss(&backend, Some(&admission), Some(&mut runtime));

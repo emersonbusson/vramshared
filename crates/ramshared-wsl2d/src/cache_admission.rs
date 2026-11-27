@@ -7,7 +7,7 @@
 //! Shared cache-authority observations and joined supervisor lifetime.
 use super::{attempt_vsock_lease_cancellable, spawn_heartbeat, unix_time_ms};
 use ramshared_wsl2d::{
-    control_plane::{NegotiatedCadence, VsockControlPlane},
+    control_plane::{NegotiatedCadence, SharedHostActivity, VsockControlPlane},
     host_catalog::SharedHostCatalog,
     host_gate::{ControlPlaneAuthority, SealedOrigin, SessionAuthority, SharedAuthority},
     host_storage_state::SharedHostStorage,
@@ -106,6 +106,8 @@ where
     let host_memory = Arc::new(Mutex::new(None));
     let host_catalog = SharedHostCatalog::new();
     let attempt_catalog = host_catalog.clone();
+    let host_activity = SharedHostActivity::default();
+    let attempt_activity = host_activity.clone();
     let host_storage = SharedHostStorage::new();
     let attempt_storage = host_storage.clone();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -128,6 +130,7 @@ where
         move |session| {
             attempt(session, &attempt_stop).map(|(mut plane, cadence)| {
                 plane.attach_host_catalog(attempt_catalog.clone());
+                plane.attach_host_activity(attempt_activity.clone());
                 plane.attach_host_storage(attempt_storage.clone());
                 Granted {
                     host_memory: plane.host_memory_handle(),
@@ -156,6 +159,7 @@ where
         lease_seen,
         host_memory,
         host_catalog,
+        host_activity,
         host_storage,
         lifetime,
     }
@@ -176,6 +180,7 @@ pub(super) struct ControlPlaneCacheAdmission {
     pub(super) lease_seen: Arc<std::sync::atomic::AtomicBool>,
     pub(super) host_memory: Arc<Mutex<Option<SessionHostMemory>>>,
     pub(super) host_catalog: SharedHostCatalog,
+    pub(super) host_activity: SharedHostActivity,
     pub(super) host_storage: SharedHostStorage,
     pub(super) lifetime: Option<Arc<SupervisorOwner>>,
 }

@@ -33,6 +33,9 @@ impl NativeProcess {
     pub fn spawn_identity(executable: &Path) -> Result<Self, String> {
         spawn::spawn(executable, "inspect-gpus --json")
     }
+    pub(crate) fn spawn_gpu_activity(executable: &Path) -> Result<Self, String> {
+        spawn::spawn(executable, "inspect-gpu-activity --supervised-json")
+    }
     pub fn spawn_vm_identity(executable: &Path) -> Result<Self, String> {
         spawn::spawn(executable, "inspect-vms --json")
     }

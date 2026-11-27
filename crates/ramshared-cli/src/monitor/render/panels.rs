@@ -485,7 +485,13 @@ pub(in crate::monitor) fn draw_gpu(frame: &mut Frame<'_>, area: Rect, observatio
     let cache =
         crate::monitor::observations::cache_telemetry_record(observation.value("gpu_cache"));
     let mut lines = vec![budget_text];
-    if utilization_present {
+    if let Some(line) = crate::monitor::gpu_activity::busy_line(
+        observation,
+        crate::monitor::Language::En,
+        usize::from(area.width.saturating_sub(2)),
+    ) {
+        lines.push(line);
+    } else if utilization_present {
         lines.push(utilization_text);
     }
     if cache_state == "ACTIVE"

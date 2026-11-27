@@ -26,6 +26,21 @@ fn inspect_gpus_is_a_read_only_command_without_configuration() {
     }
 }
 
+#[test]
+fn inspect_gpu_activity_is_read_only_and_requires_json() {
+    let command = parse_product_cli(&["inspect-gpu-activity".into(), "--json".into()]).unwrap();
+    assert!(matches!(
+        command,
+        ProductCommand::InspectGpuActivity { supervised: false }
+    ));
+    assert!(matches!(
+        parse_product_cli(&["inspect-gpu-activity".into(), "--supervised-json".into()]).unwrap(),
+        ProductCommand::InspectGpuActivity { supervised: true }
+    ));
+    assert!(!product_runtime_selected(&command));
+    assert!(parse_product_cli(&["inspect-gpu-activity".into()]).is_err());
+}
+
 fn cfg() -> WinDriveConfig {
     WinDriveConfig {
         size_bytes: 64 * 1024 * 1024,

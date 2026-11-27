@@ -26,6 +26,7 @@ pub mod codec;
 pub mod device_codec;
 mod frame_lru;
 mod gpu_budget;
+pub mod host_gpu_activity;
 pub mod host_identity;
 /// The single configured-reserve authority for every VRAM admission surface.
 ///
@@ -57,7 +58,7 @@ pub use slab_pool::{
     VramSlabPool, VramSlabTicket,
 };
 pub use worker_telemetry::{
-    CodecCapability, CodecState, CodecTelemetry, MAX_CODEC_REFUSAL_REASON_BYTES,
+    CodecCapability, CodecState, CodecTelemetry, GpuCodecActivity, MAX_CODEC_REFUSAL_REASON_BYTES,
     MAX_WORKER_TELEMETRY_PAYLOAD_BYTES, TELEMETRY_MAX_AGE_MS, WORKER_TELEMETRY_SCHEMA_VERSION,
     WorkerCacheTelemetry, WorkerTelemetryEnvelope,
 };

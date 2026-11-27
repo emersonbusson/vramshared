@@ -183,7 +183,7 @@ impl IdentitySource for CudaIdentitySource {
         )
     }
 }
-fn process_identity() -> Result<ProducerProcess, String> {
+pub(crate) fn process_identity() -> Result<ProducerProcess, String> {
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();

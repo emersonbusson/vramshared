@@ -88,10 +88,14 @@ struct MetadataCustody {
 impl MetadataCustody {
     fn finish(&mut self) -> std::io::Result<()> {
         let gpu = crate::gpu_identity::sampler::stop_and_wait();
+        let activity = crate::gpu_activity::sampler::stop_and_wait();
         let vm = crate::vm_identity::sampler::stop_and_wait();
         let storage = crate::host_storage::sampler::stop_and_wait();
         self.finished = true;
-        gpu.and(vm).and(storage).map_err(std::io::Error::other)
+        gpu.and(activity)
+            .and(vm)
+            .and(storage)
+            .map_err(std::io::Error::other)
     }
 }
 impl Drop for MetadataCustody {
@@ -108,6 +112,12 @@ fn start_metadata(product: PathBuf, log: &Path) -> MetadataCustody {
     crate::host_storage::sampler::configure_product_executable(product.clone());
     if let Err(error) = crate::gpu_identity::sampler::start(product.clone()) {
         append_log(log, &format!("native GPU sampler unavailable: {error}"));
+    }
+    if let Err(error) = crate::gpu_activity::sampler::start(product.clone()) {
+        append_log(
+            log,
+            &format!("native GPU activity sampler unavailable: {error}"),
+        );
     }
     if let Err(error) = crate::vm_identity::sampler::start(product) {
         append_log(log, &format!("native VM sampler unavailable: {error}"));
@@ -139,6 +149,7 @@ fn serve_active_session(
     // full cadence; restore idle posture when the session closes.
     crate::vm_identity::sampler::set_paused(true);
     crate::gpu_identity::sampler::set_idle(false);
+    crate::gpu_activity::sampler::set_idle(false);
     append_log(log, &format!("session connected (route={route_kind})"));
     append_log(log, &crate::gpu_identity::sampler::diagnostic());
     let established = match serve_connection_with_stop(
@@ -165,6 +176,7 @@ fn serve_active_session(
         }
     };
     crate::gpu_identity::sampler::set_idle(true);
+    crate::gpu_activity::sampler::set_idle(true);
     crate::vm_identity::sampler::set_paused(false);
     established
 }
@@ -275,6 +287,7 @@ fn host_samples() -> HostSamples {
     HostSamples {
         memory: crate::host_memory::sample(),
         gpu: crate::gpu_identity::sampler::aged_observation(),
+        activity: crate::gpu_activity::sampler::observation(),
         storage: Some(std::sync::Arc::new(|disk_id| {
             crate::host_storage::sampler::sample_for_disk(
                 disk_id,

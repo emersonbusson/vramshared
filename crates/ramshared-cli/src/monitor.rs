@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 mod classify;
 mod compact;
 mod dashboard;
+mod gpu_activity;
 mod i18n;
 mod latency;
 #[cfg_attr(not(test), allow(dead_code))]

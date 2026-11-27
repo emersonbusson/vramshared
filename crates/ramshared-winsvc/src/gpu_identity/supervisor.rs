@@ -35,6 +35,11 @@ pub trait ProbeReport: Clone {
     fn decode(bytes: &[u8]) -> Result<Self, String>;
     fn producer(&self) -> &ProducerProcess;
     fn window(&self) -> (u64, u64);
+    /// An observation with a discrete sample can use that capture time
+    /// instead of the conservative start of the entire probe process.
+    fn capture_time_unix_ms(&self) -> Option<u64> {
+        None
+    }
 }
 impl ProbeReport for HostGpuIdentityReport {
     fn decode(bytes: &[u8]) -> Result<Self, String> {
@@ -293,11 +298,11 @@ impl<P: Producer, R: ProbeReport> ProbeSupervisor<P, R> {
         if let ProbeTick::Completed(result) = &tick {
             self.snapshot = None;
             if let Ok(report) = result
-                && let Some(expires) = flight
-                    .started
-                    .checked_add(Duration::from_millis(GPU_BUDGET_MAX_AGE_MS))
+                && let Some(captured) = freshness_anchor(report, flight.started, now, now_unix_ms)
+                && let Some(expires) =
+                    captured.checked_add(Duration::from_millis(GPU_BUDGET_MAX_AGE_MS))
             {
-                self.snapshot = Some((report.clone(), flight.started, expires));
+                self.snapshot = Some((report.clone(), captured, expires));
             }
             self.flight.take();
         }
@@ -323,6 +328,20 @@ impl<P: Producer, R: ProbeReport> ProbeSupervisor<P, R> {
     pub fn snapshot(&self, now: Instant) -> Option<&R> {
         self.snapshot_entry(now).map(|(report, _, _)| report)
     }
+}
+
+fn freshness_anchor(
+    report: &impl ProbeReport,
+    started: Instant,
+    now: Instant,
+    now_unix_ms: u64,
+) -> Option<Instant> {
+    let Some(captured_unix_ms) = report.capture_time_unix_ms() else {
+        return Some(started);
+    };
+    let age_ms = now_unix_ms.checked_sub(captured_unix_ms)?;
+    now.checked_sub(Duration::from_millis(age_ms))
+        .filter(|captured| *captured >= started)
 }
 
 pub(crate) fn elapsed_age_ms(start: Instant, now: Instant) -> Option<u64> {

@@ -8,8 +8,8 @@
 //! A verified envelope is not a guest binding, a complete inventory proof, or
 //! an allocation authorization; callers must independently establish each.
 use crate::{
-    FrameError, HandshakeTranscript, HostChallenge, IPC_VERSION_5, compute_hmac, host_proof,
-    verify_hmac,
+    FrameError, HandshakeTranscript, HostChallenge, IPC_VERSION_5, IPC_VERSION_6, IPC_VERSION_7,
+    compute_hmac, host_proof, verify_hmac,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -365,7 +365,10 @@ impl StorageSession {
     ) -> Result<Self, FrameError> {
         if secret.is_empty()
             || lease_id == 0
-            || challenge.accepted_version != IPC_VERSION_5
+            || !matches!(
+                challenge.accepted_version,
+                IPC_VERSION_5 | IPC_VERSION_6 | IPC_VERSION_7
+            )
             || !(transcript.min_version..=transcript.max_version)
                 .contains(&challenge.accepted_version)
         {

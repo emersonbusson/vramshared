@@ -219,6 +219,7 @@ fn lease_loss_marks_and_cancels_every_pending_member() {
         lease_seen: Arc::new(AtomicBool::new(true)),
         host_memory: Arc::new(Mutex::new(None)),
         host_catalog: ramshared_wsl2d::host_catalog::SharedHostCatalog::new(),
+        host_activity: Default::default(),
         host_storage: ramshared_wsl2d::host_storage_state::SharedHostStorage::new(),
     };
     release_cache_after_lease_loss(&backend, Some(&admission), workers.iter_mut());
@@ -557,6 +558,37 @@ fn oversized_member_status_cannot_replace_the_published_document() {
     let path = root.join("status.json");
     write_origin_cache_status(&path, &status).unwrap();
     let original = std::fs::read(&path).unwrap();
+    {
+        use ramshared_vram::host_gpu_activity::{
+            HostGpuActivityReport, HostGpuActivitySource, HostGpuActivityTelemetry,
+            HostGpuAdapterActivity, HostGpuEngineActivity,
+        };
+        status.host_gpu_activity = Some(HostGpuActivityTelemetry {
+            valid_before_unix_ms: 200,
+            sampled_at_guest_unix_ms: Some(90),
+            preferred_host_adapter: None,
+            report: HostGpuActivityReport {
+                schema_version: 1,
+                source: HostGpuActivitySource::WddmPdh,
+                sampled_at_unix_ms: 100,
+                interval_ms: 1_000,
+                adapters: vec![HostGpuAdapterActivity {
+                    luid: "00000000:00000001".into(),
+                    physical_index: 0,
+                    engines: (0..640)
+                        .map(|index| HostGpuEngineActivity {
+                            index,
+                            kind: "X".repeat(110),
+                            busy_pct: 44,
+                            processes: None,
+                        })
+                        .collect(),
+                }],
+            },
+        });
+        write_origin_cache_status(&path, &status).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
     status.daemon_instance_id = "x".repeat(ramshared_block::cache_group::MAX_CACHE_STATUS_BYTES);
     let refused = write_origin_cache_status(&path, &status).is_err();
     let unchanged = std::fs::read(&path).unwrap() == original;

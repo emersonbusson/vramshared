@@ -83,11 +83,21 @@ fn draw_main(
 ) {
     let text = text(language);
     let show_banner = has_active_operation(observation);
+    let gpu_sample = super::gpu_activity::engine_sample(observation);
+    let mut gpu_process_rows = gpu_sample
+        .as_ref()
+        .map(|sample| sample.process_lines(language))
+        .unwrap_or_default();
+    let baseline_height = if show_banner { 28 } else { 24 };
+    gpu_process_rows.truncate(usize::from(
+        frame.area().height.saturating_sub(baseline_height),
+    ));
+    let gpu_height = 9 + u16::try_from(gpu_process_rows.len()).unwrap_or(0);
     let constraints = if show_banner {
         vec![
             Constraint::Length(5),
             Constraint::Length(4),
-            Constraint::Length(9),
+            Constraint::Length(gpu_height),
             Constraint::Min(7),
             Constraint::Length(2),
             Constraint::Length(1),
@@ -95,7 +105,7 @@ fn draw_main(
     } else {
         vec![
             Constraint::Length(5),
-            Constraint::Length(9),
+            Constraint::Length(gpu_height),
             Constraint::Min(7),
             Constraint::Length(2),
             Constraint::Length(1),
@@ -118,7 +128,19 @@ fn draw_main(
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1 + offset]);
     draw_memory(frame, top[0], observation, language);
-    draw_gpu(frame, top[1], observation, language);
+    let gpu_width = usize::from(top[1].width.saturating_sub(2));
+    let busy_line = gpu_sample.map_or_else(
+        || nvml_busy_line(observation, language, gpu_width),
+        |sample| sample.busy_line(language, gpu_width),
+    );
+    draw_gpu(
+        frame,
+        top[1],
+        observation,
+        language,
+        busy_line,
+        gpu_process_rows,
+    );
     draw_cache(frame, rows[2 + offset], observation, history, language);
     draw_action(frame, rows[3 + offset], observation, language);
     frame.render_widget(
@@ -262,7 +284,14 @@ fn draw_memory(frame: &mut Frame<'_>, area: Rect, observation: &Observation, lan
     );
 }
 
-fn draw_gpu(frame: &mut Frame<'_>, area: Rect, observation: &Observation, language: Language) {
+fn draw_gpu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    observation: &Observation,
+    language: Language,
+    busy_line: String,
+    process_rows: Vec<String>,
+) {
     let text = text(language);
     let mut lines = Vec::new();
     if let Some(gpu) = observation.gpu.as_ref() {
@@ -295,17 +324,13 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, observation: &Observation, langua
     } else {
         lines.push(Line::from(format!(" {}: {}", text.gpu, text.unavailable)));
     }
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    lines.push(Line::from(gpu_busy_line(
-        observation,
-        language,
-        inner_width,
-    )));
+    lines.push(Line::from(busy_line));
     if let Some(gpu) = observation.gpu.as_ref()
         && !gpu.is_fresh_at(observation.epoch_ms, ramshared_vram::GPU_BUDGET_MAX_AGE_MS)
     {
         lines.push(Line::from(format!(" {}", text.stale)));
     }
+    lines.extend(process_rows.into_iter().map(Line::from));
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(text.gpu))
@@ -314,7 +339,15 @@ fn draw_gpu(frame: &mut Frame<'_>, area: Rect, observation: &Observation, langua
     );
 }
 
+#[cfg(test)]
 fn gpu_busy_line(observation: &Observation, language: Language, inner_width: usize) -> String {
+    if let Some(line) = super::gpu_activity::busy_line(observation, language, inner_width) {
+        return line;
+    }
+    nvml_busy_line(observation, language, inner_width)
+}
+
+fn nvml_busy_line(observation: &Observation, language: Language, inner_width: usize) -> String {
     let text = text(language);
     let sample_stale = observation_sample_is_stale(observation);
     match classify_utilization(

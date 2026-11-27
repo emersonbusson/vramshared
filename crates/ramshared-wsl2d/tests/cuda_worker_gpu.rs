@@ -71,6 +71,11 @@ fn cuda_device_codec_serves_normal_worker_io_and_reports_physical_allocation() {
     assert!(occupancy > 0 && occupancy <= client.target_bytes());
     assert_eq!(occupancy, before_raw + 2 * MIB);
     let telemetry = client.cache_telemetry().expect("codec telemetry");
+    let activity = telemetry
+        .gpu_codec_activity
+        .expect("hardware codec activity");
+    assert!(activity.compression_age_ms.unwrap() < 5_000);
+    assert!(activity.decompression_age_ms.unwrap() < 5_000);
     assert!(telemetry.compressed_payload_bytes > 0);
     assert!(telemetry.compressed_payload_bytes < telemetry.logical_cached_bytes);
     assert!(telemetry.physical_cache_slab_bytes > 0);

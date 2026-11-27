@@ -427,6 +427,7 @@ fn control_plane_state_changes_publish_before_the_interval() {
     let f = Fixture::new();
     let b = backend(&f, OriginCache::Disabled(DisabledCache));
     let admission = ControlPlaneCacheAdmission {
+        host_activity: Default::default(),
         lifetime: None,
         authority: Arc::new(Mutex::new(crate::ControlPlaneAuthority::disconnected())),
         lease_lost: Arc::new(AtomicBool::new(false)),

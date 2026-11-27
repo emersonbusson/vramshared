@@ -387,6 +387,12 @@ pub fn build_cascade_snapshot(entries: &[SwapEntry]) -> CascadeSnapshot {
     let (gpu_budget, gpu_headroom_kib) =
         budget_record_and_headroom(cache_status.as_ref(), unix_time_ms());
     let gpu_utilization = utilization_record(cache_status.as_ref());
+    let host_gpu_activity = cache_status.as_ref().and_then(|status| {
+        let sample: ramshared_vram::host_gpu_activity::HostGpuActivityTelemetry =
+            serde_json::from_value(status.get("host_gpu_activity")?.clone()).ok()?;
+        sample.report_at(unix_time_ms()?)?;
+        Some(sample)
+    });
     // DT-8: cache occupancy and codec health travel beside the adapter budget
     // and the busy-time sample, never merged into either. The record is kept;
     // only the renderer decides whether it may be shown.
@@ -523,6 +529,7 @@ pub fn build_cascade_snapshot(entries: &[SwapEntry]) -> CascadeSnapshot {
         gpu_headroom_kib,
         gpu_budget,
         gpu_utilization,
+        host_gpu_activity,
         gpu_cache,
         origin_cache_io,
         // Cache-event counters the daemon publishes as document-level keys and
