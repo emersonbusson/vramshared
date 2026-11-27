@@ -58,6 +58,17 @@ fn hardware_identity(value: &Value) -> Option<String> {
         })
 }
 
+fn subsystem_local_transport(value: &Value) -> Option<String> {
+    let subsystems = json_string(value, "subsystems")?;
+    let tokens: Vec<&str> = subsystems.split(':').collect();
+    if tokens.iter().any(|t| t.eq_ignore_ascii_case("scsi"))
+        && tokens.iter().any(|t| t.eq_ignore_ascii_case("vmbus"))
+    {
+        return Some("scsi".to_string());
+    }
+    None
+}
+
 fn parse_block_device(
     value: &Value,
     parent_hardware_identity: Option<&str>,
@@ -80,7 +91,9 @@ fn parse_block_device(
         (Some(false), _) | (_, Some(false)) => Some(false),
         (None, None) => None,
     };
-    let transport = json_string(value, "tran").or_else(|| parent_transport.map(str::to_owned));
+    let transport = json_string(value, "tran")
+        .or_else(|| subsystem_local_transport(value))
+        .or_else(|| parent_transport.map(str::to_owned));
     let hardware_identity = hardware_identity(value);
 
     devices.push(BlockDevice {
@@ -226,8 +239,19 @@ pub fn parse_mountinfo(text: &str) -> Result<Vec<MountInfo>, String> {
 fn validate_node(value: &Value) -> Result<(), String> {
     use ramshared_config::resource_profile::{MAX_IDENTITY_BYTES, MAX_LINUX_RELATIVE_PATH_BYTES};
     for key in [
-        "name", "path", "type", "fstype", "uuid", "pkname", "maj:min", "wwn", "serial", "tran",
-        "model", "partuuid",
+        "name",
+        "path",
+        "type",
+        "fstype",
+        "uuid",
+        "pkname",
+        "maj:min",
+        "wwn",
+        "serial",
+        "tran",
+        "subsystems",
+        "model",
+        "partuuid",
     ] {
         let Some(field) = value.get(key).filter(|field| !field.is_null()) else {
             continue;

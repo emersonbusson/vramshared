@@ -271,7 +271,7 @@ pub(super) fn device_basename(path: &str) -> String {
         .to_string()
 }
 
-/// The topology facts the health rules read (SPEC DT-1).
+/// The topology facts the health rules read.
 ///
 /// Two measurements, both from the running system: the kernel's `backing_dev`
 /// attribute on the live zram device names the device the zram writes its
@@ -446,7 +446,14 @@ pub fn build_cascade_snapshot(entries: &[SwapEntry]) -> CascadeSnapshot {
     // policy, so the named non-serving verdicts survive an `ok: false`.
     let cache_state =
         cache_state_from_status(status_text("cache_state"), product_active, cache_status_ok);
-    let cache_unavailable_reason = cache_unavailable_reason_from_status(cache_status.as_ref());
+    let (_, effective_pooled_mode, pooled_reason) =
+        pooled_cache_mode_from_status(cache_status.as_ref());
+    let cache_unavailable_reason = cache_unavailable_reason_from_status(cache_status.as_ref())
+        .or_else(|| {
+            (effective_pooled_mode == "pooled_origin_only")
+                .then_some(pooled_reason)
+                .flatten()
+        });
     let control_plane_state = cache_status
         .as_ref()
         .and_then(|status| status.get("control_plane_state"))
@@ -702,6 +709,25 @@ pub(super) fn stress_continuation_from_snapshot(snapshot: &CascadeSnapshot) -> R
 pub fn stress_readiness() -> Result<(), String> {
     let entries = read_swaps().map_err(|error| error.to_string())?;
     stress_readiness_from_snapshot(&build_cascade_snapshot(&entries))
+}
+
+/// Project configured and effective pooled cache profile from daemon status.
+/// Defaults to `("independent", "independent", None)` when absent.
+pub(crate) fn pooled_cache_mode_from_status(
+    cache_status: Option<&serde_json::Value>,
+) -> (String, String, Option<String>) {
+    let field = |key: &str| {
+        cache_status
+            .and_then(|doc| doc.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let configured = field("configured_cache_profile").unwrap_or_else(|| "independent".into());
+    let effective = field("effective_cache_mode").unwrap_or_else(|| configured.clone());
+    let reason = field("pooled_cache_reason");
+    (configured, effective, reason)
 }
 
 /// Read-only continuation check for a pressure workload already in flight.

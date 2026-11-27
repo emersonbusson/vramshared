@@ -30,6 +30,7 @@ pub(super) struct OriginRuntime {
     pub(super) admission: Option<ControlPlaneCacheAdmission>,
     pub(super) workers: WorkerSet,
     pub(super) native_session: Option<Arc<super::native_cache::NativeCacheSession>>,
+    pub(super) pooled_session: Option<Arc<ramshared_wsl2d::pooled_cache::GuestCacheSession>>,
 }
 
 impl Drop for OriginRuntime {
@@ -131,10 +132,29 @@ pub(super) fn build_with_catalog_wait<S: NbdRuntimeStarter + ?Sized>(
     starter: &mut S,
     initial_catalog_wait: std::time::Duration,
 ) -> Result<OriginRuntime, Box<dyn std::error::Error>> {
+    build_with_profile(
+        opened,
+        size,
+        reserve,
+        starter,
+        initial_catalog_wait,
+        active_profile_path(),
+    )
+}
+
+fn build_with_profile<S: NbdRuntimeStarter + ?Sized>(
+    opened: OpenedOrigin,
+    size: u64,
+    reserve: u64,
+    starter: &mut S,
+    initial_catalog_wait: std::time::Duration,
+    profile_path: &std::path::Path,
+) -> Result<OriginRuntime, Box<dyn std::error::Error>> {
     let (origin, sealed) = match opened {
-        OpenedOrigin::Native(origin) => return build_native(origin, size, starter),
+        OpenedOrigin::Native(origin) => return build_native(origin, size, starter, profile_path),
         OpenedOrigin::Wsl(origin, sealed) => (origin, sealed),
     };
+    let origin_binding = sealed.partuuid.clone();
     let admission = compose_cache_admission(sealed);
     #[cfg(test)]
     starter.seed_test_catalog(admission.host_catalog());
@@ -143,24 +163,102 @@ pub(super) fn build_with_catalog_wait<S: NbdRuntimeStarter + ?Sized>(
     let _ = admission.wait_for_initial_catalog(initial_catalog_wait);
     // Validate geometry before spawning, then keep this owner through every
     // fallible cache-attachment step and through the caller's startup rollback.
+    let backend = AuthoritativeOriginBackend::new_with_admission(
+        origin,
+        OriginCache::Disabled(DisabledCache),
+        size,
+        BLOCK_SIZE,
+        admission.clone(),
+    )
+    .map_err(|error| error.0)?;
+    let (backend, pooled_session) =
+        maybe_attach_pooled_cache(profile_path, "origin-cache", &origin_binding, size, backend)?;
+    if let Some(pooled_session) = pooled_session {
+        return Ok(OriginRuntime {
+            backend: Arc::new(backend),
+            admission: Some(admission),
+            workers: WorkerSet::default(),
+            native_session: None,
+            pooled_session: Some(pooled_session),
+        });
+    }
     let mut runtime = OriginRuntime {
-        backend: Arc::new(
-            AuthoritativeOriginBackend::new_with_admission(
-                origin,
-                OriginCache::Disabled(DisabledCache),
-                size,
-                BLOCK_SIZE,
-                admission.clone(),
-            )
-            .map_err(|error| error.0)?,
-        ),
+        backend: Arc::new(backend),
         admission: Some(admission),
         workers: WorkerSet::default(),
         native_session: None,
+        pooled_session: None,
     };
     let plan = starter.origin_worker_plan(size, reserve)?;
     attach_workers(&mut runtime, starter, plan, size, reserve)?;
     Ok(runtime)
+}
+
+type OriginBackend = AuthoritativeOriginBackend<FileOrigin, OriginCache>;
+type PooledAttachResult = Result<
+    (
+        OriginBackend,
+        Option<Arc<ramshared_wsl2d::pooled_cache::GuestCacheSession>>,
+    ),
+    Box<dyn std::error::Error>,
+>;
+
+fn maybe_attach_pooled_cache(
+    profile_path: &std::path::Path,
+    mode_label: &str,
+    origin_binding: &str,
+    size: u64,
+    mut backend: OriginBackend,
+) -> PooledAttachResult {
+    if origin_binding.is_empty() {
+        return Ok((backend, None));
+    }
+    let swaps = read_active_swap_paths();
+    let swap_refs: Vec<&str> = swaps.iter().map(String::as_str).collect();
+    let (pooled_session, pooled_read) =
+        ramshared_wsl2d::pooled_cache::connector::connect_boot_pooled_session(
+            profile_path,
+            origin_binding,
+            &swap_refs,
+            size,
+        )?;
+    if pooled_session.spawns_independent_worker() {
+        return Ok((backend, None));
+    }
+    let status = pooled_session.status(None);
+    if let Some(state) = pooled_read {
+        backend = backend.with_pooled_read(state);
+    }
+    eprintln!(
+        "[ramsharedd] mode={mode_label} cache={} epoch={} reason={}",
+        status.effective_mode.as_str(),
+        status.epoch,
+        status.reason.as_deref().unwrap_or("none")
+    );
+    Ok((backend, Some(Arc::new(pooled_session))))
+}
+
+fn active_profile_path() -> &'static std::path::Path {
+    #[cfg(test)]
+    {
+        std::path::Path::new("/nonexistent/ramshared-test-cache-mode.json")
+    }
+    #[cfg(not(test))]
+    {
+        std::path::Path::new(ramshared_wsl2d::pooled_cache::profile::DEFAULT_CACHE_PROFILE_PATH)
+    }
+}
+
+fn read_active_swap_paths() -> Vec<String> {
+    std::fs::read_to_string("/proc/swaps")
+        .ok()
+        .map(|text| {
+            text.lines()
+                .skip(1)
+                .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn attach_workers<S: NbdRuntimeStarter + ?Sized>(
@@ -236,7 +334,15 @@ fn build_native<S: NbdRuntimeStarter + ?Sized>(
     origin: super::native_origin::AdmittedOrigin,
     size: u64,
     starter: &mut S,
+    profile_path: &std::path::Path,
 ) -> Result<OriginRuntime, Box<dyn std::error::Error>> {
+    let origin_binding = match &origin.manifest.target {
+        ramshared_config::resource_profile::ResourceTarget::LinuxFileOrigin {
+            filesystem_uuid,
+            ..
+        } => filesystem_uuid.clone(),
+        _ => String::new(),
+    };
     let session = origin.cache_session;
     let backend = match &session {
         Some(session) => AuthoritativeOriginBackend::new_with_admission(
@@ -254,11 +360,28 @@ fn build_native<S: NbdRuntimeStarter + ?Sized>(
         ),
     }
     .map_err(|error| error.0)?;
+    let (backend, pooled_session) = maybe_attach_pooled_cache(
+        profile_path,
+        "native-origin",
+        &origin_binding,
+        size,
+        backend,
+    )?;
+    if let Some(pooled_session) = pooled_session {
+        return Ok(OriginRuntime {
+            backend: Arc::new(backend),
+            admission: None,
+            workers: WorkerSet::default(),
+            native_session: session,
+            pooled_session: Some(pooled_session),
+        });
+    }
     let mut runtime = OriginRuntime {
         backend: Arc::new(backend),
         admission: None,
         workers: WorkerSet::default(),
         native_session: session.clone(),
+        pooled_session: None,
     };
     if let Some(session) = session {
         if session.policy.is_some() {

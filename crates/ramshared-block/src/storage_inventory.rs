@@ -19,7 +19,7 @@ pub const LSBLK_ARGS: &[&str] = &[
     "--json",
     "--bytes",
     "--output",
-    "name,path,type,size,fstype,uuid,partuuid,mountpoints,pkname,maj:min,wwn,serial,ro,rm,rota,tran,model",
+    "name,path,type,size,fstype,uuid,partuuid,mountpoints,pkname,maj:min,wwn,serial,ro,rm,rota,tran,subsystems,model",
 ];
 pub const SUPPORTED_SWAP_FILESYSTEMS: &[&str] = &["ext4", "xfs"];
 pub const QUALIFIED_SWAP_TRANSPORTS: &[&str] = &[

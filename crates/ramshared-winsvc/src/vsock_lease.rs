@@ -4,7 +4,7 @@
 // LinkedIn: https://www.linkedin.com/in/emersonbusson
 // Source: https://github.com/emersonbusson/vramshared
 // File: crates/ramshared-winsvc/src/vsock_lease.rs
-//! Host side of the native-vsock control plane (SPEC ITEM-4, DT-3/DT-5).
+//! Host side of the native-vsock control plane.
 //!
 //! The guest drives: `Handshake` → `HandshakeAck` → `HandshakeFinish` →
 //! `LeaseRequest` → `LeaseGranted`, then heartbeats. This module verifies the
@@ -174,45 +174,44 @@ impl VsockConfig {
     /// provisioning script; the caller must treat the returned bytes as secret
     /// and never log them.
     pub fn read_key(&self) -> Result<Vec<u8>, LeaseServerError> {
-        let blob = self.read_key_blob()?;
-        match self.key_protection {
-            KeyProtection::Plain => Ok(blob),
-            KeyProtection::DpapiMachine => unprotect_dpapi_machine(&blob),
-        }
+        read_key_file_with_protection(&self.key_file, self.key_protection)
     }
+}
 
-    fn read_key_blob(&self) -> Result<Vec<u8>, LeaseServerError> {
-        let file = std::fs::File::open(&self.key_file).map_err(|error| {
-            LeaseServerError::Key(format!("{}: {error}", self.key_file.display()))
-        })?;
-        let metadata = file.metadata().map_err(|error| {
-            LeaseServerError::Key(format!("{}: {error}", self.key_file.display()))
-        })?;
-        if !metadata.is_file() {
-            return Err(LeaseServerError::Key(format!(
-                "{}: not a regular file",
-                self.key_file.display()
-            )));
-        }
-        if metadata.len() == 0 || metadata.len() > MAX_KEY_BYTES {
-            return Err(LeaseServerError::Key(format!(
-                "{}: key must be 1..={MAX_KEY_BYTES} bytes",
-                self.key_file.display()
-            )));
-        }
-        let mut key = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_KEY_BYTES)
-            .read_to_end(&mut key)
-            .map_err(|error| {
-                LeaseServerError::Key(format!("{}: {error}", self.key_file.display()))
-            })?;
-        if key.len() as u64 != metadata.len() {
-            return Err(LeaseServerError::Key(format!(
-                "{}: key file changed while reading",
-                self.key_file.display()
-            )));
-        }
-        Ok(key)
+pub(crate) fn read_key_file_with_protection(
+    key_file: &Path,
+    protection: KeyProtection,
+) -> Result<Vec<u8>, LeaseServerError> {
+    let file = std::fs::File::open(key_file)
+        .map_err(|error| LeaseServerError::Key(format!("{}: {error}", key_file.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| LeaseServerError::Key(format!("{}: {error}", key_file.display())))?;
+    if !metadata.is_file() {
+        return Err(LeaseServerError::Key(format!(
+            "{}: not a regular file",
+            key_file.display()
+        )));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_KEY_BYTES {
+        return Err(LeaseServerError::Key(format!(
+            "{}: key must be 1..={MAX_KEY_BYTES} bytes",
+            key_file.display()
+        )));
+    }
+    let mut key = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_KEY_BYTES)
+        .read_to_end(&mut key)
+        .map_err(|error| LeaseServerError::Key(format!("{}: {error}", key_file.display())))?;
+    if key.len() as u64 != metadata.len() {
+        return Err(LeaseServerError::Key(format!(
+            "{}: key file changed while reading",
+            key_file.display()
+        )));
+    }
+    match protection {
+        KeyProtection::Plain => Ok(key),
+        KeyProtection::DpapiMachine => unprotect_dpapi_machine(&key),
     }
 }
 

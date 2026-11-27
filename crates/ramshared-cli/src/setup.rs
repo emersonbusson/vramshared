@@ -24,13 +24,15 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+pub(crate) mod cache_mode;
+
 use crate::cascade::boot::{BootPaths, observe_lower_tier_capacity, release_version};
 use crate::customer::diagnostics::{DiagnosticLimits, ReadinessDiagnosticSource};
 use crate::customer::plan_document::MAX_PROFILE_NAME_BYTES;
 use crate::customer::setup_scope::SetupScope;
 use crate::customer::{
-    CustomerCommand, CustomerDependencies, CustomerError, CustomerReason, CustomerState,
-    execute_customer,
+    CustomerCommand, CustomerDependencies, CustomerError, CustomerOutcome, CustomerReason,
+    CustomerState, execute_customer,
 };
 use crate::readiness::run_check;
 use crate::resource_config::default_configuration_root;
@@ -132,11 +134,39 @@ fn run_wizard_subcommand(args: &[String], stdout: &mut dyn Write, stderr: &mut d
     }
 }
 
+fn emit_plan_outcome(
+    outcome: Result<CustomerOutcome, CustomerError>,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    match outcome {
+        Ok(outcome) => {
+            // `--json` prints the exact document that was written, so a piped
+            // consumer can never see a re-encoding that drifts from the file
+            // `setup apply` reads.
+            if json {
+                if let Some(document) = outcome.document.as_deref() {
+                    let _ = writeln!(stdout, "{document}");
+                }
+            } else {
+                let _ = writeln!(stdout, "{}", outcome.result.detail);
+            }
+            0
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "{error}");
+            error.exit_code()
+        }
+    }
+}
+
 /// `ramshared setup` dispatch. Returns the PRD-mapped exit code.
 pub(crate) fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     if let Some((subcommand, rest)) = args.split_first() {
         match subcommand.as_str() {
             "apply" => return crate::customer::setup_apply::run(rest, stdout, stderr),
+            "cache-mode" => return cache_mode::run(rest, stdout, stderr),
             "reconcile" => {
                 return crate::customer::setup_apply::run_reconcile(rest, stdout, stderr);
             }
@@ -205,25 +235,7 @@ pub(crate) fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Writ
         },
     );
 
-    match outcome {
-        Ok(outcome) => {
-            // `--json` prints the exact document that was written, so a piped
-            // consumer can never see a re-encoding that drifts from the file
-            // `setup apply` reads.
-            if json {
-                if let Some(document) = outcome.document.as_deref() {
-                    let _ = writeln!(stdout, "{document}");
-                }
-            } else {
-                let _ = writeln!(stdout, "{}", outcome.result.detail);
-            }
-            0
-        }
-        Err(error) => {
-            let _ = writeln!(stderr, "{error}");
-            error.exit_code()
-        }
-    }
+    emit_plan_outcome(outcome, json, stdout, stderr)
 }
 
 #[cfg(test)]
@@ -313,5 +325,119 @@ mod tests {
             assert_eq!(run(&full, &mut out, &mut err_buf), 2);
             assert!(out.is_empty());
         }
+    }
+
+    #[test]
+    fn setup_routes_unknown_recommend_gpu_cache_plan_and_headless_wizard() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(run(&["unknown-sub".into()], &mut out, &mut err), 2);
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("unsupported setup subcommand")
+        );
+
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        assert_ne!(
+            run(
+                &["recommend".into(), "--unknown".into()],
+                &mut out2,
+                &mut err2
+            ),
+            0
+        );
+
+        let mut out3 = Vec::new();
+        let mut err3 = Vec::new();
+        let plan_args = [
+            "plan",
+            "--profile",
+            "nonexistent-profile-name",
+            "--output",
+            "/tmp/ramshared-setup-test-plan.json",
+            "--scope",
+            "gpu-cache",
+        ]
+        .map(str::to_string);
+        assert_ne!(run(&plan_args, &mut out3, &mut err3), 0);
+
+        let sample = CustomerOutcome {
+            result: crate::customer::CustomerResult {
+                state: CustomerState::InstalledOff,
+                detail: "planned".into(),
+            },
+            document: Some("{\"plan\":true}".into()),
+        };
+        let mut j_out = Vec::new();
+        let mut j_err = Vec::new();
+        assert_eq!(
+            emit_plan_outcome(Ok(sample.clone()), true, &mut j_out, &mut j_err),
+            0
+        );
+        assert_eq!(String::from_utf8(j_out).unwrap().trim(), "{\"plan\":true}");
+        let mut t_out = Vec::new();
+        let mut t_err = Vec::new();
+        assert_eq!(
+            emit_plan_outcome(Ok(sample), false, &mut t_out, &mut t_err),
+            0
+        );
+        assert_eq!(String::from_utf8(t_out).unwrap().trim(), "planned");
+        let mut e_out = Vec::new();
+        let mut e_err = Vec::new();
+        assert_eq!(
+            emit_plan_outcome(Err(refused("bad")), false, &mut e_out, &mut e_err),
+            2
+        );
+        assert!(String::from_utf8(e_err).unwrap().contains("bad"));
+
+        let no_doc = CustomerOutcome {
+            result: crate::customer::CustomerResult {
+                state: CustomerState::InstalledOff,
+                detail: "planned".into(),
+            },
+            document: None,
+        };
+        assert_eq!(
+            emit_plan_outcome(Ok(no_doc), true, &mut Vec::new(), &mut Vec::new()),
+            0
+        );
+
+        struct FailingWrite;
+        impl Write for FailingWrite {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "broken pipe",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w_err = Vec::new();
+        assert_eq!(
+            run(
+                &["wizard".into(), "--json".into()],
+                &mut FailingWrite,
+                &mut w_err
+            ),
+            1
+        );
+        assert!(
+            String::from_utf8(w_err)
+                .unwrap()
+                .contains("setup wizard failed")
+        );
+
+        let mut wiz_out = Vec::new();
+        let mut wiz_err = Vec::new();
+        let code = run(
+            &["wizard".into(), "--json".into()],
+            &mut wiz_out,
+            &mut wiz_err,
+        );
+        assert!(code == 0 || code == 1);
     }
 }

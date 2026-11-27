@@ -523,3 +523,99 @@ fn wsl_startup_accepts_bounded_catalog_wait_without_blocking_origin() {
         ramshared_block::OriginState::Ready
     );
 }
+
+#[test]
+fn maybe_attach_pooled_cache_bypasses_independent_worker_for_staged_pooled_profile() {
+    use ramshared_wsl2d::pooled_cache::profile::{
+        CACHE_PROFILE_SCHEMA_VERSION, CacheProfile, StagedCacheProfile, stage_next_boot_profile,
+    };
+
+    let fixture = Fixture::new();
+    let backend = AuthoritativeOriginBackend::new(
+        held_file(&fixture),
+        OriginCache::Disabled(DisabledCache),
+        8192,
+        BLOCK_SIZE,
+    )
+    .unwrap();
+    let (backend, none_empty) = maybe_attach_pooled_cache(
+        std::path::Path::new("/nonexistent"),
+        "test",
+        "",
+        8192,
+        backend,
+    )
+    .unwrap();
+    assert!(none_empty.is_none());
+
+    let profile_path = fixture.root.join("cache-mode.json");
+    let doc = StagedCacheProfile {
+        schema_version: CACHE_PROFILE_SCHEMA_VERSION,
+        profile: CacheProfile::Pooled,
+        role: "secondary_guest".into(),
+        endpoint_version: 1,
+        data_port: 27698,
+        key_ref: "/nonexistent/pooled.key".into(),
+        release_binding: "v1.0.4".into(),
+        origin_binding: "synthetic-origin-binding".into(),
+        generation: 1,
+    };
+    stage_next_boot_profile(&profile_path, doc, false).unwrap();
+    let (backend_pooled, pooled) = maybe_attach_pooled_cache(
+        &profile_path,
+        "native-origin",
+        "synthetic-origin-binding",
+        8192,
+        backend,
+    )
+    .unwrap();
+    let session = pooled.expect("staged pooled profile suppresses independent worker");
+    assert!(!session.spawns_independent_worker());
+    assert_eq!(
+        session.status(None).effective_mode.as_str(),
+        "pooled_origin_only"
+    );
+    drop(backend_pooled);
+
+    // Exercise both WSL and Native `build_with_profile` pooled early-return branches.
+    let mut starter = InitialWorkerStarter {
+        initial: Some(Err("must not spawn independent worker".into())),
+        replacement_requests: 0,
+    };
+    let wsl_runtime = build_with_profile(
+        OpenedOrigin::Wsl(
+            held_file(&fixture),
+            SealedOrigin {
+                logical_capacity_mib: 1,
+                partuuid: "synthetic-origin-binding".into(),
+                origin_vhdx: "synthetic-host-origin".into(),
+            },
+        ),
+        8192,
+        0,
+        &mut starter,
+        std::time::Duration::ZERO,
+        &profile_path,
+    )
+    .unwrap();
+    assert!(wsl_runtime.pooled_session.is_some());
+    assert!(starter.initial.is_some());
+    drop(wsl_runtime);
+
+    let native_runtime = build_with_profile(
+        OpenedOrigin::Native(AdmittedOrigin {
+            file: held_file(&fixture),
+            logical_bytes: 8192,
+            manifest: fixture.manifest.clone(),
+            cache_session: None,
+        }),
+        8192,
+        0,
+        &mut starter,
+        std::time::Duration::ZERO,
+        &profile_path,
+    )
+    .unwrap();
+    assert!(native_runtime.pooled_session.is_some());
+    assert!(starter.initial.is_some());
+}

@@ -16,8 +16,10 @@ use ramshared_vram::{
     GpuAdapterIdentity, GpuBudgetTelemetry, GpuUtilizationTelemetry, WorkerCacheTelemetry,
 };
 use std::sync::Mutex;
+use std::time::Instant;
 
 mod cache_client;
+pub mod pooled_read;
 mod range_lock;
 
 pub(crate) use cache_client::mutation_frames;
@@ -26,6 +28,10 @@ pub use cache_client::{
     CacheMutation, CacheRead, CacheReleaseOutcome, DisabledCache, IsolatedCacheControl,
     IsolatedCacheRequest, IsolatedCacheWorker, MAX_CACHE_MUTATION_BYTES, RefuseCacheAdmission,
     isolated_cache_channel,
+};
+pub use pooled_read::{
+    DEFAULT_POOLED_LOOKUP_BUDGET, POOLED_PAGE_BYTES, POOLED_STAGING_SLOTS, PooledCacheClient,
+    PooledLookupReply, PooledReadState, PooledReadTelemetry, pooled_crc32c,
 };
 
 pub struct AuthoritativeOriginBackend<O, C> {
@@ -41,6 +47,7 @@ pub struct AuthoritativeOriginBackend<O, C> {
     block: u32,
     state: Mutex<BackendState>,
     admission: Box<dyn CacheAdmission>,
+    pooled: Option<PooledReadState>,
 }
 
 struct BackendState {
@@ -85,7 +92,18 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
                 admission_refusal: None,
             }),
             admission: Box::new(admission),
+            pooled: None,
         })
+    }
+
+    /// Attach a locally fenced pooled read cache leaf.
+    pub fn with_pooled_read(mut self, pooled: PooledReadState) -> Self {
+        self.pooled = Some(pooled);
+        self
+    }
+
+    pub fn pooled_read(&self) -> Option<&PooledReadState> {
+        self.pooled.as_ref()
     }
 
     /// Whether the cache may be used right now (DT-9), revoking what is
@@ -447,9 +465,22 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
 
 impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
     /// Serve a read. `&self`: the origin is positional, the cache socket and
-    /// the counters take their own locks (SPEC DT-3).
+    /// the counters take their own locks.
     pub fn read_at(&self, offset: u64, destination: &mut [u8]) -> Result<(), IoError> {
+        self.read_at_with_deadline(offset, destination, None)
+    }
+
+    /// Serve a read honoring an optional inherited deadline on the pooled read path.
+    pub fn read_at_with_deadline(
+        &self,
+        offset: u64,
+        destination: &mut [u8],
+        inherited_deadline: Option<Instant>,
+    ) -> Result<(), IoError> {
         self.check_range(offset, destination.len())?;
+        if let Some(pooled) = &self.pooled {
+            return self.read_at_pooled(pooled, offset, destination, inherited_deadline);
+        }
         let _range = self.ranges.read(offset, destination.len())?;
         self.require_ready_origin()?;
         if destination.is_empty() {
@@ -512,6 +543,56 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
         Ok(())
     }
 
+    fn read_at_pooled(
+        &self,
+        pooled: &PooledReadState,
+        offset: u64,
+        destination: &mut [u8],
+        inherited_deadline: Option<Instant>,
+    ) -> Result<(), IoError> {
+        let snapshot = {
+            let _range = self.ranges.read(offset, destination.len())?;
+            self.require_ready_origin()?;
+            if destination.is_empty() {
+                return Ok(());
+            }
+            pooled.snapshot(offset, destination.len())
+        };
+        if let Some((epoch, content_gen)) = snapshot
+            && let Some(attempt) =
+                pooled.try_lookup_remote(epoch, offset, content_gen, inherited_deadline)
+        {
+            let _range = self.ranges.read(offset, destination.len())?;
+            self.require_ready_origin()?;
+            if pooled.validate_and_copy_hit(attempt, offset, epoch, content_gen, destination) {
+                if let Ok(mut s) = self.state.lock() {
+                    s.telemetry.cache_read_bytes = s
+                        .telemetry
+                        .cache_read_bytes
+                        .saturating_add(destination.len() as u64);
+                    s.telemetry.cache_hits = s.telemetry.cache_hits.saturating_add(1);
+                }
+                return Ok(());
+            }
+        }
+        let offer_snap = {
+            let _range = self.ranges.read(offset, destination.len())?;
+            self.require_ready_origin()?;
+            self.origin
+                .read_exact_at(offset, destination)
+                .inspect_err(|_| self.mark_origin_failed())?;
+            pooled.record_origin_fallback();
+            if let Ok(mut s) = self.state.lock() {
+                s.telemetry.fallback_reads = s.telemetry.fallback_reads.saturating_add(1);
+            }
+            pooled.snapshot(offset, destination.len())
+        };
+        if let Some((epoch, content_gen)) = offer_snap {
+            pooled.offer_after_origin_read(epoch, offset, content_gen, destination);
+        }
+        Ok(())
+    }
+
     /// Serve a write: origin write-through first, then the best-effort mirror.
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), IoError> {
         self.check_range(offset, data.len())?;
@@ -524,11 +605,16 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
         if data.is_empty() {
             return Ok(());
         }
+        if let Some(pooled) = &self.pooled {
+            pooled.advance_written_stripes(offset, data.len());
+        }
         self.write_origin(offset, data)?;
         if let Ok(mut state) = self.state.lock() {
             state.telemetry.batched_writes = state.telemetry.batched_writes.saturating_add(1);
         }
-        self.update_cache(offset, data);
+        if self.pooled.is_none() {
+            self.update_cache(offset, data);
+        }
         Ok(())
     }
 
@@ -551,9 +637,14 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
         if data.is_empty() {
             return Ok(());
         }
+        if let Some(pooled) = &self.pooled {
+            pooled.advance_written_stripes(offset, data.len());
+        }
         self.write_origin(offset, data)?;
         self.sync_dirty_origin()?;
-        self.update_cache(offset, data);
+        if self.pooled.is_none() {
+            self.update_cache(offset, data);
+        }
         Ok(())
     }
 
@@ -598,7 +689,7 @@ impl<O: OriginStorage, C: BestEffortCache> BlockBackend for AuthoritativeOriginB
     }
 }
 
-/// The shared serving path (SPEC `wsl2-nbd-serving-throughput` DT-3): the same
+/// The shared serving path: the same
 /// origin authority, callable from many threads.
 impl<O: OriginStorage + Send + Sync, C: BestEffortCache + Send> crate::SharedBlockBackend
     for AuthoritativeOriginBackend<O, C>

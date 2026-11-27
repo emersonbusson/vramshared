@@ -152,6 +152,7 @@ fn production_nbd_adapters_and_starter_defaults_cover_synthetic_paths() {
         cache_target_kib: 0,
         serve_threads: 1,
         serve_requests_total: 0,
+        pooled_cache: None,
     });
     let _ = prod_starter.elapsed_us(Instant::now());
     let rx = prod_starter.spawn_swapoff(root.join("nonexistent-nbd").to_string_lossy().as_ref());
@@ -301,6 +302,7 @@ fn production_nbd_adapters_and_starter_defaults_cover_synthetic_paths() {
         cache_target_kib: 0,
         serve_threads: 1,
         serve_requests_total: 0,
+        pooled_cache: None,
     });
 
     let disarm_sock = root.join("disarm.sock");

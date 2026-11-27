@@ -28,6 +28,7 @@ mod native_sampler;
 pub mod ntpagefile;
 pub mod package;
 pub mod package_builder;
+pub mod pooled_cache;
 pub mod proto;
 pub mod runtime;
 pub mod service;

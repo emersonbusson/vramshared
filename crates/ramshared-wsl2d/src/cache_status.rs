@@ -26,6 +26,7 @@ pub(super) struct PublicationContext<'a> {
     pub(super) serve_requests_total: u64,
     pub(super) worker: CacheWorkerObservation<'a>,
     pub(super) control_admission: Option<&'a ControlPlaneCacheAdmission>,
+    pub(super) pooled_session: Option<&'a ramshared_wsl2d::pooled_cache::GuestCacheSession>,
 }
 
 #[derive(Default)]
@@ -183,7 +184,17 @@ fn snapshot(
         serve_requests_total,
         worker,
         control_admission,
+        pooled_session,
     } = context;
+    let pooled_cache = pooled_session.map(|session| {
+        let pooled_tel = cache.pooled_read().map(|p| {
+            if p.active_epoch() == 0 && session.active_epoch() != 0 {
+                session.retire_to_origin_only("pooled_epoch_retired");
+            }
+            p.telemetry()
+        });
+        session.status(pooled_tel)
+    });
     let host_memory = control_admission.and_then(ControlPlaneCacheAdmission::host_memory);
     let host_storage = control_admission.and_then(ControlPlaneCacheAdmission::host_storage);
     let host_gpu_activity = control_admission.and_then(|admission| {
@@ -279,6 +290,7 @@ fn snapshot(
         },
         serve_threads: *serve_threads,
         serve_requests_total: *serve_requests_total,
+        pooled_cache,
     }
 }
 
@@ -385,6 +397,9 @@ pub(super) struct OriginCacheStatus {
     /// Jobs served since this daemon instance started, including the
     /// dispatcher's inline queue-full fallbacks. Monotonic.
     pub(super) serve_requests_total: u64,
+    /// Optional pooled Hyper-V VRAM cache telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) pooled_cache: Option<ramshared_wsl2d::pooled_cache::PooledGuestStatus>,
 }
 
 /// Each atomic replacement owns a unique staging path. Exclusive creation
@@ -465,6 +480,7 @@ pub(super) fn publish_origin_cache_status<S: NbdRuntimeStarter + ?Sized>(
             serve_requests_total,
             worker,
             control_admission,
+            pooled_session: None,
         },
     ));
 }

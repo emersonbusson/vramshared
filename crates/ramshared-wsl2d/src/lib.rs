@@ -28,6 +28,7 @@ pub mod host_storage_match;
 pub mod host_storage_state;
 pub mod lease_supervisor;
 pub mod pid_file;
+pub mod pooled_cache;
 pub mod reply_budget;
 pub mod residency;
 pub mod state;
