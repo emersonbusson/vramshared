@@ -5,6 +5,8 @@
 // Source: https://github.com/emersonbusson/vramshared
 // File: crates/ramshared-block/src/gpu_cache_worker/slab_pages.rs
 //! Page-indexed normal I/O over the device slab codec.
+use std::io::Write;
+
 use super::*;
 use ramshared_vram::device_codec::{CodecError, MAX_BATCH_PAGES, PAGE_BYTES, PageDecodeStatus};
 
@@ -155,8 +157,7 @@ impl<'p, P: VramProvider + 'p> GpuCacheWorker<'p, P> {
                     bridge.invalidate_ticket(ticket);
                 }
                 if matches!(result, Err(CodecError::DeadlineExceeded)) {
-                    self.compressed.note_codec_timeout();
-                    self.disabled = true;
+                    self.disable_after_codec_deadline("compression");
                 }
                 self.invalidate_device_pages(offset, end);
                 return false;
@@ -174,6 +175,20 @@ impl<'p, P: VramProvider + 'p> GpuCacheWorker<'p, P> {
             self.sync_device_host_metadata();
         }
         true
+    }
+
+    pub(super) fn disable_after_codec_deadline(&mut self, operation: &'static str) {
+        self.compressed.note_codec_timeout();
+        if self.disabled {
+            return;
+        }
+        self.disabled = true;
+        // The worker can exit before its next telemetry heartbeat.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[ramsharedd] GPU worker codec deadline exceeded: operation={operation} pid={}",
+            std::process::id()
+        );
     }
 
     pub(super) fn read_device_pages(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
@@ -204,8 +219,7 @@ impl<'p, P: VramProvider + 'p> GpuCacheWorker<'p, P> {
                     }
                 }
                 if matches!(error, CodecError::DeadlineExceeded) {
-                    self.compressed.note_codec_timeout();
-                    self.disabled = true;
+                    self.disable_after_codec_deadline("decompression");
                 }
                 return None;
             }
