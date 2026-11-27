@@ -21,11 +21,20 @@ import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as source:
         result = json.load(source)
-    ready = type(result.get("schema_version")) is int and result.get("schema_version") == 4
+    version = result.get("schema_version")
+    ready = type(version) is int and version in (4, 5)
     ready = ready and result.get("control_state") == "HEALTHY"
     ready = ready and result.get("guardian_state") == "HEALTHY" and result.get("origin_state") == "READY"
     ready = ready and result.get("topology_ok") is True and result.get("ghost") is False
-    ready = ready and result.get("activation", {}).get("active") is True
+    if version == 5 and result.get("posture") == "writeback":
+        logical_capacity = result.get("capacity", {}).get("logical_capacity_kib")
+        ready = ready and result.get("protection_state") in ("READY", "ACTIVE")
+        ready = ready and result.get("tiers", {}).get("zram", {}).get("present") is True
+        ready = ready and result.get("tier_roles", {}).get("writeback_target_is_tier") is True
+        ready = ready and result.get("tier_state") == "bound"
+        ready = ready and type(logical_capacity) is int and logical_capacity > 0
+    else:
+        ready = ready and result.get("activation", {}).get("active") is True
     ready = ready and result.get("daemon", {}).get("alive") is True
     ready = ready and result.get("measurement_errors") == []
     if sys.argv[2] == "0":
