@@ -110,7 +110,7 @@ mod tests {
         vec![CgroupSample {
             identity: CgroupIdentity { device: 1, inode },
             limit_bytes: Some(1_000),
-            current_bytes: 100,
+            current_bytes: Some(100),
             sampled_at_unix_ms: time,
         }]
     }

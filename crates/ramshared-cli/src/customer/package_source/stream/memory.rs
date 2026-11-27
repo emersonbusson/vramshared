@@ -27,7 +27,7 @@ impl MemoryObservation {
                 inode: 1,
             },
             limit_bytes: None,
-            current_bytes: 0,
+            current_bytes: Some(0),
             sampled_at_unix_ms,
         }]
     }
@@ -200,7 +200,7 @@ mod tests {
                     inode: 1,
                 },
                 limit_bytes: None,
-                current_bytes: 0,
+                current_bytes: Some(0),
                 sampled_at_unix_ms: 1,
             };
             assert!(MemoryObservation::from_live_sources(Some(vec![group])).is_none());
@@ -242,7 +242,7 @@ mod tests {
                 inode: 1,
             },
             limit_bytes: None,
-            current_bytes: 0,
+            current_bytes: Some(0),
             sampled_at_unix_ms: now,
         };
         let result = MemoryObservation::with_live_guest(host, Some(vec![fixture_group])).unwrap();
@@ -265,11 +265,11 @@ mod tests {
                 inode: 2,
             },
             limit_bytes: Some(500),
-            current_bytes: 250,
+            current_bytes: Some(250),
             sampled_at_unix_ms: 100,
         }]);
         assert!(!policy().admits_at(&sample, 101));
-        sample.cgroups.as_mut().unwrap()[0].current_bytes = 200;
+        sample.cgroups.as_mut().unwrap()[0].current_bytes = Some(200);
         assert!(policy().admits_at(&sample, 101));
     }
 

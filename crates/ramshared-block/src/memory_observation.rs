@@ -23,7 +23,7 @@ pub struct CgroupIdentity {
 pub struct CgroupSample {
     pub identity: CgroupIdentity,
     pub limit_bytes: Option<u64>,
-    pub current_bytes: u64,
+    pub current_bytes: Option<u64>,
     pub sampled_at_unix_ms: u64,
 }
 
@@ -76,9 +76,42 @@ fn metric(directory: impl AsFd, name: &str) -> io::Result<String> {
     read_bounded(File::from(fd))
 }
 
-fn sample_group(directory: impl AsFd, sampled: u64) -> io::Result<CgroupSample> {
+fn is_global_root(directory: impl AsFd) -> bool {
+    // These controls exist only below the kernel's global cgroup v2 root.
+    let absent =
+        |name| metric(&directory, name).is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+    absent("cgroup.type")
+        && absent("memory.current")
+        && metric(&directory, "cgroup.controllers")
+            .is_ok_and(|controllers| controllers.split_whitespace().any(|name| name == "memory"))
+}
+
+fn sample_group(
+    directory: impl AsFd,
+    sampled: u64,
+    at_mount_root: bool,
+) -> io::Result<CgroupSample> {
     let stat = rustix::fs::fstat(&directory)?;
-    let maximum = metric(&directory, "memory.max")?;
+    let identity = CgroupIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    };
+    let maximum = match metric(&directory, "memory.max") {
+        Ok(maximum) => maximum,
+        Err(error)
+            if at_mount_root
+                && error.kind() == io::ErrorKind::NotFound
+                && is_global_root(&directory) =>
+        {
+            return Ok(CgroupSample {
+                identity,
+                limit_bytes: None,
+                current_bytes: None,
+                sampled_at_unix_ms: sampled,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let current = metric(&directory, "memory.current")?;
     let limit_bytes = match maximum.trim() {
         "max" => None,
@@ -93,12 +126,9 @@ fn sample_group(directory: impl AsFd, sampled: u64) -> io::Result<CgroupSample> 
         .parse::<u64>()
         .map_err(|_| invalid("invalid memory.current"))?;
     Ok(CgroupSample {
-        identity: CgroupIdentity {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        },
+        identity,
         limit_bytes,
-        current_bytes,
+        current_bytes: Some(current_bytes),
         sampled_at_unix_ms: sampled,
     })
 }
@@ -132,11 +162,11 @@ fn visible_cgroups_inner(
     };
     check_filesystem(&directory)?;
     let mut samples = Vec::with_capacity(components.len() + 1);
-    samples.push(sample_group(&directory, sampled_at_unix_ms)?);
+    samples.push(sample_group(&directory, sampled_at_unix_ms, true)?);
     for component in components {
         directory = openat(&directory, component, flags, Mode::empty())?;
         check_filesystem(&directory)?;
-        samples.push(sample_group(&directory, sampled_at_unix_ms)?);
+        samples.push(sample_group(&directory, sampled_at_unix_ms, false)?);
     }
     Ok(samples)
 }

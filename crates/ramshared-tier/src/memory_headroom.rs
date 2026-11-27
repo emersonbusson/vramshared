@@ -26,7 +26,8 @@ pub struct CgroupSample {
     pub identity: CgroupIdentity,
     /// `None` is a verified unlimited limit, not an unreadable limit.
     pub limit_bytes: Option<u64>,
-    pub current_bytes: u64,
+    /// Usage is absent at the verified unbounded global cgroup root.
+    pub current_bytes: Option<u64>,
     pub sampled_at_unix_ms: u64,
 }
 
@@ -87,7 +88,7 @@ pub fn shared_headroom(
         if let Some(limit) = group.limit_bytes {
             available = available.min(
                 limit
-                    .checked_sub(group.current_bytes)?
+                    .checked_sub(group.current_bytes?)?
                     .saturating_sub(guest_reserve_bytes),
             );
         }
@@ -120,7 +121,7 @@ mod tests {
                     inode: 1,
                 },
                 limit_bytes: Some(70),
-                current_bytes: 20,
+                current_bytes: Some(20),
                 sampled_at_unix_ms: 1000,
             },
             CgroupSample {
@@ -129,7 +130,7 @@ mod tests {
                     inode: 1,
                 },
                 limit_bytes: Some(100),
-                current_bytes: 60,
+                current_bytes: Some(60),
                 sampled_at_unix_ms: 1000,
             },
         ];
@@ -144,6 +145,28 @@ mod tests {
         assert_eq!(
             shared_headroom(guest, host, Some(&groups), 90, 20, 1005, 5),
             Some(0)
+        );
+    }
+    #[test]
+    fn unlimited_global_root_does_not_hide_unmeasured_finite_limits() {
+        let guest = sample(100, 80, 1000);
+        let mut group = CgroupSample {
+            identity: CgroupIdentity {
+                device: 1,
+                inode: 1,
+            },
+            limit_bytes: None,
+            current_bytes: None,
+            sampled_at_unix_ms: 1000,
+        };
+        assert_eq!(
+            shared_headroom(guest, HostScope::Native, Some(&[group]), 10, 0, 1000, 5),
+            Some(70)
+        );
+        group.limit_bytes = Some(50);
+        assert_eq!(
+            shared_headroom(guest, HostScope::Native, Some(&[group]), 10, 0, 1000, 5),
+            None
         );
     }
     #[test]
@@ -179,7 +202,7 @@ mod tests {
                 inode: 1,
             },
             limit_bytes: Some(10),
-            current_bytes: 11,
+            current_bytes: Some(11),
             sampled_at_unix_ms: 1000,
         };
         assert_eq!(
