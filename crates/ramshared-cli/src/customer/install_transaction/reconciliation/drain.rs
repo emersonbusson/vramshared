@@ -9,6 +9,7 @@
 
 //! Reconcile a published package with durable installer drain custody.
 
+use super::super::published_source::find_drain_bundle;
 use super::super::runtime_recovery::{verify_committed_approvals, verify_committed_selection};
 use crate::cascade::boot_policy_effect::BootPolicyHost;
 use crate::cascade::posture::Posture;
@@ -22,7 +23,6 @@ use crate::customer::install_tokens::{recover_activation_approval, recover_enrol
 use crate::customer::install_transaction::InstallEnvironment;
 use crate::customer::install_units::UnitHost;
 use crate::customer::package_selector::{inspect_effect_journal, settle_observed_publication};
-use crate::customer::release_ordering::find_previous_bundle;
 use crate::customer::transition::{CustomerTransitionGuard, PackagePending, recovery_refusal};
 use crate::release_identity::read_release_version;
 
@@ -68,9 +68,9 @@ pub(in crate::customer::install_transaction) fn recovered_request(
             .as_deref()
             .unwrap_or(&env.default_bundle_root);
         let policy = req.policy.as_deref().unwrap_or(&env.default_policy);
-        find_previous_bundle(root, policy, env.owner_uid, &inputs.candidate_manifest)?.ok_or_else(
-            || recovery_refusal("original signed package is unavailable for recovery"),
-        )?
+        find_drain_bundle(env, root, policy, &inputs.candidate_manifest)?.ok_or_else(|| {
+            recovery_refusal("original signed package is unavailable for recovery")
+        })?
     };
     Ok(InstallRequest {
         mode: InstallMode::Apply,

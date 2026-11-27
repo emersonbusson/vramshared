@@ -23,7 +23,7 @@ use super::super::render::make_bar;
 use super::fmt_bytes;
 use crate::operation_progress::{
     OperationKind, OperationProgressV1, PACKAGE_COMMIT, PACKAGE_STAGE, PACKAGE_VERIFY,
-    unix_epoch_ms,
+    UPDATE_DOWNLOAD_PHASE, unix_epoch_ms,
 };
 
 mod package;
@@ -78,7 +78,15 @@ fn build_cli_operation_banner(
     {
         return package::build_package_banner(progress, language, now_unix_ms);
     }
-    let title = if let Some(upgrade) = progress.upgrade.as_ref() {
+    let downloading =
+        progress.kind == OperationKind::ReleaseSync && progress.phase == UPDATE_DOWNLOAD_PHASE;
+    let title = if downloading {
+        let label = match language {
+            Language::En => "UPDATE",
+            Language::PtBr => "ATUALIZAÇÃO",
+        };
+        format!(" {label} ")
+    } else if let Some(upgrade) = progress.upgrade.as_ref() {
         let label = match language {
             Language::En => "UPDATE",
             Language::PtBr => "ATUALIZAÇÃO",
@@ -91,6 +99,14 @@ fn build_cli_operation_banner(
             operation_kind_label(language, progress.kind)
         )
     };
+    if downloading && progress.total_bytes == 0 {
+        return OperationBannerContent {
+            title,
+            primary_line: format!(" {}", operation_phase_label(language, &progress.phase)),
+            secondary_line: String::new(),
+            border_color: Color::Cyan,
+        };
+    }
     let pct = progress.percent();
     let bar = make_bar(u64::from(pct), BANNER_BAR_WIDTH);
     let step_label = dashboard_phrase(language, DashboardPhrase::StepLabel);
@@ -384,6 +400,22 @@ mod tests {
         let banner = build_operation_banner(&obs, Language::PtBr).expect("commit banner");
         assert!(banner.primary_line.contains("3/3"));
         assert!(!banner.primary_line.contains('%'));
+
+        let progress = obs.operation_progress.as_mut().expect("live progress");
+        progress.kind = OperationKind::ReleaseSync;
+        progress.phase = UPDATE_DOWNLOAD_PHASE.to_owned();
+        progress.target = Some("v1.0.4".into());
+        progress.step_index = 1;
+        progress.total_steps = 1;
+        let starting = build_operation_banner(&obs, Language::PtBr).expect("download banner");
+        assert!(!starting.primary_line.contains('%'));
+        let progress = obs.operation_progress.as_mut().expect("live progress");
+        progress.total_bytes = 2 * 1024 * 1024;
+        progress.completed_bytes = 512 * 1024;
+        let transfer = build_operation_banner(&obs, Language::PtBr).expect("download banner");
+        assert!(transfer.title.contains("ATUALIZAÇÃO"));
+        assert!(transfer.primary_line.contains("25%"));
+        assert!(transfer.primary_line.contains("v1.0.4"));
 
         // Clear CLI operation, test daemon VRAM cache demote drain banner.
         obs.operation_progress = None;

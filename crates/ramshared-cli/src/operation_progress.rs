@@ -41,6 +41,8 @@ pub(crate) const MAX_FUTURE_SKEW_MS: u64 = 5_000;
 pub(crate) const SWAPOFF_POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub(crate) const SYSTEM_OPERATION_PROGRESS_PATH: &str = "/run/ramshared/operation-progress.json";
 pub(crate) const OPERATION_PROGRESS_PATH_ENV: &str = "RAMSHARED_OPERATION_PROGRESS_PATH";
+pub(crate) const UPDATE_DOWNLOAD_PATH: &str = "/run/ramshared/update-download-progress.json";
+pub(crate) const UPDATE_DOWNLOAD_PHASE: &str = "download_update";
 
 static OPERATION_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -211,11 +213,16 @@ fn validate_record_shape(record: &OperationProgressV1) -> bool {
 }
 
 pub(crate) fn read_live_operation_progress() -> Option<OperationProgressV1> {
-    read_live_operation_progress_from(
-        &resolve_operation_progress_path(),
-        Path::new("/proc"),
-        unix_epoch_ms(),
-    )
+    let path = resolve_operation_progress_path();
+    let proc = Path::new("/proc");
+    let now = unix_epoch_ms();
+    read_live_operation_progress_from(&path, proc, now).or_else(|| {
+        if path == Path::new(SYSTEM_OPERATION_PROGRESS_PATH) {
+            read_live_operation_progress_from(Path::new(UPDATE_DOWNLOAD_PATH), proc, now)
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn read_live_operation_progress_from(

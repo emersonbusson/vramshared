@@ -36,8 +36,8 @@ use super::package_source::DeclaredBundle;
 use super::package_source::stream::MemoryObservation;
 use super::package_trust::{VerifiedSignature, verify_bundle_from_policy};
 use super::release_ordering::{
-    AutoUpdatePolicy, ReleaseOrder, find_newest_bundle, find_previous_bundle,
-    read_auto_update_policy, read_enrolled_posture, release_is_newer,
+    AutoUpdatePolicy, ReleaseOrder, find_newest_bundle, read_auto_update_policy,
+    read_enrolled_posture, release_is_newer,
 };
 use super::transition::TransitionPaths;
 use super::{CustomerError, CustomerReason, CustomerState};
@@ -46,6 +46,7 @@ use crate::cascade::boot_policy_host::SystemBootPolicyHost;
 use crate::cascade::posture::Posture;
 use crate::release_identity::read_release_version;
 
+mod published_source;
 mod reconciliation;
 mod runtime_recovery;
 use reconciliation::{
@@ -100,6 +101,7 @@ impl InstallEnvironment {
 struct AutoUpdateContext<'a> {
     policy_path: &'a Path,
     policy_opt: Option<AutoUpdatePolicy>,
+    published: bool,
     running: Option<String>,
     enrolled: Option<Posture>,
     newest: Option<PathBuf>,
@@ -389,6 +391,7 @@ fn load_auto_update_context<'a>(
     req: &'a InstallRequest,
     env: &'a InstallEnvironment,
     active: Option<&DrainInputs>,
+    fetched: Option<published_source::FetchedPatch>,
 ) -> Result<AutoUpdateContext<'a>, CustomerError> {
     let policy_path = req.policy.as_deref().unwrap_or(&env.default_policy);
     let owner = env.require_root.then_some(0).or(Some(env.owner_uid));
@@ -402,23 +405,28 @@ fn load_auto_update_context<'a>(
         .as_deref()
         .or_else(|| policy_opt.as_ref().and_then(|p| p.bundle_root.as_deref()))
         .unwrap_or(&env.default_bundle_root);
+    let published = published_source::enabled(req, policy_opt.as_ref());
     let newest = match active {
         Some(active) => Some(
-            find_previous_bundle(
+            published_source::find_drain_bundle(
+                env,
                 bundle_root,
                 policy_path,
-                env.owner_uid,
                 &active.candidate_manifest,
             )?
             .ok_or_else(|| {
                 super::transition::recovery_refusal("original signed upgrade bundle is unavailable")
             })?,
         ),
+        None if published => {
+            fetched.and_then(|patch| patch.for_running(running.as_deref(), &env.selector_path()))
+        }
         None => find_newest_bundle(bundle_root).ok().flatten(),
     };
     Ok(AutoUpdateContext {
         policy_path,
         policy_opt,
+        published,
         running,
         enrolled,
         newest,
@@ -751,7 +759,7 @@ fn run_auto_update(
     memory_obs: &mut dyn FnMut() -> Option<MemoryObservation>,
     stdout: &mut dyn Write,
 ) -> Result<(), CustomerError> {
-    let lock = if mode == AutoUpdateMode::Apply {
+    let mut lock = if mode == AutoUpdateMode::Apply {
         require_root(env)?;
         installer_lock(env, lifecycle)?
     } else {
@@ -762,7 +770,17 @@ fn run_auto_update(
         .map(InstallerLock::active_inputs)
         .transpose()?
         .flatten();
-    let ctx = load_auto_update_context(req, env, active.as_ref())?;
+    let fetched = if mode == AutoUpdateMode::Apply && active.is_none() {
+        published_source::fetch_outside_install_lock(req, env, lifecycle, &mut lock)?
+    } else {
+        None
+    };
+    let active = lock
+        .as_ref()
+        .map(InstallerLock::active_inputs)
+        .transpose()?
+        .flatten();
+    let ctx = load_auto_update_context(req, env, active.as_ref(), fetched)?;
     if mode == AutoUpdateMode::Status {
         write_auto_update_status(
             ctx.policy_path,
@@ -773,6 +791,10 @@ fn run_auto_update(
             req.json,
             stdout,
         );
+        return Ok(());
+    }
+    if ctx.published && ctx.newest.is_none() {
+        published_source::write_no_prepared_patch(req.json, stdout);
         return Ok(());
     }
     let running = ctx.running.clone();

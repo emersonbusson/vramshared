@@ -382,6 +382,7 @@ pub(super) fn write_auto_update_status(
         let doc = serde_json::json!({
             "policy": policy_path.display().to_string(),
             "enabled": policy.map(|p| p.enabled),
+            "source": policy.map(|p| if p.published { "github" } else { "local" }),
             "lower_sink": policy.and_then(|p| p.lower_sink.as_ref()).map(|p| p.display().to_string()),
             "bundle_root": policy.and_then(|p| p.bundle_root.as_ref()).map(|p| p.display().to_string()),
             "release_keyring": policy.and_then(|p| p.release_keyring.as_ref()).map(|p| p.display().to_string()),
@@ -395,6 +396,11 @@ pub(super) fn write_auto_update_status(
     let _ = writeln!(stdout, "policy: {}", policy_path.display());
     if let Some(p) = policy {
         let _ = writeln!(stdout, "enabled: {}", u8::from(p.enabled));
+        let _ = writeln!(
+            stdout,
+            "source: {}",
+            if p.published { "github" } else { "local" }
+        );
         let _ = writeln!(
             stdout,
             "lower_sink: {}",

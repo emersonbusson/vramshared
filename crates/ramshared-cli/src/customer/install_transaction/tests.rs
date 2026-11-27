@@ -1000,6 +1000,7 @@ fn install_args_plan_reconcile_and_apply_error_paths_cover_all_refusals() {
     // Formatters cover text & JSON variants.
     let mut fmt_out = Vec::new();
     let sample_policy = AutoUpdatePolicy {
+        published: false,
         enabled: true,
         lower_sink: Some(PathBuf::from("/sink")),
         bundle_root: Some(PathBuf::from("/bundles")),

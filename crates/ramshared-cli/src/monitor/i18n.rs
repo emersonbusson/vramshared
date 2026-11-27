@@ -706,6 +706,8 @@ pub(super) fn operation_phase_label(language: Language, phase: &str) -> &str {
         (Language::PtBr, "commit_config") => "gravando configuração",
         (Language::En, "verify") => "verifying state",
         (Language::PtBr, "verify") => "verificando estado",
+        (Language::En, "download_update") => "downloading signed package",
+        (Language::PtBr, "download_update") => "baixando pacote assinado",
         (Language::En, "observe_fleet") => "inspecting active units",
         (Language::PtBr, "observe_fleet") => "inspecionando unidades ativas",
         (Language::En, "restart_services") => "restarting managed services",

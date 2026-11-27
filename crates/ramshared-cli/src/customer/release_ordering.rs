@@ -53,6 +53,7 @@ impl ReleaseOrder {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AutoUpdatePolicy {
     pub(super) enabled: bool,
+    pub(super) published: bool,
     pub(super) lower_sink: Option<PathBuf>,
     pub(super) bundle_root: Option<PathBuf>,
     pub(super) release_keyring: Option<PathBuf>,
@@ -134,6 +135,11 @@ fn parse_release_parts(value: &str) -> Option<ReleaseParts<'_>> {
         count,
         dirty: is_dirty,
     })
+}
+
+pub(super) fn stable_release_series(value: &str) -> Option<[&str; 2]> {
+    let parts = parse_release_parts(value)?;
+    (!value.contains(['-', '+'])).then_some([parts.version[0], parts.version[1]])
 }
 
 /// Strictly compares `candidate` vs `running` (`release_is_newer` single authority).
@@ -341,6 +347,7 @@ pub(super) fn parse_auto_update_policy(bytes: &[u8]) -> Result<AutoUpdatePolicy,
         ));
     }
     let mut enabled = None;
+    let mut published = None;
     let mut lower_sink = None;
     let mut bundle_root = None;
     let mut release_keyring = None;
@@ -354,6 +361,19 @@ pub(super) fn parse_auto_update_policy(bytes: &[u8]) -> Result<AutoUpdatePolicy,
         };
         match key {
             "enabled" if enabled.is_none() => enabled = Some(val == "1"),
+            "source" if published.is_none() => {
+                published = Some(match val {
+                    "local" => false,
+                    "github" => true,
+                    _ => {
+                        return Err(fs_error(
+                            CustomerReason::UnsupportedSurface,
+                            "NBD_INSTALL_REASON=POLICY_VALUE_INVALID (source)",
+                            CustomerState::InstalledOff,
+                        ));
+                    }
+                });
+            }
             "lower_sink" if lower_sink.is_none() => {
                 lower_sink = Some(validate_safe_absolute(val, "lower_sink")?);
             }
@@ -363,7 +383,7 @@ pub(super) fn parse_auto_update_policy(bytes: &[u8]) -> Result<AutoUpdatePolicy,
             "release_keyring" if release_keyring.is_none() => {
                 release_keyring = Some(validate_safe_absolute(val, "release_keyring")?);
             }
-            "enabled" | "lower_sink" | "bundle_root" | "release_keyring" => {
+            "enabled" | "source" | "lower_sink" | "bundle_root" | "release_keyring" => {
                 return Err(fs_error(
                     CustomerReason::UnsupportedSurface,
                     format!("NBD_INSTALL_REASON=POLICY_DUPLICATE_KEY ({key})"),
@@ -375,6 +395,7 @@ pub(super) fn parse_auto_update_policy(bytes: &[u8]) -> Result<AutoUpdatePolicy,
     }
     Ok(AutoUpdatePolicy {
         enabled: enabled.unwrap_or(false),
+        published: published.unwrap_or(false),
         lower_sink,
         bundle_root,
         release_keyring,
