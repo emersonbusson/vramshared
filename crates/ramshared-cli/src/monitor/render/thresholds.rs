@@ -230,11 +230,7 @@ pub(in crate::monitor) fn compression_row(
     let Some(sample) = sample.filter(|value| !value.is_null()) else {
         return "not measured".to_string();
     };
-    let orig = sample.get("orig_data_bytes").and_then(Value::as_u64);
-    let compr = sample.get("compr_data_bytes").and_then(Value::as_u64);
-    let (Some(orig), Some(compr)) = (orig, compr) else {
-        // A field the kernel did not report is not a zero. Same rule the
-        // memory-events counters use: absence stays absent.
+    let Some((orig, compr)) = resident_compression_from_status(sample) else {
         return "not measured".to_string();
     };
     // `compression_ratio_of` refuses any pair with a zero on either side,
@@ -244,6 +240,14 @@ pub(in crate::monitor) fn compression_row(
     // touches them: they are the row's own non-measurement wordings, and
     // absence is more specific than a refresh failure.
     let ratio_text = match compression_ratio_of(orig, compr) {
+        None if orig == 0
+            && sample
+                .get("backed_data_bytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|bytes| bytes > 0) =>
+        {
+            return "no resident pages (backing storage in use)".to_string();
+        }
         Some(ratio) => sample_derived(sample_stale, format!("{ratio:.2}:1")),
         None if orig == 0 && compr == 0 => {
             return "holding nothing (no ratio yet)".to_string();

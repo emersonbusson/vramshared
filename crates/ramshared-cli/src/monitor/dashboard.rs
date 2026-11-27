@@ -31,6 +31,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
 use views::{draw_details, draw_help, draw_pressure};
 
+use crate::zram_compression::{compression_ratio_of, resident_compression_from_status};
+
 use super::classify::observation_sample_is_stale;
 use super::i18n::{
     DashboardPhrase, Language, dashboard_phrase, pressure_class, pressure_label, reason_label,
@@ -458,17 +460,8 @@ fn tier_bytes(observation: &Observation, name: &str) -> Option<(u64, u64)> {
 fn zram_ratio_line(observation: &Observation, language: Language) -> String {
     let ratio = observation
         .value("zram_compression")
-        .and_then(|value| {
-            value
-                .get("orig_data_bytes")
-                .and_then(|value| value.as_u64())
-                .zip(
-                    value
-                        .get("compr_data_bytes")
-                        .and_then(|value| value.as_u64()),
-                )
-        })
-        .and_then(|(orig, stored)| (stored > 0).then(|| orig as f64 / stored as f64));
+        .and_then(resident_compression_from_status)
+        .and_then(|(original, stored)| compression_ratio_of(original, stored));
     ratio.map_or_else(
         || text(language).not_measured.to_string(),
         |ratio| format!("zram {}:1", language.number(format!("{ratio:.2}"))),

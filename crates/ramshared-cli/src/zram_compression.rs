@@ -23,9 +23,11 @@ use crate::cascade::{self, SwapTierRole};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct ZramCompression {
-    /// Uncompressed size of the data the device currently holds, in bytes.
+    /// Logical bytes in occupied slots, including data on backing storage.
     pub orig_data_bytes: u64,
-    /// Compressed size of that same data, in bytes.
+    /// Logical bytes in backing storage, if measured for every counted device.
+    pub backed_data_bytes: Option<u64>,
+    /// Compressor output for the resident data, in bytes.
     pub compr_data_bytes: u64,
     /// Memory the device has actually allocated for it, in bytes.
     ///
@@ -60,8 +62,9 @@ pub struct ZramCompression {
     /// page and increments `compr` only on the compressed path, and
     /// `write_same_filled_page` never allocates a compressed body. So the
     /// saving they represent is **already inside**
-    /// `orig_data_bytes - compr_data_bytes`. Reading this count as a second
-    /// saving and adding `same_pages * PAGE_SIZE` on top of that difference
+    /// the difference between resident logical bytes and compressed bytes.
+    /// Reading this count as a second saving and adding `same_pages * PAGE_SIZE`
+    /// on top of that difference
     /// would count the same pages twice. It is published so a reader can see
     /// how much of the ratio came from the fill references, not so the reader
     /// can add it again.
@@ -148,12 +151,43 @@ pub(crate) fn all_stored_pages_same_filled(
     orig_data_bytes > 0 && compr_data_bytes == 0 && same_pages != Some(0)
 }
 
+/// Match the compressed count to the logical slots that remain in RAM.
+fn resident_compression_bytes(
+    original: u64,
+    backed: Option<u64>,
+    compressed: u64,
+) -> Option<(u64, u64)> {
+    let backed = backed.or_else(|| (original == 0).then_some(0))?;
+    let resident = original.checked_sub(backed)?;
+    (!unproducible_pair(resident, compressed)).then_some((resident, compressed))
+}
+
+/// Dashboard views may have only these counters, without allocator or codec fields.
+pub(crate) fn resident_compression_from_status(value: &serde_json::Value) -> Option<(u64, u64)> {
+    resident_compression_bytes(
+        value.get("orig_data_bytes")?.as_u64()?,
+        value
+            .get("backed_data_bytes")
+            .and_then(serde_json::Value::as_u64),
+        value.get("compr_data_bytes")?.as_u64()?,
+    )
+}
+
 impl ZramCompression {
+    pub(crate) fn resident_compression(&self) -> Option<(u64, u64)> {
+        resident_compression_bytes(
+            self.orig_data_bytes,
+            self.backed_data_bytes,
+            self.compr_data_bytes,
+        )
+    }
+
     /// Uncompressed over compressed size. `None` when the device holds
     /// nothing, because there is no ratio to report — a `1.0` here would
     /// claim a measurement that did not happen.
     pub fn compression_ratio(&self) -> Option<f64> {
-        compression_ratio_of(self.orig_data_bytes, self.compr_data_bytes)
+        let (original, compressed) = self.resident_compression()?;
+        compression_ratio_of(original, compressed)
     }
 
     /// The one published shape of a compression sample.
@@ -179,8 +213,9 @@ impl ZramCompression {
 
 impl Serialize for ZramCompression {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("ZramCompression", 7)?;
+        let mut state = serializer.serialize_struct("ZramCompression", 8)?;
         state.serialize_field("orig_data_bytes", &self.orig_data_bytes)?;
+        state.serialize_field("backed_data_bytes", &self.backed_data_bytes)?;
         state.serialize_field("compr_data_bytes", &self.compr_data_bytes)?;
         state.serialize_field("mem_used_bytes", &self.mem_used_bytes)?;
         state.serialize_field("huge_pages", &self.huge_pages)?;
@@ -191,7 +226,7 @@ impl Serialize for ZramCompression {
     }
 }
 
-/// Sum the `mm_stat` of every Tier 1 swap device on this host.
+/// Sum the logical, backing and compressor counters of every Tier 1 swap device.
 ///
 /// A sample only means something while the pressure that created it is still
 /// resident: a read taken after the ramp drops its buffers, or after a
@@ -201,7 +236,7 @@ pub fn read_zram_compression() -> Option<ZramCompression> {
     zram_compression_from(Path::new("/sys/block"), &swaps)
 }
 
-/// The reader's pure core: resolve Tier 1 swap devices, sum their `mm_stat`.
+/// Resolve the Tier 1 devices and sum their measured counters.
 ///
 /// The sum is over **every** Tier 1 device the swap table names, or it does not
 /// exist. A named device whose `mm_stat` will not read, whose body does not
@@ -212,7 +247,10 @@ pub fn read_zram_compression() -> Option<ZramCompression> {
 /// counts are bare `u64` and cannot be demoted field by field, and none of the
 /// other fields would be complete either.
 fn zram_compression_from(sys_block: &Path, swaps: &str) -> Option<ZramCompression> {
-    let mut total = ZramCompression::default();
+    let mut total = ZramCompression {
+        backed_data_bytes: Some(0),
+        ..ZramCompression::default()
+    };
     let mut seen = false;
     // `Some(name)` once a device reported one, `None` before any did, and the
     // held name is dropped to `None` on a disagreement — see `compressor`.
@@ -229,24 +267,35 @@ fn zram_compression_from(sys_block: &Path, swaps: &str) -> Option<ZramCompressio
     let mut huge_pages_incomplete = false;
     let mut same_pages_incomplete = false;
     for device in zram_swap_devices(swaps) {
-        // The two byte counts come from one `mm_stat` read and cannot disagree
-        // with each other. The compressor name is a second file, so it is the
-        // one fact this reader can still tear: a zram reset between the two
-        // reads would leave the bytes describing one incarnation of the device
-        // and the name describing another. Read the name before and after
-        // `mm_stat` and keep it only when both reads agree — see
-        // [`agreed_compressor`].
+        // Bracket `mm_stat` so a changing backing count or algorithm cannot
+        // be presented as part of a stable resident observation.
+        let device_path = sys_block.join(&device);
         let algorithm_before = read_active_zram_algorithm(sys_block, &device);
+        let backed_before = read_zram_backed_bytes(&device_path);
         // A Tier 1 device the swap table names and whose `mm_stat` will not
         // read has not answered. Skipping it would publish the survivors'
         // bytes as the tier total — the same partial sum the incomplete marks
         // below refuse — and would even let a column the silent device never
         // reported stop demoting, by ceasing to count as a counted device.
         // A body that does not parse is not an answer either.
-        let Ok(text) = fs::read_to_string(sys_block.join(&device).join("mm_stat")) else {
+        let Ok(text) = fs::read_to_string(device_path.join("mm_stat")) else {
             return None;
         };
         let mut sample = parse_zram_mm_stat(&text)?;
+        let backed_after = read_zram_backed_bytes(&device_path);
+        sample.backed_data_bytes = backed_before.filter(|&backed| {
+            Some(backed) == backed_after
+                && resident_compression_bytes(
+                    sample.orig_data_bytes,
+                    Some(backed),
+                    sample.compr_data_bytes,
+                )
+                .is_some()
+        });
+        total.backed_data_bytes = total
+            .backed_data_bytes
+            .zip(sample.backed_data_bytes)
+            .and_then(|(total, device)| total.checked_add(device));
         // A body that parses to a pair the kernel cannot produce has not
         // answered either. Its bytes cannot enter a total without inventing a
         // reading the tear does not have, and the display layer already
@@ -364,6 +413,26 @@ fn zram_swap_devices(swaps: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// `bd_stat` uses 4 KiB units on every architecture.
+fn read_zram_backed_bytes(device: &Path) -> Option<u64> {
+    match fs::read_to_string(device.join("bd_stat")) {
+        Ok(text) => text
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(4096),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Both attributes are conditional on CONFIG_ZRAM_WRITEBACK.
+            match fs::metadata(device.join("backing_dev")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// The compressor the kernel reports as active on one device, or `None` when
 /// the device leaves the answer unreadable or unparsable.
 ///
@@ -394,8 +463,8 @@ fn agreed_compressor(before: Option<String>, after: Option<String>) -> Option<St
 /// Field order is the kernel's and is long-stable:
 /// `orig_data_size compr_data_size mem_used_total mem_limit mem_used_max
 /// same_pages pages_compacted huge_pages huge_pages_since`.
-/// The three leading columns are what the ratio needs and are required; the
-/// rest are tolerated so a kernel that adds or omits a trailing column still
+/// The three leading columns are required; the rest are tolerated so a
+/// kernel that adds or omits a trailing column still
 /// parses. `same_pages` and `huge_pages` are each `None` when their column is
 /// absent or unreadable — an unavailable counter is not a measured zero, and
 /// neither feeds the ratio. `pages_compacted` is read past and dropped.
@@ -411,6 +480,7 @@ fn parse_zram_mm_stat(text: &str) -> Option<ZramCompression> {
     let huge_pages = fields.nth(1).and_then(|value| value.parse::<u64>().ok());
     Some(ZramCompression {
         orig_data_bytes,
+        backed_data_bytes: None,
         compr_data_bytes,
         mem_used_bytes,
         huge_pages,

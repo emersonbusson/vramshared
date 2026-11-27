@@ -378,6 +378,7 @@ fn compression_row_draws_the_shrinkage_bar_from_the_two_counts() {
     // cannot contradict each other.
     let sample = serde_json::json!({
         "orig_data_bytes": 4000,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1400,
         "mem_used_bytes": 1600,
         "same_pages": 0,

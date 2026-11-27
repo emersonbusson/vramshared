@@ -477,6 +477,7 @@ fn tier_disk_bytes_omits_a_dm_row_with_no_recorded_alias() {
 fn fold_keeps_the_sample_that_held_the_most_uncompressed_data() {
     let small = ZramCompression {
         orig_data_bytes: 1_000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 400,
         mem_used_bytes: 512,
         huge_pages: Some(0),
@@ -485,6 +486,7 @@ fn fold_keeps_the_sample_that_held_the_most_uncompressed_data() {
     };
     let saturated = ZramCompression {
         orig_data_bytes: 9_000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 3_000,
         mem_used_bytes: 3_500,
         huge_pages: Some(8),

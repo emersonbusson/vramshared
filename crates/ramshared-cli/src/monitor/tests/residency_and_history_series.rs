@@ -290,6 +290,7 @@ fn a_history_series_fills_from_an_observation_that_carries_the_data() {
         "zram_compression".to_string(),
         serde_json::json!({
             "orig_data_bytes": 265936896u64,
+            "backed_data_bytes": 0_u64,
             "compr_data_bytes": 97734684u64,
             "mem_used_bytes": 102027264u64,
             "huge_pages": 256u64,
@@ -314,6 +315,7 @@ fn zram_compression_from_the_status_document_yields_a_saved_percent() {
     // ratio, which cannot both be right.
     let v = serde_json::json!({
         "orig_data_bytes": 265936896u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 97734684u64,
         "mem_used_bytes": 102027264u64,
         "huge_pages": 256u64,
@@ -497,6 +499,7 @@ fn compression_row_fills_the_bar_with_the_compressed_form_not_the_host_cost() {
     // bar encodes; the cost is a third number the bar does not encode.
     let sample = serde_json::json!({
         "orig_data_bytes": 4_u64 * 1024 * 1024 * 1024,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1024_u64 * 1024 * 1024,
         "mem_used_bytes": 1342177280_u64,
         "huge_pages": 12,
@@ -523,6 +526,7 @@ fn compression_row_fills_the_bar_with_the_compressed_form_not_the_host_cost() {
 fn compression_row_names_the_kernel_compressor_beside_the_numbers() {
     let sample = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "mem_used_bytes": 1200_u64,
         "huge_pages": 2,
@@ -536,6 +540,7 @@ fn compression_row_names_the_kernel_compressor_beside_the_numbers() {
     // name the sample did not report.
     let other = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "mem_used_bytes": 1200_u64,
         "huge_pages": 2,
@@ -553,6 +558,7 @@ fn compression_row_reports_an_unavailable_compressor_as_unreported() {
     // in the setup walk and must never be attributed by fallback.
     let absent = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "mem_used_bytes": 1200_u64,
         "huge_pages": 2,
@@ -565,6 +571,7 @@ fn compression_row_reports_an_unavailable_compressor_as_unreported() {
 
     let null_name = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "mem_used_bytes": 1200_u64,
         "huge_pages": 2,
@@ -580,6 +587,7 @@ fn compression_row_reports_an_unavailable_compressor_as_unreported() {
     // An empty name is no name either.
     let empty_name = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "mem_used_bytes": 1200_u64,
         "huge_pages": 2,
@@ -600,6 +608,7 @@ fn compression_row_reports_an_unavailable_host_cost_as_unreported() {
     // pays nothing for data the bar is holding.
     let absent = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "huge_pages": 2,
         "compressor": "zstd",
@@ -614,6 +623,7 @@ fn compression_row_reports_an_unavailable_host_cost_as_unreported() {
 
     let null_cost = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "mem_used_bytes": null,
         "huge_pages": 2,
@@ -632,6 +642,7 @@ fn compression_row_renders_the_graphic_when_only_the_optional_counters_are_absen
     // with a named hole in it.
     let partial = serde_json::json!({
         "orig_data_bytes": 3000_u64,
+        "backed_data_bytes": 0_u64,
         "compr_data_bytes": 1000_u64,
         "ratio": 3.0,
     });

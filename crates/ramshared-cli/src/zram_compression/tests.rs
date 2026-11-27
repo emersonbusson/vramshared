@@ -19,6 +19,7 @@ fn zram_mm_stat_parses_the_kernel_columns_and_refuses_junk() {
         parse_zram_mm_stat("30912512 10297603 11972608 0 11972608 528 0 169 169"),
         Some(ZramCompression {
             orig_data_bytes: 30_912_512,
+            backed_data_bytes: None,
             compr_data_bytes: 10_297_603,
             mem_used_bytes: 11_972_608,
             huge_pages: Some(169),
@@ -31,6 +32,7 @@ fn zram_mm_stat_parses_the_kernel_columns_and_refuses_junk() {
         parse_zram_mm_stat("3000 1000 1200 0 1200 0 0 2 4 8"),
         Some(ZramCompression {
             orig_data_bytes: 3000,
+            backed_data_bytes: None,
             compr_data_bytes: 1000,
             mem_used_bytes: 1200,
             huge_pages: Some(2),
@@ -45,6 +47,7 @@ fn zram_mm_stat_parses_the_kernel_columns_and_refuses_junk() {
         parse_zram_mm_stat("3000 1000 1200 0 1200 0 0"),
         Some(ZramCompression {
             orig_data_bytes: 3000,
+            backed_data_bytes: None,
             compr_data_bytes: 1000,
             mem_used_bytes: 1200,
             huge_pages: None,
@@ -57,6 +60,7 @@ fn zram_mm_stat_parses_the_kernel_columns_and_refuses_junk() {
         parse_zram_mm_stat("3000 1000 1200 0 1200"),
         Some(ZramCompression {
             orig_data_bytes: 3000,
+            backed_data_bytes: None,
             compr_data_bytes: 1000,
             mem_used_bytes: 1200,
             huge_pages: None,
@@ -69,6 +73,7 @@ fn zram_mm_stat_parses_the_kernel_columns_and_refuses_junk() {
         parse_zram_mm_stat("3000 1000 1200 0 1200 0 0 0 0"),
         Some(ZramCompression {
             orig_data_bytes: 3000,
+            backed_data_bytes: None,
             compr_data_bytes: 1000,
             mem_used_bytes: 1200,
             huge_pages: Some(0),
@@ -83,6 +88,7 @@ fn zram_mm_stat_parses_the_kernel_columns_and_refuses_junk() {
         parse_zram_mm_stat("3000 1000 1200 0 1200 abc 0 2 2"),
         Some(ZramCompression {
             orig_data_bytes: 3000,
+            backed_data_bytes: None,
             compr_data_bytes: 1000,
             mem_used_bytes: 1200,
             huge_pages: Some(2),
@@ -94,6 +100,7 @@ fn zram_mm_stat_parses_the_kernel_columns_and_refuses_junk() {
         parse_zram_mm_stat("3000 1000 1200 0 1200 2 0 abc 2"),
         Some(ZramCompression {
             orig_data_bytes: 3000,
+            backed_data_bytes: None,
             compr_data_bytes: 1000,
             mem_used_bytes: 1200,
             huge_pages: None,
@@ -157,6 +164,7 @@ fn zram_compression_counts_the_same_devices_the_tier_table_does() {
         zram_compression_from(&root, swaps),
         Some(ZramCompression {
             orig_data_bytes: 3900,
+            backed_data_bytes: Some(0),
             compr_data_bytes: 1300,
             mem_used_bytes: 1600,
             huge_pages: None,
@@ -236,6 +244,7 @@ fn zram_compression_counts_a_repeated_basename_once() {
     let once = "Filename Type Size Used Priority\n/dev/zram0 partition 2097148 1024 200\n";
     let expected = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(2),
@@ -377,6 +386,7 @@ fn a_device_the_tier_table_names_but_that_does_not_answer_makes_the_tier_total_u
         zram_compression_from(&root, swaps),
         Some(ZramCompression {
             orig_data_bytes: 6000,
+            backed_data_bytes: Some(0),
             compr_data_bytes: 2000,
             mem_used_bytes: 2400,
             huge_pages: Some(4),
@@ -550,6 +560,7 @@ fn a_counted_device_without_an_algorithm_makes_the_tier_name_unmeasurable() {
 fn compression_ratio_is_absent_when_nothing_is_stored() {
     let held = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(0),
@@ -563,6 +574,7 @@ fn compression_ratio_is_absent_when_nothing_is_stored() {
     assert_eq!(
         ZramCompression {
             orig_data_bytes: 3000,
+            backed_data_bytes: Some(0),
             ..ZramCompression::default()
         }
         .compression_ratio(),
@@ -588,6 +600,7 @@ fn compression_ratio_of_is_the_single_derivation() {
     // The typed method is a projection of the same rule, not a rival one.
     let held = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(0),
@@ -726,6 +739,7 @@ fn disagreeing_compressors_publish_no_single_name() {
         zram_compression_from(&root, swaps),
         Some(ZramCompression {
             orig_data_bytes: 2000,
+            backed_data_bytes: Some(0),
             compr_data_bytes: 800,
             mem_used_bytes: 1000,
             huge_pages: Some(0),
@@ -753,6 +767,7 @@ fn disagreeing_compressors_publish_no_single_name() {
 fn the_published_shape_never_reports_an_unmeasured_field_as_zero() {
     let measured = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: Some(0),
@@ -774,6 +789,7 @@ fn the_published_shape_never_reports_an_unmeasured_field_as_zero() {
     // reads like a sample the device did not take.
     let unmeasured = ZramCompression {
         orig_data_bytes: 3000,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 1000,
         mem_used_bytes: 1200,
         huge_pages: None,
@@ -823,6 +839,7 @@ fn the_published_saving_already_contains_the_same_filled_pages() {
     const PAGE_SIZE: u64 = 4096;
     let sample = ZramCompression {
         orig_data_bytes: PAGE_SIZE * 3,
+        backed_data_bytes: Some(0),
         compr_data_bytes: 0,
         mem_used_bytes: PAGE_SIZE,
         huge_pages: Some(0),
@@ -861,4 +878,61 @@ fn the_published_saving_already_contains_the_same_filled_pages() {
             "the sample must not publish a second saving field ({invented}) for a reader to add"
         );
     }
+}
+
+#[test]
+fn zram_compression_ratio_excludes_pages_on_writeback_storage() {
+    let root = std::env::temp_dir().join(format!(
+        "ramshared-zram-resident-accounting-{}",
+        std::process::id()
+    ));
+    let zram = root.join("zram0");
+    fs::create_dir_all(&zram).expect("fixture dir");
+    fs::write(
+        zram.join("mm_stat"),
+        "774696960 11820671 15101952 0 0 3284 0 73 73\n",
+    )
+    .expect("fixture mm_stat");
+    fs::write(zram.join("bd_stat"), "178072 0 0\n").expect("fixture bd_stat");
+    let swaps = "Filename Type Size Used Priority\n/dev/zram0 partition 4194300 756540 200\n";
+    let reading = zram_compression_from(&root, swaps).expect("zram0 counted");
+    fs::remove_dir_all(&root).expect("remove fixture");
+
+    assert_eq!(reading.orig_data_bytes, 774696960);
+    assert_eq!(reading.compr_data_bytes, 11820671);
+    assert_eq!(reading.backed_data_bytes, Some(729382912));
+    assert_eq!(reading.resident_compression(), Some((45314048, 11820671)));
+    let ratio = reading.compression_ratio().expect("resident ratio");
+    assert!((ratio - 3.833).abs() < 0.001, "reported ratio: {ratio}");
+}
+
+#[test]
+fn writeback_count_must_cover_all_counted_devices() {
+    let root = std::env::temp_dir().join(format!(
+        "ramshared-zram-incomplete-backing-{}",
+        std::process::id()
+    ));
+    let first = root.join("zram0");
+    let second = root.join("zram1");
+    for device in [&first, &second] {
+        fs::create_dir_all(device).expect("fixture directory");
+        fs::write(device.join("mm_stat"), "8192 1024 4096 0 0 0 0 0 0\n").expect("mm_stat");
+    }
+    fs::write(first.join("bd_stat"), "1 0 1\n").expect("first backing count");
+    fs::write(second.join("backing_dev"), "/dev/nbd0\n").expect("second backing configured");
+    let swaps = "Filename Type Size Used Priority\n/dev/zram0 partition 16 8 200\n/dev/zram1 partition 16 8 150\n";
+    let reading = zram_compression_from(&root, swaps).expect("logical counters");
+    assert_eq!(reading.orig_data_bytes, 16384);
+    assert_eq!(reading.backed_data_bytes, None);
+    assert_eq!(reading.compression_ratio(), None);
+
+    fs::write(second.join("bd_stat"), "3 0 3\n").expect("inconsistent count");
+    let reading = zram_compression_from(&root, swaps).expect("logical counters");
+    assert_eq!(reading.backed_data_bytes, None);
+
+    fs::write(second.join("bd_stat"), "0 0 0\n").expect("measured zero");
+    let reading = zram_compression_from(&root, swaps).expect("measured resident data");
+    assert_eq!(reading.backed_data_bytes, Some(4096));
+    assert_eq!(reading.resident_compression(), Some((12288, 2048)));
+    fs::remove_dir_all(&root).expect("remove fixture");
 }
