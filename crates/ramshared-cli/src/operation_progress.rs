@@ -26,6 +26,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod package_install;
+
+pub(crate) use package_install::{
+    PACKAGE_COMMIT, PACKAGE_STAGE, PACKAGE_VERIFY, PackageFileProgress,
+};
+
 pub(crate) const OPERATION_PROGRESS_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_OPERATION_PROGRESS_BYTES: usize = 16 * 1024;
 pub(crate) const DEFAULT_PROGRESS_TTL_MS: u64 = 15_000;
@@ -95,6 +101,8 @@ pub(crate) struct OperationProgressV1 {
     pub(crate) owner_start_ticks: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upgrade: Option<UpgradeDrainProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_files: Option<PackageFileProgress>,
 }
 
 impl OperationProgressV1 {
@@ -194,6 +202,12 @@ fn validate_record_shape(record: &OperationProgressV1) -> bool {
             .upgrade
             .as_ref()
             .is_none_or(|upgrade| record.kind == OperationKind::Teardown && upgrade.valid())
+        && record.package_files.is_none_or(|files| {
+            record.kind == OperationKind::SetupInstall
+                && record.phase == PACKAGE_STAGE
+                && files.total > 0
+                && files.completed <= files.total
+        })
 }
 
 pub(crate) fn read_live_operation_progress() -> Option<OperationProgressV1> {
@@ -317,6 +331,14 @@ impl OperationProgressReporter {
     }
 
     pub(crate) fn update(&self, update: ProgressUpdate<'_>) {
+        self.update_with_files(update, None);
+    }
+
+    fn update_with_files(
+        &self,
+        update: ProgressUpdate<'_>,
+        package_files: Option<PackageFileProgress>,
+    ) {
         let mut guard = lock_unpoisoned(&self.shared);
         let now = (guard.now_fn)();
         let total_steps = guard.record.total_steps.max(1);
@@ -328,6 +350,7 @@ impl OperationProgressReporter {
         guard.record.target = update.target.map(ToOwned::to_owned);
         guard.record.completed_bytes = completed_bytes;
         guard.record.total_bytes = total_bytes;
+        guard.record.package_files = package_files;
         guard.record.throughput_mib_per_s = update
             .throughput_mib_per_s
             .filter(|rate| rate.is_finite() && *rate >= 0.0);
@@ -357,6 +380,7 @@ impl OperationProgressReporter {
                     owner_pid: 1,
                     owner_start_ticks: 0,
                     upgrade: None,
+                    package_files: None,
                 },
                 now_fn: unix_epoch_ms,
             })),
@@ -421,6 +445,7 @@ impl OperationProgressGuard {
                 owner_pid,
                 owner_start_ticks: start_ticks,
                 upgrade: None,
+                package_files: None,
             },
             now_fn,
         };
@@ -633,10 +658,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-    struct TestTempDir(PathBuf);
+    pub(super) struct TestTempDir(PathBuf);
 
     impl TestTempDir {
-        fn new(prefix: &str) -> Self {
+        pub(super) fn new(prefix: &str) -> Self {
             static DIR_SEQ: AtomicU64 = AtomicU64::new(1);
             let seq = DIR_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
@@ -647,7 +672,7 @@ mod tests {
             Self(dir)
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.0
         }
     }

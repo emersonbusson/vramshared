@@ -320,6 +320,7 @@ fn install_transaction_plan_root_untrusted_and_reconcile_effect_edges() {
             parent_identity: (rel_meta.dev(), rel_meta.ino()),
             name: ver2,
             reserve_bytes: INSTALL_RESERVE_BYTES,
+            progress: None,
         };
         let prepared = crate::customer::package_prepare::prepare_admitted(
             &admitted,

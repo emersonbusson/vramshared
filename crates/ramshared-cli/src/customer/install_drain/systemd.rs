@@ -339,6 +339,7 @@ mod tests {
             owner_pid: 9,
             owner_start_ticks: 23,
             upgrade: None,
+            package_files: None,
         };
         wait.observe(at(1), control, Some(&progress));
         progress.updated_at_unix_ms = 10;

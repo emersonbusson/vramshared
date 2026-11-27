@@ -22,12 +22,15 @@ use super::transition::{
     recovery_refusal,
 };
 
+use crate::operation_progress::{OperationProgressGuard, PACKAGE_STAGE, PackageFileProgress};
+
 pub(super) struct PreparePaths<'a> {
     pub stage: &'a Path,
     pub parent: &'a Path,
     pub parent_identity: (u64, u64),
     pub name: &'a str,
     pub reserve_bytes: u64,
+    pub progress: Option<&'a OperationProgressGuard>,
 }
 
 pub(super) struct PreparedRelease {
@@ -141,12 +144,24 @@ fn prepare(
     if evidence(guard, pending, bundle, signature)? != (false, false, false) {
         return Err(recovery_refusal("prepare history already exists"));
     }
-    drop(stage::stage_all_members(
+    drop(stage::stage_all_members_with_hook(
         guard,
         pending,
         bundle,
         paths.stage,
         paths.reserve_bytes,
+        &mut |completed, total| {
+            if let Some(progress) = paths.progress {
+                progress.update_package(
+                    PACKAGE_STAGE,
+                    paths.name,
+                    Some(PackageFileProgress {
+                        completed: completed as u32,
+                        total: total as u32,
+                    }),
+                );
+            }
+        },
     )?);
     after_stage();
     if evidence(guard, pending, bundle, signature)? != (true, false, false) {

@@ -124,6 +124,7 @@ fn exercise_package_preparation(
         parent_identity: (coordinated_metadata.dev(), coordinated_metadata.ino()),
         name: "release",
         reserve_bytes: 0,
+        progress: None,
     };
     let alternate_root = root.join("alternate-bundle");
     std::fs::create_dir(&alternate_root).unwrap();
@@ -568,6 +569,7 @@ fn exercise_fresh_selector_intent(
         parent_identity: (metadata.dev(), metadata.ino()),
         name: "release",
         reserve_bytes: 0,
+        progress: None,
     };
     let release = crate::customer::package_prepare::prepare_admitted(
         &admitted, &pending, bundle, signature, &request,

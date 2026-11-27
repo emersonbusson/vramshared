@@ -22,6 +22,7 @@ use crate::customer::transition::{
 
 /// Prepare a complete inventory after bounded journal and disk observations.
 /// Free space is a snapshot, not a reservation; failures retain evidence.
+#[cfg(test)]
 pub(in crate::customer) fn stage_all_members(
     guard: &CustomerTransitionGuard,
     pending: &PackagePending,
@@ -29,7 +30,14 @@ pub(in crate::customer) fn stage_all_members(
     parent: &Path,
     reserve_bytes: u64,
 ) -> Result<BTreeMap<String, StageSlot>, CustomerError> {
-    stage_all_members_with_hook(guard, pending, bundle, parent, reserve_bytes, &mut |_| {})
+    stage_all_members_with_hook(
+        guard,
+        pending,
+        bundle,
+        parent,
+        reserve_bytes,
+        &mut |_, _| {},
+    )
 }
 
 pub(in crate::customer) fn stage_all_members_with_hook(
@@ -38,7 +46,7 @@ pub(in crate::customer) fn stage_all_members_with_hook(
     bundle: &DeclaredBundle,
     parent: &Path,
     reserve_bytes: u64,
-    after_member: &mut dyn FnMut(usize),
+    after_member: &mut dyn FnMut(usize, usize),
 ) -> Result<BTreeMap<String, StageSlot>, CustomerError> {
     if stage_journal_present(guard.paths())? {
         return Err(recovery_refusal("package stage journal already exists"));
@@ -69,7 +77,7 @@ pub(in crate::customer) fn resume_staged_inventory(
         parent,
         reserve_bytes,
         true,
-        &mut |_| {},
+        &mut |_, _| {},
     )
 }
 
@@ -80,7 +88,7 @@ fn continue_inventory(
     parent: &Path,
     reserve_bytes: u64,
     resume: bool,
-    after_member: &mut dyn FnMut(usize),
+    after_member: &mut dyn FnMut(usize, usize),
 ) -> Result<BTreeMap<String, StageSlot>, CustomerError> {
     if guard.owner() != OperationOwner::Package
         || bundle.manifest_sha256() != pending.new_hash
@@ -163,7 +171,7 @@ struct StageProgress<'a> {
     reserve_bytes: u64,
     history: Option<&'a [StageJournal]>,
     started: usize,
-    after_member: &'a mut dyn FnMut(usize),
+    after_member: &'a mut dyn FnMut(usize, usize),
 }
 
 fn finish_inventory(
@@ -186,6 +194,7 @@ fn finish_inventory(
         )?;
         drop(resume_staged_member(guard, pending, bundle)?);
     }
+    (progress.after_member)(progress.started, plan.len());
     for (index, item) in plan[progress.started..].iter().enumerate() {
         check_stage_space(
             progress.directory,
@@ -203,7 +212,7 @@ fn finish_inventory(
                 limit: item.limit,
             },
         )?);
-        (progress.after_member)(index + 1);
+        (progress.after_member)(progress.started + index + 1, plan.len());
     }
     let mut inventory = verify_staged_inventory(guard, pending, bundle)?;
     bundle

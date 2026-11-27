@@ -443,6 +443,7 @@ fn exercise_signed_preparation(
         parent_identity: (meta.dev(), meta.ino()),
         name: "release",
         reserve_bytes: 0,
+        progress: None,
     };
     assert_eq!(read_pending(&paths).unwrap(), Some(pending.clone()));
     assert!(resume(admitted.guard(), &wrong_target, bundle, signature, &request).is_err());
@@ -512,6 +513,7 @@ fn exercise_signed_preparation(
         parent_identity: (meta_sel.dev(), meta_sel.ino()),
         name: "release",
         reserve_bytes: 0,
+        progress: None,
     };
     let release_sel =
         prepare_admitted(&admitted_sel, &pending, bundle, signature, &request_sel).unwrap();
@@ -550,6 +552,7 @@ fn exercise_signed_preparation(
         parent_identity: (meta2.dev(), meta2.ino()),
         name: "release",
         reserve_bytes: 0,
+        progress: None,
     };
     assert!(
         prepare_admitted_with_hooks(
@@ -621,6 +624,7 @@ fn exercise_signed_preparation(
         parent_identity: (meta3.dev(), meta3.ino()),
         name: "release",
         reserve_bytes: 0,
+        progress: None,
     };
     assert!(
         prepare_admitted_with_hooks(
@@ -698,6 +702,7 @@ fn exercise_signed_preparation(
         parent_identity: (meta4.dev(), meta4.ino()),
         name: "release",
         reserve_bytes: 0,
+        progress: None,
     };
     assert!(
         prepare_admitted_with_hooks(

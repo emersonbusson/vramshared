@@ -21,7 +21,12 @@ use super::super::i18n::{
 use super::super::model::Observation;
 use super::super::render::make_bar;
 use super::fmt_bytes;
-use crate::operation_progress::{OperationProgressV1, unix_epoch_ms};
+use crate::operation_progress::{
+    OperationKind, OperationProgressV1, PACKAGE_COMMIT, PACKAGE_STAGE, PACKAGE_VERIFY,
+    unix_epoch_ms,
+};
+
+mod package;
 
 const BANNER_BAR_WIDTH: u64 = 16;
 const KIB: u64 = 1024;
@@ -65,6 +70,14 @@ fn build_cli_operation_banner(
     language: Language,
     now_unix_ms: u64,
 ) -> OperationBannerContent {
+    if progress.kind == OperationKind::SetupInstall
+        && matches!(
+            progress.phase.as_str(),
+            PACKAGE_VERIFY | PACKAGE_STAGE | PACKAGE_COMMIT
+        )
+    {
+        return package::build_package_banner(progress, language, now_unix_ms);
+    }
     let title = if let Some(upgrade) = progress.upgrade.as_ref() {
         let label = match language {
             Language::En => "UPDATE",
@@ -291,6 +304,7 @@ mod tests {
             owner_pid: 99,
             owner_start_ticks: 111,
             upgrade: None,
+            package_files: None,
         });
         assert!(has_active_operation(&obs));
 
@@ -334,6 +348,42 @@ mod tests {
         assert!(update_banner.primary_line.contains("50%"));
         assert!(update_banner.secondary_line.contains("320.5 MiB/s"));
         assert_eq!(update_banner.border_color, Color::Cyan);
+
+        let progress = obs.operation_progress.as_mut().expect("live progress");
+        progress.kind = OperationKind::SetupInstall;
+        progress.step_index = 2;
+        progress.total_steps = 3;
+        progress.phase = PACKAGE_STAGE.into();
+        progress.target = Some("v1.0.3".into());
+        progress.upgrade = None;
+        progress.completed_bytes = 0;
+        progress.total_bytes = 0;
+        progress.throughput_mib_per_s = None;
+        for (completed, percentage) in [(0, "0%"), (3, "75%"), (4, "100%")] {
+            obs.operation_progress
+                .as_mut()
+                .expect("live progress")
+                .package_files = Some(crate::operation_progress::PackageFileProgress {
+                completed,
+                total: 4,
+            });
+            let banner = build_operation_banner(&obs, Language::PtBr).expect("install banner");
+            assert!(banner.title.contains("INSTALAÇÃO · v1.0.3"));
+            assert!(banner.primary_line.contains(percentage));
+            assert!(
+                banner
+                    .secondary_line
+                    .contains(&format!("{completed} / 4 arquivos"))
+            );
+            assert_eq!(banner.border_color, Color::Cyan);
+        }
+        let progress = obs.operation_progress.as_mut().expect("live progress");
+        progress.step_index = 3;
+        progress.phase = PACKAGE_COMMIT.into();
+        progress.package_files = None;
+        let banner = build_operation_banner(&obs, Language::PtBr).expect("commit banner");
+        assert!(banner.primary_line.contains("3/3"));
+        assert!(!banner.primary_line.contains('%'));
 
         // Clear CLI operation, test daemon VRAM cache demote drain banner.
         obs.operation_progress = None;

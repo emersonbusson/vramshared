@@ -67,6 +67,7 @@ fn exercise_preparation_recovery(
             parent_identity: parent_id,
             name: "release",
             reserve_bytes: 0,
+            progress: None,
         };
         let release = crate::customer::package_prepare::resume(
             &guard,
