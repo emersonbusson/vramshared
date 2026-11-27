@@ -85,6 +85,30 @@ $phases = @(New-LiveHealth 1000; New-LiveHealth 2000; New-LiveHealth 3000; New-L
 if (-not (Test-SharedWslPressureControlEvidence -PhaseHealth $phases -MonitorHealth @((New-LiveHealth)))) {
     throw 'complete_current_control_evidence_rejected'
 }
+$writeback = New-LiveHealth
+$writeback.activation.active = $false
+$writeback.protection_state = 'ACTIVE'
+$writeback.tiers.zram.present = $true
+$writeback | Add-Member NoteProperty posture 'writeback'
+$writeback | Add-Member NoteProperty capacity ([pscustomobject]@{logical_capacity_kib = 4194304})
+$writeback | Add-Member NoteProperty tier_roles ([pscustomobject]@{writeback_target_is_tier = $true})
+$writeback | Add-Member NoteProperty tier_state 'bound'
+if (-not (Test-SharedWslPressureControlEvidence -PhaseHealth $phases -MonitorHealth @($writeback))) {
+    throw 'healthy_writeback_without_direct_swap_rejected'
+}
+$writeback.protection_state = 'AT_RISK'
+if (-not (Test-SharedWslPressureControlEvidence -PhaseHealth $phases -MonitorHealth @($writeback))) {
+    throw 'measurable_at_risk_writeback_rejected'
+}
+$writeback.tier_state = 'unbound'
+if (Test-SharedWslPressureControlEvidence -PhaseHealth $phases -MonitorHealth @($writeback)) {
+    throw 'unbound_writeback_accepted'
+}
+$writeback.tier_state = 'bound'
+$writeback.protection_state = 'BLOCKED'
+if (Test-SharedWslPressureControlEvidence -PhaseHealth $phases -MonitorHealth @($writeback)) {
+    throw 'blocked_writeback_accepted'
+}
 foreach ($case in @('guarded', 'stale_guardian', 'measurement_error', 'missing_schema', 'inactive_phase')) {
     $health = New-LiveHealth
     switch ($case) {
