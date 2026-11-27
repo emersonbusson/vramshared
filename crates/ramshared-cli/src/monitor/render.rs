@@ -613,6 +613,7 @@ impl DashboardMetadata {
             active_install.as_ref(),
         );
         let update_notice = client_banner(
+            reexec_origin,
             current_release_version().as_deref(),
             selected_release_version().as_deref(),
             previous_release_hint().as_deref(),

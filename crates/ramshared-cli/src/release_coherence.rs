@@ -528,12 +528,16 @@ pub(crate) fn completed_update_notice(from: Option<&str>, to: &str) -> ClientUpd
 ///
 /// Pending wins: if a different release is selected, that is the news. Only
 /// when there is nothing pending does the carried hint report a completed
-/// transition. Returns `None` when there is nothing to say.
+/// transition. A standalone client has no installed transition to report.
 pub(crate) fn client_banner(
+    origin: ProcessInstallOrigin,
     running: Option<&str>,
     selected: Option<&str>,
     previous_hint: Option<&str>,
 ) -> Option<String> {
+    if origin == ProcessInstallOrigin::Unknown {
+        return None;
+    }
     let pending = client_update_notice(running, selected);
     if pending != ClientUpdateNotice::None {
         return Some(pending.banner());
