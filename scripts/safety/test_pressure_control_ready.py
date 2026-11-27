@@ -52,6 +52,18 @@ class ReadinessTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertNotEqual(self.invoke(health, 1), 0)
 
+    def test_writeback_uses_measured_protection_without_an_nbd_swap_entry(self):
+        self.health.update(schema_version=5, posture="writeback", protection_state="ACTIVE",
+                           activation={"active": False}, tiers={"zram": {"present": True}},
+                           tier_roles={"writeback_target_is_tier": True}, tier_state="bound",
+                           capacity={"logical_capacity_kib": 4194304})
+        self.assertEqual(self.invoke(self.health), 0)
+        self.health["tier_state"] = "unbound"
+        self.assertNotEqual(self.invoke(self.health, 1), 0)
+        self.health["tier_state"] = "bound"
+        self.health["protection_state"] = "BLOCKED"
+        self.assertNotEqual(self.invoke(self.health, 1), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

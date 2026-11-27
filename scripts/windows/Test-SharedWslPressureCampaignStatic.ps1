@@ -153,6 +153,7 @@ if (-not $guestScriptMatch.Success) {
     throw "shared pressure campaign guest script here-string is missing"
 }
 $guestBody = $guestScriptMatch.Groups[1].Value
+$nbdAck = $guestBody.IndexOf('missing_or_invalid_release_nbd_acknowledgment')
 $guestAdmission = $guestBody.IndexOf('bash ./scripts/safety/ramshared-guest-memory-admission.sh /proc/meminfo')
 $guestRefusalExit = $guestBody.IndexOf('exit "`$guest_admission_rc"')
 $cleanupTrap = $guestBody.IndexOf('trap cleanup EXIT INT TERM')
@@ -165,6 +166,12 @@ if ($guestAdmission -lt 0 -or $guestRefusalExit -lt 0 -or $cleanupTrap -lt 0 -or
     $guestAdmission -gt $ramsharedDown -or
     $guestAdmission -gt $ramsharedUp -or $guestAdmission -gt $pressureLaunch) {
     throw "guest memory admission must refuse before cleanup, RamShared mutation, or pressure launch"
+}
+if ($nbdAck -lt 0 -or $nbdAck -ge $cleanupTrap -or
+    -not $guestBody.Contains('wsl2-nbd-ack-`$release_version.token') -or
+    -not $guestBody.Contains('accept-wsl2-nbd:`$release_version') -or
+    -not $guestBody.Contains('--transport nbd --zram-writeback-tier --accept-wsl2-nbd')) {
+    throw "campaign must require the selected release's NBD acknowledgment before activation"
 }
 
 if ($text.Contains('>>"`$artifact/daemon.out"')) {

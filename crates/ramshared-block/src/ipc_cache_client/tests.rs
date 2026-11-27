@@ -8,6 +8,8 @@
 
 #[path = "tests/deferred_invalidation.rs"]
 mod deferred_invalidation;
+#[path = "tests/response_failures.rs"]
+mod response_failures;
 #[path = "tests/support.rs"]
 mod support;
 #[path = "tests/wire_and_telemetry.rs"]

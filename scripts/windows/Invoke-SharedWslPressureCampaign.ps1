@@ -802,6 +802,14 @@ export RAMSHARED_BIN="`$product_release/bin/ramshared"
 export RAMSHARED_DAEMON_BIN="`$product_release/bin/ramsharedd"
 test -x "`$RAMSHARED_BIN" && test -x "`$RAMSHARED_DAEMON_BIN"
 sha256sum "`$RAMSHARED_BIN" "`$RAMSHARED_DAEMON_BIN" >"`$artifact/product-binaries.sha256"
+release_version="`${product_release##*/}"
+nbd_ack="/var/lib/ramshared/approvals/wsl2-nbd-ack-`$release_version.token"
+if ! sudo -n test -f "`$nbd_ack" || sudo -n test -L "`$nbd_ack" ||
+   [ "`$(sudo -n stat -c '%u:%g:%a' -- "`$nbd_ack")" != '0:0:400' ] ||
+   [ "`$(sudo -n cat -- "`$nbd_ack")" != "accept-wsl2-nbd:`$release_version" ]; then
+  printf '%s\n' 'missing_or_invalid_release_nbd_acknowledgment' >&2
+  exit 2
+fi
 guest_admission_rc=0
 bash ./scripts/safety/ramshared-guest-memory-admission.sh /proc/meminfo \
   "$GuestMemAvailableReserveMiB" "$GuestSwapFreeReserveMiB" \
@@ -841,7 +849,7 @@ sudo -n "`$RAMSHARED_BIN" down >"`$artifact/pre-down.out" 2>"`$artifact/pre-down
 daemon_wrapper="`$artifact/ramsharedd-logged.sh"
 printf '#!/usr/bin/env bash\nexec "%s" "`$@" >>"%s" 2>&1\n' "`$RAMSHARED_DAEMON_BIN" "`$artifact/daemon.out" >"`$daemon_wrapper"
 chmod 0700 "`$daemon_wrapper"
-sudo -n env RAMSHARED_TRACE_PROBE=1 "`$RAMSHARED_BIN" up --vram "$VramMiB" --zram "$ZramMiB" --daemon "`$daemon_wrapper" >"`$artifact/ramshared-up.out" 2>"`$artifact/ramshared-up.err"
+sudo -n env RAMSHARED_TRACE_PROBE=1 "`$RAMSHARED_BIN" up --vram "$VramMiB" --zram "$ZramMiB" --daemon "`$daemon_wrapper" --transport nbd --zram-writeback-tier --accept-wsl2-nbd >"`$artifact/ramshared-up.out" 2>"`$artifact/ramshared-up.err"
 ./scripts/safety/cascade-health.sh --once >"`$artifact/after-up-health.json"
 
 bash ./scripts/safety/wait-pressure-control-ready.sh "`$RAMSHARED_BIN" "`$artifact/ready-status.json" 180

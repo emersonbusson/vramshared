@@ -101,11 +101,20 @@ function Test-SharedWslPressureLiveHealth {
         if ($protectedState) {
             $controlOk = Test-SharedWslClosedAdmissionProof -Health $Health -Witnesses $ControlWitness
         }
+        $tierActive = Test-PressureBoolean $Health.activation.active $true
+        if ($Health.PSObject.Properties['posture'] -and $Health.posture -ceq 'writeback') {
+            $logicalKiB = $Health.capacity.logical_capacity_kib
+            $tierActive = ($Health.protection_state -cin @('READY', 'ACTIVE', 'AT_RISK') -and
+                (Test-PressureBoolean $Health.tiers.zram.present $true) -and
+                (Test-PressureBoolean $Health.tier_roles.writeback_target_is_tier $true) -and
+                $Health.tier_state -ceq 'bound' -and
+                ($logicalKiB -is [int] -or $logicalKiB -is [long]) -and $logicalKiB -gt 0)
+        }
         return ((Test-PressureInteger $Health.schema_version $script:PressureHealthSchemaVersion) -and
             $controlOk -and
             (Test-PressureBoolean $Health.ghost $false) -and
             (Test-PressureBoolean $Health.topology_ok $true) -and
-            (Test-PressureBoolean $Health.activation.active $true) -and
+            $tierActive -and
             (Test-PressureBoolean $Health.daemon.alive $true) -and
             ($Health.daemon.pid -is [int] -or $Health.daemon.pid -is [long]) -and $Health.daemon.pid -gt 0 -and
             $Health.origin_state -ceq 'READY' -and
