@@ -11,6 +11,40 @@ File: CHANGELOG.md
 All notable changes to RamShared are documented in this file.
 The project adheres to Semantic Versioning (`MAJOR.MINOR.PATCH`).
 
+## [1.0.5] - 2026-11-27
+
+### Added
+
+- Opt-in selectable Hyper-V pooled VRAM read cache (`RSCP` v1 over `AF_VSOCK` / `AF_HYPERV` port `2762`, `ramshared-pooled-cache`, `ramshared setup cache-mode stage --mode pooled`, and `hv_storvsc` storage discovery), keeping `Independent` as the default profile while enforcing host RAM and GPU VRAM reserves (#35).
+
+### Fixed
+
+- Raised the 7-day hardware-health journal boot-scan ceiling from 8 to 32 boots while continuing to fail closed on overflow or any machine-check event, and hardened WSL boot-canary scripts (#33).
+- Enforced single-component release-name path confinement across installer transition pending records, selector effect journals, and transaction reconciliation, binding rollback cleanup to the durable stage journal (#34).
+
+## [1.0.4] - 2026-11-27
+
+### Added
+
+- Signed same-series patch update acquisition and staging (`v1.0.x`) using verified digests and detached OpenPGP signatures (#30).
+- Interactive update wake trigger from installed `ramshared top` with fail-closed enrollment path preparation (#31).
+- Live swap-drain context and measured package installation progress banners in `ramshared top` during upgrades (#29).
+
+## [1.0.3] - 2026-11-27
+
+### Added
+
+- Authenticated per-engine GPU and hardware video encode/decode activity in `ramshared top` (#27).
+- Hosted Windows runtime CI qualification (#17).
+
+### Fixed
+
+- Preserved GPU worker exit diagnostics and reported worker codec deadlines before exit (#16, #23).
+- Distinguished cache read timeouts from disconnects and preserved IPC heartbeats when GPU observations expire (#12, #13).
+- Reported accurate resident ZRAM compression during writeback, observed the unbounded native cgroup hierarchy root, and bound writeback tiers in pressure evidence (#14, #20, #21).
+- Preserved cascade and zram/NBD startup custody across upgrades, explained managed workload admission privileges, and hid update notices in standalone clients (#18, #19, #24, #25).
+- Ignored HCS VM rows without running-state proof during automatic routing, isolated authority-only Windows installs from StorPort storage state, and bound the Arch `PKGBUILD` source archive to the checked-in commit (#15, #22, #26).
+
 ## [1.0.2] - 2026-11-25
 
 ### Fixed
