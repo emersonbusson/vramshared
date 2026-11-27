@@ -107,7 +107,7 @@ fn require_package_owner(
     Ok(())
 }
 
-fn busy_refusal(detail: impl Into<String>) -> CustomerError {
+pub(super) fn busy_refusal(detail: impl Into<String>) -> CustomerError {
     CustomerError {
         reason: CustomerReason::ActiveSession,
         detail: detail.into(),

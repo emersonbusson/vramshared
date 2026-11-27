@@ -23,6 +23,7 @@ pub(crate) mod gpu_plan;
 pub(crate) mod gpu_set;
 mod install_apply;
 mod install_args;
+mod install_drain;
 mod install_fs;
 mod install_lifecycle;
 mod install_tokens;

@@ -221,6 +221,7 @@ fn execute_check_quiescent(
     let first = host.observe();
     let _ = admit_package(req.action, &first.snapshot, &first.release)?;
     let _guard = acquire_transition(OperationOwner::Package, host.transitions())?;
+    super::install_drain::require_no_drain(host.transitions())?;
     let locked = host.observe();
     if locked != first {
         return Err(fs_error(

@@ -9,50 +9,49 @@
 //! Complete native sealed installation, auto-update, rollback, and recovery coordinator.
 
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::process::geteuid;
 
 use super::install_apply::{
-    clear_all_package_journals, clear_stage_artifacts, execute_verified_apply,
-    verify_candidate_trust, verify_declared_payload_identity, verify_install,
+    execute_verified_apply, verify_declared_payload_identity, verify_install,
 };
 use super::install_args::{
     AutoUpdateMode, InstallMode, InstallRequest, parse_install_args, write_auto_update_status,
     write_plan_output,
 };
+use super::install_drain::{DrainInputs, InstallerLock};
 use super::install_fs::{WslInstallHostMemoryCache, fs_error};
 #[cfg(test)]
 use super::install_lifecycle::NoopLifecycleHost;
 use super::install_lifecycle::{
     LifecycleHost, PrepareUpgradeOutcome, SystemLifecycleHost, append_auto_update_log,
-    finalize_auto_update_outcome, finish_upgrade_lifecycle, prepare_seamless_auto_update,
-    run_attended_apply_with, write_deferred_output, write_up_to_date_output,
+    complete_drain_custody, emit_committed_install, finalize_auto_update_outcome,
+    finish_upgrade_lifecycle, prepare_upgrade_with_custody, run_attended_apply_with,
+    write_deferred_output, write_up_to_date_output,
 };
-use super::install_units::{MANAGED_UNITS, SystemUnitHost, UnitHost, validate_unit_plan};
-use super::package_prepare::{PreparePaths, resume as resume_prepared};
-use super::package_selector::{
-    SelectorEffectPhase, SelectorRecoveryAction, SinkWitness, inspect_effect_journal,
-    reconcile_selector, remove_owned_unselected_release,
-};
+use super::install_units::{SystemUnitHost, UnitHost, validate_unit_plan};
+use super::package_selector::{SelectorRecoveryAction, SinkWitness};
 use super::package_source::DeclaredBundle;
 use super::package_source::stream::MemoryObservation;
 use super::package_trust::{VerifiedSignature, verify_bundle_from_policy};
 use super::release_ordering::{
-    AutoUpdatePolicy, ReleaseOrder, find_newest_bundle, read_auto_update_policy,
-    read_enrolled_posture, release_is_newer,
+    AutoUpdatePolicy, ReleaseOrder, find_newest_bundle, find_previous_bundle,
+    read_auto_update_policy, read_enrolled_posture, release_is_newer,
 };
-use super::transition::{
-    CustomerTransitionGuard, OperationOwner, PackagePending, TransitionPaths, acquire_transition,
-    read_pending,
-};
+use super::transition::TransitionPaths;
 use super::{CustomerError, CustomerReason, CustomerState};
 use crate::cascade::boot_policy_effect::BootPolicyHost;
 use crate::cascade::boot_policy_host::SystemBootPolicyHost;
 use crate::cascade::posture::Posture;
-use crate::installed_image::{observe_installed_input_bundle_digest, verify_release_manifest};
 use crate::release_identity::read_release_version;
+
+mod reconciliation;
+mod runtime_recovery;
+use reconciliation::{
+    finish_pending_drain, prepare_timer_runtime_request, recovered_request, run_reconcile,
+};
+use runtime_recovery::resume_committed_install;
 
 pub(super) const INSTALL_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -210,27 +209,88 @@ fn execute_request(
         ),
         InstallMode::Reconcile(action) => {
             require_root(env)?;
-            run_reconcile(req, env, action, unit_host, stdout)
+            let lock = installer_lock(env, lifecycle)?;
+            run_reconcile(
+                req,
+                env,
+                action,
+                lock.as_ref(),
+                unit_host,
+                boot_host,
+                stdout,
+            )?;
+            if action == SelectorRecoveryAction::Complete
+                && let Some(lock) = lock.as_ref()
+                && let Some((inputs, _, _)) = lock.committed_runtime()?
+            {
+                let recovered = recovered_request(req, env, &inputs)?;
+                if let Some((committed, activation)) = resume_committed_install(
+                    &recovered,
+                    env,
+                    Some(lock),
+                    None,
+                    unit_host,
+                    boot_host,
+                    lifecycle,
+                    stdout,
+                )? {
+                    emit_committed_install(&committed, &activation, req.json, stdout);
+                }
+            }
+            Ok(())
         }
         InstallMode::Apply => {
             require_root(env)?;
-            let verified = verify_install(req, env, None)?;
+            let lock = installer_lock(env, lifecycle)?;
+            finish_pending_drain(req, env, lock.as_ref(), unit_host, boot_host)?;
+            if let Some((committed, activation)) = resume_committed_install(
+                req,
+                env,
+                lock.as_ref(),
+                None,
+                unit_host,
+                boot_host,
+                lifecycle,
+                stdout,
+            )? {
+                emit_committed_install(&committed, &activation, req.json, stdout);
+                return Ok(());
+            }
+            let (verified, drain) = verify_install(req, env, unit_host, None)?;
             let selector = env.selector_path();
             run_attended_apply_with(
                 req,
                 &selector,
+                lock.as_ref().map(|lock| (lock, drain.as_ref())),
                 unit_host,
                 boot_host,
                 lifecycle,
                 stdout,
                 |apply_req, u_host, out| {
                     execute_verified_apply(
-                        apply_req, env, verified, u_host, boot_host, memory_obs, out,
+                        apply_req,
+                        env,
+                        verified,
+                        lock.as_ref(),
+                        u_host,
+                        boot_host,
+                        memory_obs,
+                        out,
                     )
                 },
             )
         }
     }
+}
+
+fn installer_lock(
+    env: &InstallEnvironment,
+    lifecycle: &dyn LifecycleHost,
+) -> Result<Option<InstallerLock>, CustomerError> {
+    lifecycle
+        .upgrade_stop()
+        .map(|_| InstallerLock::acquire(&env.transition))
+        .transpose()
 }
 
 fn require_root(env: &InstallEnvironment) -> Result<(), CustomerError> {
@@ -328,6 +388,7 @@ fn run_plan(
 fn load_auto_update_context<'a>(
     req: &'a InstallRequest,
     env: &'a InstallEnvironment,
+    active: Option<&DrainInputs>,
 ) -> Result<AutoUpdateContext<'a>, CustomerError> {
     let policy_path = req.policy.as_deref().unwrap_or(&env.default_policy);
     let owner = env.require_root.then_some(0).or(Some(env.owner_uid));
@@ -341,7 +402,20 @@ fn load_auto_update_context<'a>(
         .as_deref()
         .or_else(|| policy_opt.as_ref().and_then(|p| p.bundle_root.as_deref()))
         .unwrap_or(&env.default_bundle_root);
-    let newest = find_newest_bundle(bundle_root).ok().flatten();
+    let newest = match active {
+        Some(active) => Some(
+            find_previous_bundle(
+                bundle_root,
+                policy_path,
+                env.owner_uid,
+                &active.candidate_manifest,
+            )?
+            .ok_or_else(|| {
+                super::transition::recovery_refusal("original signed upgrade bundle is unavailable")
+            })?,
+        ),
+        None => find_newest_bundle(bundle_root).ok().flatten(),
+    };
     Ok(AutoUpdateContext {
         policy_path,
         policy_opt,
@@ -489,6 +563,7 @@ fn authorize_auto_update_upgrade(
     running: Option<&str>,
     enrolled: Option<Posture>,
     candidate: &str,
+    explicit_bundle: bool,
 ) -> Result<AutoUpdateDecision, CustomerError> {
     let current = running.ok_or_else(|| {
         append_auto_update_log(&env.auto_update_log, "REFUSED no-installed-release");
@@ -510,10 +585,13 @@ fn authorize_auto_update_upgrade(
         )
     })?;
     let order = release_is_newer(candidate, current);
-    if order == ReleaseOrder::Equal {
+    if order == ReleaseOrder::Equal || (order == ReleaseOrder::Older && !explicit_bundle) {
         append_auto_update_log(
             &env.auto_update_log,
-            &format!("UP-TO-DATE running={current} candidate={candidate}"),
+            &format!(
+                "UP-TO-DATE running={current} candidate={candidate} order={}",
+                order.as_str(),
+            ),
         );
         return Ok(AutoUpdateDecision::UpToDate(current.to_owned()));
     }
@@ -550,14 +628,52 @@ fn run_auto_update_apply<B: BootPolicyHost>(
     req: &InstallRequest,
     env: &InstallEnvironment,
     validated: ValidatedAutoUpdate<'_>,
+    lock: Option<&InstallerLock>,
     runtime: &mut AutoUpdateRuntime<'_, B>,
     stdout: &mut dyn Write,
 ) -> Result<(), CustomerError> {
+    let mut apply_req = InstallRequest {
+        mode: InstallMode::Apply,
+        approved_version: Some(validated.candidate.clone()),
+        approved_manifest_sha256: Some(validated.manifest_sha256),
+        lower_sink: Some(validated.lower_sink),
+        posture: runtime.enrolled,
+        bundle_root: Some(validated.bundle_dir),
+        running: runtime.running.clone(),
+        policy: Some(validated.policy_path.to_path_buf()),
+        ..req.clone()
+    };
+    prepare_timer_runtime_request(
+        &mut apply_req,
+        env,
+        lock,
+        runtime.unit_host,
+        runtime.boot_host,
+    )?;
+    if let Some(resumed) = resume_committed_install(
+        &apply_req,
+        env,
+        lock,
+        Some(&validated.signature),
+        runtime.unit_host,
+        runtime.boot_host,
+        runtime.lifecycle,
+        stdout,
+    )? {
+        return finalize_auto_update_outcome(
+            &env.auto_update_log,
+            &validated.candidate,
+            req.json,
+            Ok(resumed),
+            stdout,
+        );
+    }
     let (current, posture) = match authorize_auto_update_upgrade(
         env,
         runtime.running.as_deref(),
         runtime.enrolled,
         &validated.candidate,
+        req.bundle_root.is_some(),
     )? {
         AutoUpdateDecision::UpToDate(current) => {
             write_up_to_date_output(&current, &validated.candidate, req.json, stdout);
@@ -565,24 +681,18 @@ fn run_auto_update_apply<B: BootPolicyHost>(
         }
         AutoUpdateDecision::Upgrade(current, posture) => (current, posture),
     };
-    require_root(env)?;
-    let mut apply_req = InstallRequest {
-        mode: InstallMode::Apply,
-        approved_version: Some(validated.candidate.clone()),
-        approved_manifest_sha256: Some(validated.manifest_sha256),
-        lower_sink: Some(validated.lower_sink),
-        posture: Some(posture),
-        bundle_root: Some(validated.bundle_dir),
-        running: Some(current.clone()),
-        policy: Some(validated.policy_path.to_path_buf()),
-        ..req.clone()
-    };
-    let verified = verify_install(&apply_req, env, Some(validated.signature))?;
-    let quiescence = match prepare_seamless_auto_update(
+    apply_req.posture = Some(posture);
+    let (verified, drain) = verify_install(
+        &apply_req,
+        env,
         runtime.unit_host,
-        runtime.boot_host,
-        runtime.lifecycle,
-    )? {
+        Some(validated.signature),
+    )?;
+    let custody = lock.map(|lock| (lock, drain.as_ref()));
+    let live = runtime
+        .lifecycle
+        .observe_live_state(runtime.unit_host, runtime.boot_host)?;
+    let quiescence = match prepare_upgrade_with_custody(live, runtime.lifecycle, custody)? {
         PrepareUpgradeOutcome::Deferred(reason) => {
             append_auto_update_log(
                 &env.auto_update_log,
@@ -606,6 +716,7 @@ fn run_auto_update_apply<B: BootPolicyHost>(
         &apply_req,
         env,
         verified,
+        lock,
         runtime.unit_host,
         runtime.boot_host,
         runtime.memory_obs,
@@ -616,9 +727,10 @@ fn run_auto_update_apply<B: BootPolicyHost>(
         runtime.lifecycle,
         apply_res,
         |_| false,
-        false,
+        req.no_activate,
         stdout,
     );
+    complete_drain_custody(custody, &outcome, runtime.unit_host)?;
     finalize_auto_update_outcome(
         &env.auto_update_log,
         &validated.candidate,
@@ -639,7 +751,18 @@ fn run_auto_update(
     memory_obs: &mut dyn FnMut() -> Option<MemoryObservation>,
     stdout: &mut dyn Write,
 ) -> Result<(), CustomerError> {
-    let ctx = load_auto_update_context(req, env)?;
+    let lock = if mode == AutoUpdateMode::Apply {
+        require_root(env)?;
+        installer_lock(env, lifecycle)?
+    } else {
+        None
+    };
+    let active = lock
+        .as_ref()
+        .map(InstallerLock::active_inputs)
+        .transpose()?
+        .flatten();
+    let ctx = load_auto_update_context(req, env, active.as_ref())?;
     if mode == AutoUpdateMode::Status {
         write_auto_update_status(
             ctx.policy_path,
@@ -673,130 +796,7 @@ fn run_auto_update(
         lifecycle,
         memory_obs,
     };
-    run_auto_update_apply(req, env, validated, &mut runtime, stdout)
-}
-
-fn reconcile_complete(
-    req: &InstallRequest,
-    env: &InstallEnvironment,
-    guard: &CustomerTransitionGuard,
-    pending: &PackagePending,
-    unit_host: &mut dyn UnitHost,
-    stdout: &mut dyn Write,
-) -> Result<(), CustomerError> {
-    let bundle_dir = resolve_bundle_dir(req.bundle_root.as_deref(), &env.default_bundle_root)?;
-    let signature = verify_candidate_trust(&bundle_dir, req, env)?;
-    let declared = DeclaredBundle::open(&bundle_dir, &pending.new_hash).ok_or_else(|| {
-        fs_error(
-            CustomerReason::IdentityChanged,
-            "NBD_INSTALL_REASON=RECONCILE_BUNDLE_INVALID",
-            CustomerState::RecoveryRequired,
-        )
-    })?;
-    if let Some(effect) = inspect_effect_journal(&env.transition)? {
-        if effect.pending != *pending
-            || effect.phase != SelectorEffectPhase::Verified
-            || observe_installed_input_bundle_digest(&env.selector_path()).as_deref()
-                != Some(pending.new_hash.as_str())
-        {
-            return Err(fs_error(
-                CustomerReason::RecoveryRequired,
-                "NBD_INSTALL_REASON=RECONCILE_COMPLETE_UNSUPPORTED_WITHOUT_SEALED_SELECTOR",
-                CustomerState::RecoveryRequired,
-            ));
-        }
-    } else {
-        let target_ver = pending.target_release.as_deref().ok_or_else(|| {
-            fs_error(
-                CustomerReason::RecoveryRequired,
-                "NBD_INSTALL_REASON=RECONCILE_TARGET_MISSING",
-                CustomerState::RecoveryRequired,
-            )
-        })?;
-        let releases_meta = std::fs::metadata(env.releases_dir()).map_err(|_| {
-            fs_error(
-                CustomerReason::RecoveryRequired,
-                "NBD_INSTALL_REASON=PRODUCT_ROOT_INVALID",
-                CustomerState::RecoveryRequired,
-            )
-        })?;
-        let stage_dir = env.stage_dir();
-        let _ = resume_prepared(
-            guard,
-            pending,
-            &declared,
-            &signature,
-            &PreparePaths {
-                stage: &stage_dir,
-                parent: &env.releases_dir(),
-                parent_identity: (releases_meta.dev(), releases_meta.ino()),
-                name: target_ver,
-                reserve_bytes: INSTALL_RESERVE_BYTES,
-            },
-        )?;
-    }
-    if verify_release_manifest(&env.selector_path()).is_none() {
-        return Err(fs_error(
-            CustomerReason::RecoveryRequired,
-            "NBD_INSTALL_REASON=RECONCILE_COMPLETE_UNSUPPORTED_WITHOUT_SEALED_SELECTOR",
-            CustomerState::RecoveryRequired,
-        ));
-    }
-    unit_host.daemon_reload()?;
-    unit_host.sync_selected_release()?;
-    clear_stage_artifacts(&env.stage_dir());
-    clear_all_package_journals(guard, pending)?;
-    let _ = writeln!(stdout, "NBD_INSTALL_STATE=RECONCILED_COMPLETE");
-    Ok(())
-}
-
-fn reconcile_rollback(
-    env: &InstallEnvironment,
-    guard: &CustomerTransitionGuard,
-    pending: &PackagePending,
-    stdout: &mut dyn Write,
-) -> Result<(), CustomerError> {
-    if inspect_effect_journal(&env.transition)?.is_some() {
-        let _ = reconcile_selector(guard, pending, SelectorRecoveryAction::Rollback, None, None)?;
-    }
-    if let Some(target_ver) = pending.target_release.as_deref() {
-        let candidate_dir = env.releases_dir().join(target_ver);
-        if let Ok(md) = std::fs::symlink_metadata(&candidate_dir) {
-            remove_owned_unselected_release(
-                &candidate_dir,
-                (md.dev(), md.ino()),
-                &env.selector_path(),
-            )?;
-        }
-    }
-    clear_stage_artifacts(&env.stage_dir());
-    clear_all_package_journals(guard, pending)?;
-    let _ = writeln!(stdout, "NBD_INSTALL_STATE=RECONCILED_ROLLBACK");
-    let _ = MANAGED_UNITS;
-    Ok(())
-}
-
-fn run_reconcile(
-    req: &InstallRequest,
-    env: &InstallEnvironment,
-    action: SelectorRecoveryAction,
-    unit_host: &mut dyn UnitHost,
-    stdout: &mut dyn Write,
-) -> Result<(), CustomerError> {
-    let guard = acquire_transition(OperationOwner::Package, &env.transition)?;
-    let Some(pending) = read_pending(&env.transition)? else {
-        return Err(fs_error(
-            CustomerReason::UnsupportedSurface,
-            "NBD_INSTALL_REASON=NO_PENDING_TRANSACTION",
-            CustomerState::InstalledOff,
-        ));
-    };
-    match action {
-        SelectorRecoveryAction::Complete => {
-            reconcile_complete(req, env, &guard, &pending, unit_host, stdout)
-        }
-        SelectorRecoveryAction::Rollback => reconcile_rollback(env, &guard, &pending, stdout),
-    }
+    run_auto_update_apply(req, env, validated, lock.as_ref(), &mut runtime, stdout)
 }
 
 #[cfg(test)]

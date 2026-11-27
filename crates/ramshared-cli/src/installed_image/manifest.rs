@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Author: Emerson Busson
 // Email: emersonbusson@gmail.com
 // GitHub: https://github.com/emersonbusson
@@ -229,6 +230,29 @@ pub(crate) fn verify_release_manifest(release_root: &Path) -> Option<HashMap<Str
 pub(crate) fn observe_installed_input_bundle_digest(release_root: &Path) -> Option<String> {
     let tree = ReleaseTree::open(release_root)?;
     let hashes = verify_release_manifest_tree(&tree)?;
+    let digest = input_bundle_digest(&tree, &hashes)?;
+    tree.matches_selected(release_root)
+        .then(|| digest.to_owned())
+}
+
+pub(crate) fn verify_committed_release(
+    release_root: &Path,
+    expected_seal: &str,
+    expected_input: &str,
+) -> Option<HashMap<String, String>> {
+    let tree = ReleaseTree::open(release_root)?;
+    if tree.line("INSTALLED_MANIFEST_SHA256")?.as_str() != expected_seal {
+        return None;
+    }
+    let hashes = verify_release_manifest_tree(&tree)?;
+    (input_bundle_digest(&tree, &hashes)? == expected_input && tree.matches_selected(release_root))
+        .then_some(hashes)
+}
+
+fn input_bundle_digest<'a>(
+    tree: &ReleaseTree,
+    hashes: &'a HashMap<String, String>,
+) -> Option<&'a str> {
     let digest = hashes.get("INPUT_BUNDLE_SHA256SUMS")?;
     tree.verified_bytes("INPUT_BUNDLE_SHA256SUMS", digest, MAX_SEALED_TEXT_BYTES)?;
     let provenance = tree.verified_bytes(
@@ -247,7 +271,7 @@ pub(crate) fn observe_installed_input_bundle_digest(release_root: &Path) -> Opti
     {
         return None;
     }
-    tree.matches_selected(release_root).then(|| digest.clone())
+    Some(digest)
 }
 
 pub(super) fn verify_release_manifest_tree(tree: &ReleaseTree) -> Option<HashMap<String, String>> {

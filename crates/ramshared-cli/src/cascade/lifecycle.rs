@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Author: Emerson Busson
 // Email: emersonbusson@gmail.com
 // GitHub: https://github.com/emersonbusson
@@ -378,10 +379,10 @@ pub struct LifecycleView {
 
 pub fn overall_state(view: &LifecycleView, snap: &CascadeSnapshot) -> OverallState {
     let product_active = snap.daemon_alive || snap.vram.present;
-    let mut states = vec![if view.ok {
-        OverallState::Healthy
-    } else {
-        OverallState::Blocked
+    let mut states = vec![match (view.ok, protection_state(view, snap)) {
+        (false, _) => OverallState::Blocked,
+        (true, ProtectionState::AtRisk) => OverallState::Guarded,
+        (true, _) => OverallState::Healthy,
     }];
     states.push(match snap.control_state {
         ControlState::Healthy => OverallState::Healthy,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Author: Emerson Busson
 // Email: emersonbusson@gmail.com
 // GitHub: https://github.com/emersonbusson
@@ -621,6 +622,14 @@ fn disk_growth_after_activation_is_at_risk() {
     assert_eq!(disk_growth_kib(&s), Some(1_500));
     assert_eq!(view.phase, CascadePhase::UsingDisk);
     assert_eq!(protection_state(&view, &s), ProtectionState::AtRisk);
+    assert!(!status_ok(&view, &s));
+    let status: serde_json::Value =
+        serde_json::from_str(&render_status_json(&view, &s, "2026-11-26T17:30:00-03:00")).unwrap();
+    assert_eq!(status["protection_state"], "AT_RISK");
+    assert_eq!(status["overall_state"], "GUARDED");
+
+    s.control_state = ControlState::Emergency;
+    assert_eq!(overall_state(&view, &s), OverallState::Emergency);
 }
 
 #[test]

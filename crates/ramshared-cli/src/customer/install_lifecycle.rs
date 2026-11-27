@@ -11,23 +11,20 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use super::install_apply::CommittedInstall;
 use super::install_args::{InstallRequest, utc_timestamp_now, write_commit_output};
+use super::install_drain::{DrainInputs, DrainOutcome, InstallerLock, systemd::SystemStop};
 use super::install_fs::fs_error;
 use super::install_tokens::EnrollmentOutcome;
-use super::install_units::{UnitHost, resolve_systemctl_bin};
+use super::install_units::{UnitHost, UnitRuntimeStatus};
 use super::{CustomerError, CustomerReason, CustomerState};
-use crate::bounded_process::run_capture_command;
 use crate::cascade::boot_policy_effect::{
     BootPolicyHost, CASCADE_UNIT, HEALTH_UNIT, HOST_GATE_UNIT, SUPERVISOR_UNIT, observe_boot_policy,
 };
 
-const START_CASCADE_TIMEOUT: Duration = Duration::from_secs(150);
-const STOP_CASCADE_TIMEOUT: Duration = Duration::from_secs(300);
-const UNIT_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const ENABLE_ORDER: [&str; 3] = [HOST_GATE_UNIT, SUPERVISOR_UNIT, CASCADE_UNIT];
 const DISABLE_ORDER: [&str; 3] = [CASCADE_UNIT, SUPERVISOR_UNIT, HOST_GATE_UNIT];
 const FULL_ACTIVATE_ORDER: [&str; 4] = [HEALTH_UNIT, HOST_GATE_UNIT, SUPERVISOR_UNIT, CASCADE_UNIT];
@@ -38,10 +35,13 @@ pub(super) struct DrainSafetyVerdict {
     pub(super) reason: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct LiveRuntimeState {
     pub(super) cascade_active: bool,
     pub(super) supervisor_active: bool,
+    #[serde(default)]
+    pub(super) host_gate_active: bool,
     pub(super) health_active: bool,
     pub(super) health_enabled: bool,
     pub(super) boot_enrolled: bool,
@@ -52,6 +52,7 @@ impl LiveRuntimeState {
     pub(super) fn needs_upgrade_quiescence(&self) -> bool {
         self.cascade_active
             || self.supervisor_active
+            || self.host_gate_active
             || self.health_active
             || self.health_enabled
             || self.boot_enrolled
@@ -70,6 +71,7 @@ pub(super) enum ActivationOutcome {
 pub(super) struct UpgradeQuiescenceState {
     pub(super) was_active: bool,
     pub(super) was_supervisor_active: bool,
+    pub(super) was_host_gate_active: bool,
     pub(super) was_boot_enrolled: bool,
     pub(super) was_health_active: bool,
     pub(super) was_health_enabled: bool,
@@ -94,6 +96,9 @@ pub(super) trait LifecycleHost {
     fn enable_unit(&mut self, unit: &str) -> Result<(), CustomerError>;
     fn run_ordered_down(&mut self) -> Result<(), CustomerError>;
     fn ensure_recommended_config(&mut self, _stdout: &mut dyn Write) {}
+    fn upgrade_stop(&self) -> Option<SystemStop<'_>> {
+        None
+    }
 }
 
 /// Pure observation of systemd units plus caller-supplied managed-lifecycle fact.
@@ -105,16 +110,34 @@ pub(super) fn observe_systemd_runtime(
     let cascade = unit_host.query_unit(CASCADE_UNIT)?;
     let supervisor = unit_host.query_unit(SUPERVISOR_UNIT)?;
     let health = unit_host.query_unit(HEALTH_UNIT)?;
-    let boot_obs = observe_boot_policy(boot_host)?;
-    let bits = boot_obs.enablement();
+    let host_gate = unit_host.query_unit(HOST_GATE_UNIT)?;
+    let boot_enrolled = if !active_managed_swap
+        && [&cascade, &health].into_iter().all(is_inert_disabled_unit)
+        && [&supervisor, &host_gate].into_iter().all(is_absent_unit)
+    {
+        // Earlier native installs could leave both boot prerequisites absent.
+        false
+    } else {
+        let bits = observe_boot_policy(boot_host)?.enablement();
+        bits.host_gate_enabled && bits.supervisor_enabled && bits.cascade_enabled
+    };
     Ok(LiveRuntimeState {
         cascade_active: is_active_state(&cascade.active_state),
         supervisor_active: is_active_state(&supervisor.active_state),
+        host_gate_active: is_active_state(&host_gate.active_state),
         health_active: is_active_state(&health.active_state),
         health_enabled: is_enabled_state(&health.file_state),
-        boot_enrolled: bits.host_gate_enabled && bits.supervisor_enabled && bits.cascade_enabled,
+        boot_enrolled,
         active_managed_swap,
     })
+}
+
+fn is_inert_disabled_unit(unit: &UnitRuntimeStatus) -> bool {
+    unit.active_state == "inactive" && unit.file_state == "disabled"
+}
+
+fn is_absent_unit(unit: &UnitRuntimeStatus) -> bool {
+    unit.active_state == "inactive" && matches!(unit.file_state.as_str(), "" | "not-found")
 }
 
 fn is_active_state(state: &str) -> bool {
@@ -168,21 +191,42 @@ pub(super) fn activate_installed_units(
 ///
 /// If managed swap or cascade is active and canonical `down --plan` is not
 /// safe, returns `PrepareUpgradeOutcome::Deferred` with zero mutations.
+#[cfg(test)]
 pub(super) fn prepare_seamless_auto_update(
     unit_host: &dyn UnitHost,
     boot_host: &dyn BootPolicyHost,
     lifecycle: &mut dyn LifecycleHost,
 ) -> Result<PrepareUpgradeOutcome, CustomerError> {
     let state = lifecycle.observe_live_state(unit_host, boot_host)?;
-    prepare_upgrade_from_state(state, lifecycle)
+    prepare_upgrade_from_state(state, lifecycle, false)
+}
+
+pub(super) fn prepare_upgrade_with_custody(
+    live: LiveRuntimeState,
+    lifecycle: &mut dyn LifecycleHost,
+    custody: Option<(&InstallerLock, Option<&DrainInputs>)>,
+) -> Result<PrepareUpgradeOutcome, CustomerError> {
+    if let (Some((lock, inputs)), Some(systemd)) = (custody, lifecycle.upgrade_stop()) {
+        match lock.prepare(inputs, &live, lifecycle, &systemd)? {
+            DrainOutcome::Unneeded => {}
+            DrainOutcome::Deferred(reason) => {
+                return Ok(PrepareUpgradeOutcome::Deferred(reason));
+            }
+            DrainOutcome::Drained(prior) => {
+                return prepare_upgrade_from_state(prior, lifecycle, true);
+            }
+        }
+    }
+    prepare_upgrade_from_state(live, lifecycle, false)
 }
 
 fn prepare_upgrade_from_state(
     state: LiveRuntimeState,
     lifecycle: &mut dyn LifecycleHost,
+    drained: bool,
 ) -> Result<PrepareUpgradeOutcome, CustomerError> {
     let is_active = state.cascade_active || state.active_managed_swap;
-    if is_active {
+    if is_active && !drained {
         let verdict = lifecycle.evaluate_drain_safety()?;
         if !verdict.safe {
             return Ok(PrepareUpgradeOutcome::Deferred(verdict.reason));
@@ -192,16 +236,22 @@ fn prepare_upgrade_from_state(
     let mut stopped = UpgradeQuiescenceState::default();
     let mut disabled = Vec::new();
     let prepare_result = (|| -> Result<(), CustomerError> {
-        if state.cascade_active {
-            lifecycle.stop_unit(CASCADE_UNIT)?;
-        }
-        if state.active_managed_swap {
-            lifecycle.run_ordered_down()?;
+        if !drained {
+            if state.cascade_active {
+                lifecycle.stop_unit(CASCADE_UNIT)?;
+            }
+            if state.active_managed_swap {
+                lifecycle.run_ordered_down()?;
+            }
         }
         stopped.was_active = is_active;
         if state.supervisor_active {
             lifecycle.stop_unit(SUPERVISOR_UNIT)?;
             stopped.was_supervisor_active = true;
+        }
+        if state.host_gate_active {
+            lifecycle.stop_unit(HOST_GATE_UNIT)?;
+            stopped.was_host_gate_active = true;
         }
         if state.health_active {
             lifecycle.stop_unit(HEALTH_UNIT)?;
@@ -233,6 +283,7 @@ fn prepare_upgrade_from_state(
     Ok(PrepareUpgradeOutcome::Ready(UpgradeQuiescenceState {
         was_active: is_active,
         was_supervisor_active: state.supervisor_active,
+        was_host_gate_active: state.host_gate_active,
         was_boot_enrolled: state.boot_enrolled,
         was_health_active: state.health_active,
         was_health_enabled: state.health_enabled,
@@ -249,6 +300,7 @@ fn prepare_upgrade_from_state(
 pub(super) fn run_attended_apply_with(
     req: &InstallRequest,
     selector_path: &Path,
+    custody: Option<(&InstallerLock, Option<&DrainInputs>)>,
     unit_host: &mut dyn UnitHost,
     boot_host: &dyn BootPolicyHost,
     lifecycle: &mut dyn LifecycleHost,
@@ -272,13 +324,22 @@ pub(super) fn run_attended_apply_with(
     };
     if installed {
         let live = lifecycle.observe_live_state(unit_host, boot_host)?;
-        if live.needs_upgrade_quiescence() {
-            let quiescence = match prepare_upgrade_from_state(live, lifecycle)? {
+        if live.needs_upgrade_quiescence() || custody.is_some() {
+            let quiescence = match prepare_upgrade_with_custody(live, lifecycle, custody)? {
                 PrepareUpgradeOutcome::Ready(q) => q,
                 PrepareUpgradeOutcome::Deferred(reason) => {
+                    let code = if reason.starts_with("DRAIN_PENDING_JOB_")
+                        || matches!(
+                            reason.as_str(),
+                            "CASCADE_NOT_SETTLED_FOR_STOP" | "STOP_REPLY_NOT_RECORDED"
+                        ) {
+                        "DRAIN_DEFERRED"
+                    } else {
+                        "DRAIN_UNSAFE"
+                    };
                     return Err(fs_error(
                         CustomerReason::ActiveSession,
-                        format!("NBD_INSTALL_REASON=DRAIN_UNSAFE ({reason})"),
+                        format!("NBD_INSTALL_REASON={code} ({reason})"),
                         CustomerState::Active,
                     ));
                 }
@@ -288,17 +349,21 @@ pub(super) fn run_attended_apply_with(
                 apply_req.enroll_default = true;
             }
             let apply_res = apply_fn(&apply_req, unit_host, stdout);
-            let (committed, activation) = finish_upgrade_lifecycle(
+            let outcome = finish_upgrade_lifecycle(
                 &quiescence,
                 lifecycle,
                 apply_res,
                 |c| should_activate_after_install(req, c.enroll_outcome.as_ref()),
                 req.no_activate,
                 stdout,
-            )?;
+            );
+            complete_drain_custody(custody, &outcome, unit_host)?;
+            let (committed, activation) = outcome?;
             emit_committed_install(&committed, &activation, req.json, stdout);
             return Ok(());
         }
+    } else if let Some((lock, _)) = custody {
+        lock.validate_no_prior_install()?;
     }
     let committed = apply_fn(req, unit_host, stdout)?;
     let activation = if should_activate_after_install(req, committed.enroll_outcome.as_ref()) {
@@ -309,6 +374,43 @@ pub(super) fn run_attended_apply_with(
     };
     emit_committed_install(&committed, &activation, req.json, stdout);
     Ok(())
+}
+
+pub(super) fn complete_drain_custody<T>(
+    custody: Option<(&InstallerLock, Option<&DrainInputs>)>,
+    outcome: &Result<(T, ActivationOutcome), CustomerError>,
+    unit_host: &dyn UnitHost,
+) -> Result<(), CustomerError> {
+    let Some((lock, inputs)) = custody else {
+        return Ok(());
+    };
+    let restored = match outcome {
+        Ok((_, activation)) => !matches!(activation, ActivationOutcome::Refused { .. }),
+        Err(error) => error.state != CustomerState::RecoveryRequired,
+    };
+    if restored {
+        if outcome.is_ok()
+            && let Some((input, _, _)) = lock.committed_runtime()?
+        {
+            observe_committed_activation(unit_host, input.no_activate)?;
+        }
+        lock.clear_finished(inputs, outcome.is_ok())?;
+    }
+    Ok(())
+}
+
+pub(super) fn observe_committed_activation(
+    unit_host: &dyn UnitHost,
+    no_activate: bool,
+) -> Result<ActivationOutcome, CustomerError> {
+    let runtime = unit_host.query_unit(CASCADE_UNIT)?;
+    match runtime.active_state.as_str() {
+        "active" => Ok(ActivationOutcome::Active),
+        "inactive" if no_activate => Ok(ActivationOutcome::Off),
+        state => Err(super::transition::recovery_refusal(format!(
+            "committed cascade did not settle ({state})"
+        ))),
+    }
 }
 
 /// Complete or restore runtime state after `execute_verified_apply` finishes
@@ -389,6 +491,7 @@ fn restore_runtime(
     }
     let units = [
         (HEALTH_UNIT, state.was_health_active),
+        (HOST_GATE_UNIT, state.was_host_gate_active),
         (SUPERVISOR_UNIT, state.was_supervisor_active),
     ];
     for (unit, was_active) in units {
@@ -562,157 +665,10 @@ impl LifecycleHost for NoopLifecycleHost {
     }
 }
 
-/// Production host adapter backed by systemd and canonical `cascade::down`.
-pub(super) struct SystemLifecycleHost {
-    systemctl_bin: std::path::PathBuf,
-    systemd_marker: std::path::PathBuf,
-}
-
-impl SystemLifecycleHost {
-    pub(super) fn production() -> Self {
-        Self {
-            systemctl_bin: std::path::PathBuf::from(resolve_systemctl_bin()),
-            systemd_marker: std::path::PathBuf::from("/run/systemd/system"),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_paths(systemctl_bin: std::path::PathBuf, systemd_marker: std::path::PathBuf) -> Self {
-        Self {
-            systemctl_bin,
-            systemd_marker,
-        }
-    }
-
-    fn run_unit(&self, verb: &str, unit: &str, timeout: Duration) -> Result<(), CustomerError> {
-        run_systemctl_unit_with(
-            &self.systemctl_bin,
-            &self.systemd_marker,
-            verb,
-            unit,
-            timeout,
-        )
-    }
-}
-
-fn map_drain_plan_verdict(observed: Result<Option<(bool, String)>, String>) -> DrainSafetyVerdict {
-    match observed {
-        Ok(None) => DrainSafetyVerdict {
-            safe: true,
-            reason: "no_lifecycle".to_owned(),
-        },
-        Ok(Some((safe, reason))) => DrainSafetyVerdict { safe, reason },
-        Err(reason) => DrainSafetyVerdict {
-            safe: false,
-            reason,
-        },
-    }
-}
-
-fn map_ordered_down_error(detail: String) -> CustomerError {
-    fs_error(
-        CustomerReason::ActiveSession,
-        format!("ordered swapoff-first drain failed: {detail}"),
-        CustomerState::Active,
-    )
-}
-
-fn run_systemctl_unit_with(
-    systemctl_bin: &Path,
-    systemd_marker: &Path,
-    verb: &str,
-    unit: &str,
-    timeout: Duration,
-) -> Result<(), CustomerError> {
-    if !systemd_marker.exists() {
-        return Err(fs_error(
-            CustomerReason::ObservationUnavailable,
-            format!("systemd unavailable for `{verb} {unit}`"),
-            CustomerState::InstalledOff,
-        ));
-    }
-    let mut cmd = Command::new(systemctl_bin);
-    cmd.args([verb, "--", unit]);
-    run_capture_command(
-        &mut cmd,
-        "installer lifecycle systemctl",
-        timeout,
-        4096,
-        |_| {},
-    )
-    .map(|_| ())
-    .map_err(|err| match err {
-        crate::bounded_process::ProcessSpawnError::NonZeroExit { stderr, .. } => {
-            let detail = stderr.trim();
-            fs_error(
-                CustomerReason::UnsupportedSurface,
-                if detail.is_empty() {
-                    format!("systemctl {verb} {unit} exited nonzero")
-                } else {
-                    format!("systemctl {verb} {unit}: {detail}")
-                },
-                CustomerState::InstalledOff,
-            )
-        }
-        other => fs_error(
-            CustomerReason::ObservationUnavailable,
-            format!("systemctl {verb} {unit}: {other}"),
-            CustomerState::InstalledOff,
-        ),
-    })
-}
-
-impl LifecycleHost for SystemLifecycleHost {
-    fn observe_live_state(
-        &self,
-        unit_host: &dyn UnitHost,
-        boot_host: &dyn BootPolicyHost,
-    ) -> Result<LiveRuntimeState, CustomerError> {
-        let active_managed_swap = !matches!(crate::cascade::evaluate_live_down_plan(), Ok(None));
-        observe_systemd_runtime(unit_host, boot_host, active_managed_swap)
-    }
-
-    fn evaluate_drain_safety(&self) -> Result<DrainSafetyVerdict, CustomerError> {
-        Ok(map_drain_plan_verdict(
-            crate::cascade::evaluate_live_down_plan().map_err(|err| err.to_string()),
-        ))
-    }
-
-    fn stop_unit(&mut self, unit: &str) -> Result<(), CustomerError> {
-        let timeout = if unit == CASCADE_UNIT {
-            STOP_CASCADE_TIMEOUT
-        } else {
-            UNIT_OP_TIMEOUT
-        };
-        self.run_unit("stop", unit, timeout)
-    }
-
-    fn start_unit(&mut self, unit: &str) -> Result<(), CustomerError> {
-        let timeout = if unit == CASCADE_UNIT {
-            START_CASCADE_TIMEOUT
-        } else {
-            UNIT_OP_TIMEOUT
-        };
-        self.run_unit("start", unit, timeout)
-    }
-
-    fn disable_unit(&mut self, unit: &str) -> Result<(), CustomerError> {
-        self.run_unit("disable", unit, UNIT_OP_TIMEOUT)
-    }
-
-    fn enable_unit(&mut self, unit: &str) -> Result<(), CustomerError> {
-        self.run_unit("enable", unit, UNIT_OP_TIMEOUT)
-    }
-
-    fn run_ordered_down(&mut self) -> Result<(), CustomerError> {
-        crate::cascade::down_quiet().map_err(|err| map_ordered_down_error(err.to_string()))
-    }
-
-    fn ensure_recommended_config(&mut self, stdout: &mut dyn Write) {
-        crate::resource_config::recommended::ensure_recommended_cascade_conf_live(stdout);
-        crate::resource_config::assistant::emit_post_install_assistant_summary_live(stdout);
-    }
-}
+mod system;
+pub(super) use system::SystemLifecycleHost;
+#[cfg(test)]
+use system::{map_drain_plan_verdict, map_ordered_down_error};
 
 #[cfg(test)]
 mod tests;

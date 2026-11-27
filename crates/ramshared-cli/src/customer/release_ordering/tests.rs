@@ -86,6 +86,28 @@ fn release_is_newer_matches_shell_ordering_contract() {
 }
 
 #[test]
+fn release_candidates_order_before_their_stable_release() {
+    for (candidate, running, order) in [
+        ("v1.0.2", "v1.0.3-rc.10", ReleaseOrder::Older),
+        ("v1.0.3", "v1.0.3-rc.10", ReleaseOrder::Newer),
+        ("v1.0.3-rc.10", "v1.0.3-2-gabcd", ReleaseOrder::Older),
+        ("v1.0.3-rc.10", "v1.0.3-rc.9", ReleaseOrder::Newer),
+        ("v1.0.3-rc.10", "v1.0.3-rc.10", ReleaseOrder::Equal),
+        ("v1.0.3-rc.10-1-gabcd", "v1.0.3-rc.10", ReleaseOrder::Newer),
+        ("v1.0.3-rc.10", "v1.0.3-rc.9+dirty", ReleaseOrder::Newer),
+        ("v1.0.3-rc.010", "v1.0.3-rc.9", ReleaseOrder::Unknown),
+        ("v1.0.3-rc.10-dirty", "v1.0.3-rc.9", ReleaseOrder::Unknown),
+        ("v1.0.3-beta.1", "v1.0.3-rc.9", ReleaseOrder::Unknown),
+    ] {
+        assert_eq!(
+            release_is_newer(candidate, running),
+            order,
+            "{candidate} vs {running}"
+        );
+    }
+}
+
+#[test]
 fn find_newest_bundle_picks_latest_and_handles_ties_without_links() {
     let base = std::env::temp_dir().join(format!("ramshared-newest-bundle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);

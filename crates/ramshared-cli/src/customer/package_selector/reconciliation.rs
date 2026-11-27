@@ -62,6 +62,78 @@ pub(in crate::customer) fn inspect_effect_journal(
     Ok(Some(parsed))
 }
 
+/// Verify a publication that already happened before its installer exited.
+/// The link's inode must be the recorded staging inode after the rename.
+pub(in crate::customer) fn settle_observed_publication(
+    guard: &CustomerTransitionGuard,
+    pending: &PackagePending,
+    selector: &Path,
+    signature: &VerifiedSignature,
+    mut record: SelectorEffectRecord,
+) -> Result<SelectorEffectRecord, CustomerError> {
+    guard.revalidate()?;
+    if guard.owner() != OperationOwner::Package
+        || read_pending(guard.paths())?.as_ref() != Some(pending)
+        || &record.pending != pending
+        || record.selector != selector
+        || !matches!(
+            record.phase,
+            SelectorEffectPhase::SelectorStaged
+                | SelectorEffectPhase::SelectorPublished
+                | SelectorEffectPhase::Verified
+        )
+        || record.input_manifest_sha256 != pending.new_hash
+        || signature.manifest_sha256() != pending.new_hash
+        || signature.revalidate().is_none()
+    {
+        return Err(recovery_refusal(
+            "selector effect does not authorize this publication",
+        ));
+    }
+    let parent_path = selector
+        .parent()
+        .ok_or_else(|| recovery_refusal("published selector has no parent"))?;
+    let parent = open_directory_no_follow(parent_path, false)?
+        .ok_or_else(|| recovery_refusal("published selector parent disappeared"))?;
+    validate_directory(&parent, "published selector parent")?;
+    let parent_meta = parent
+        .metadata()
+        .map_err(|_| recovery_refusal("published selector parent identity unavailable"))?;
+    let leaf = selector
+        .file_name()
+        .ok_or_else(|| recovery_refusal("invalid selector leaf"))?;
+    let target = record
+        .target
+        .to_str()
+        .ok_or_else(|| recovery_refusal("invalid selector target"))?;
+    if (parent_meta.dev(), parent_meta.ino()) != record.parent_identity
+        || Some(verify_symlink(&parent, leaf, target)?) != record.staging_identity
+        || stat_no_follow(&parent, OsStr::new(&record.staging_name))?.is_some()
+        || !std::fs::metadata(selector).is_ok_and(|metadata| {
+            metadata.is_dir() && (metadata.dev(), metadata.ino()) == record.target_identity
+        })
+        || crate::installed_image::verify_committed_release(
+            selector,
+            &record.sealed_manifest_sha256,
+            &record.input_manifest_sha256,
+        )
+        .is_none()
+    {
+        return Err(recovery_refusal(
+            "published selector or sealed release changed",
+        ));
+    }
+    guard.revalidate()?;
+    if record.phase != SelectorEffectPhase::Verified {
+        parent
+            .sync_all()
+            .map_err(|_| recovery_refusal("cannot sync observed selector publication"))?;
+        record.phase = SelectorEffectPhase::Verified;
+        persist_record(guard, &record)?;
+    }
+    Ok(record)
+}
+
 /// Reconcile an interrupted selector switch: either roll back cleanly or verify & complete.
 pub(in crate::customer) fn reconcile_selector(
     guard: &CustomerTransitionGuard,

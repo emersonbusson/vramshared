@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::install_args::{InstallRequest, utc_timestamp_now};
+use super::install_drain::InstallerLock;
 use super::install_fs::{ensure_dir_no_follow, fs_error, read_bounded_regular_at};
 use super::install_tokens::{
     ApprovalTokenCustody, EnrollmentOutcome, apply_default_enrollment,
@@ -22,8 +23,7 @@ use super::install_tokens::{
 };
 use super::install_transaction::{INSTALL_RESERVE_BYTES, InstallEnvironment, resolve_bundle_dir};
 use super::install_units::{
-    SystemUnitHost, UnitHost, UnitInstallCustody, check_units_inactive_and_disabled,
-    inspect_and_stage_units, validate_unit_plan,
+    SystemUnitHost, UnitHost, UnitInstallCustody, check_install_units, inspect_and_stage_units,
 };
 use super::package::{
     MAX_PAYLOAD_MANIFEST_BYTES, PayloadIdentity, PayloadManifest, RETIRED_LIFECYCLE_UNIT,
@@ -32,8 +32,8 @@ use super::package_admission::{LifecycleOwnership, LifecycleSnapshot};
 use super::package_prepare::{PreparePaths, prepare_admitted};
 use super::package_publish::clear_publication_journal;
 use super::package_selector::{
-    PreviousEvidence, PreviousTransformation, SelectorRecoveryAction, SinkWitness,
-    clear_selector_journals, finalize_and_seal_release, inspect_effect_journal,
+    PreviousEvidence, PreviousTransformation, SelectorEffectRecord, SelectorRecoveryAction,
+    SinkWitness, clear_selector_journals, finalize_and_seal_release, inspect_effect_journal,
     publish_sealed_selector, reconcile_selector, record_prepared_intent,
     remove_owned_unselected_release,
 };
@@ -46,7 +46,7 @@ use super::package_trust::{
     VerifiedSignature, verify_bundle, verify_bundle_from_policy, verify_bundle_with_keyring,
 };
 use super::plan::ReleaseIdentity;
-use super::release_ordering::{ReleaseOrder, find_bundle_by_manifest_sha256, release_is_newer};
+use super::release_ordering::{ReleaseOrder, find_previous_bundle, release_is_newer};
 use super::transition::{CustomerTransitionGuard, PackageAction, PackagePending, clear_pending};
 use super::transition_custody::open_directory_no_follow;
 use super::{CustomerError, CustomerReason, CustomerState};
@@ -54,6 +54,10 @@ use crate::cascade::boot_policy_effect::{BootPolicyHost, CASCADE_UNIT};
 use crate::cascade::posture::Posture;
 use crate::installed_image::{observe_installed_input_bundle_digest, sha256_reader};
 use crate::release_identity::{MAX_SEALED_TEXT_BYTES, read_release_version};
+
+mod drain_verification;
+use drain_verification::{resolve_prior_identity, verify_quiesced_install};
+pub(super) use drain_verification::{verify_committed_request, verify_install};
 
 const MAX_TOTAL_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 const STREAM_WORK_BYTES: u64 = 1024 * 1024;
@@ -192,12 +196,15 @@ fn resolve_previous_evidence(
                 .parent()
                 .and_then(Path::parent)
                 .unwrap_or(&env.default_bundle_root);
-            find_bundle_by_manifest_sha256(search_root, old_hash).ok_or_else(|| {
-                install_err(
-                    CustomerReason::AuthorizationRequired,
-                    "NBD_INSTALL_REASON=PREVIOUS_BUNDLE_UNAVAILABLE",
-                )
-            })?
+            let policy_path = req.policy.as_deref().unwrap_or(&env.default_policy);
+            find_previous_bundle(search_root, policy_path, env.owner_uid, old_hash)?.ok_or_else(
+                || {
+                    install_err(
+                        CustomerReason::AuthorizationRequired,
+                        "NBD_INSTALL_REASON=PREVIOUS_BUNDLE_UNAVAILABLE",
+                    )
+                },
+            )?
         }
     };
     let prev_sig = verify_candidate_trust(&prev_bundle_dir, req, env)?;
@@ -320,6 +327,15 @@ fn open_verified_candidate(
             "NBD_INSTALL_REASON=BUNDLE_MANIFEST_INVALID",
         )
     })?;
+    let declared_release = declared
+        .member("RELEASE_VERSION", MAX_SEALED_TEXT_BYTES)
+        .and_then(|bytes| crate::release_identity::parse_identity_line(&bytes));
+    if declared_release.as_deref() != Some(inputs.approved_ver) {
+        return Err(install_err(
+            CustomerReason::IdentityChanged,
+            "NBD_INSTALL_REASON=SIGNED_RELEASE_VERSION_MISMATCH",
+        ));
+    }
     let release_manifest_bytes = declared
         .member("release-manifest.json", MAX_PAYLOAD_MANIFEST_BYTES)
         .ok_or_else(|| {
@@ -344,25 +360,6 @@ fn open_verified_candidate(
         declared,
         sink,
     })
-}
-
-struct PriorLocation {
-    root: PathBuf,
-    identity: (u64, u64),
-}
-
-fn resolve_prior_identity(selector: &Path) -> Result<Option<PriorLocation>, CustomerError> {
-    if std::fs::symlink_metadata(selector).is_err() {
-        return Ok(None);
-    }
-    let root = std::fs::canonicalize(selector)
-        .map_err(|_| recovery_err("NBD_INSTALL_REASON=SELECTOR_TARGET_INVALID"))?;
-    let meta = std::fs::symlink_metadata(&root)
-        .map_err(|_| recovery_err("NBD_INSTALL_REASON=PRIOR_RELEASE_INVALID"))?;
-    Ok(Some(PriorLocation {
-        root,
-        identity: (meta.dev(), meta.ino()),
-    }))
 }
 
 fn inspect_prior_install_state(
@@ -396,16 +393,22 @@ fn inspect_prior_install_state(
             prev_evidence_bundle: None,
         });
     };
-    let cur_ver = req
+    let cur_ver = read_release_version(prev_path).ok_or_else(|| {
+        install_err(
+            CustomerReason::IdentityChanged,
+            "NBD_INSTALL_REASON=INSTALLED_RELEASE_IDENTITY_INVALID",
+        )
+    })?;
+    if req
         .running
-        .clone()
-        .or_else(|| read_release_version(selector))
-        .ok_or_else(|| {
-            install_err(
-                CustomerReason::IdentityChanged,
-                "NBD_INSTALL_REASON=INSTALLED_RELEASE_IDENTITY_INVALID",
-            )
-        })?;
+        .as_ref()
+        .is_some_and(|running| running != &cur_ver)
+    {
+        return Err(install_err(
+            CustomerReason::IdentityChanged,
+            "NBD_INSTALL_REASON=RUNNING_RELEASE_MISMATCH",
+        ));
+    }
     if let ReleaseOrder::Older | ReleaseOrder::Equal = release_is_newer(approved_ver, &cur_ver) {
         return Err(install_err(
             CustomerReason::IdentityChanged,
@@ -443,7 +446,7 @@ fn commit_release_custody(
     unit_host: &mut dyn UnitHost,
     boot_host: &impl BootPolicyHost,
     custody: &mut CommitCustodyState,
-) -> Result<Option<EnrollmentOutcome>, CustomerError> {
+) -> Result<(Option<EnrollmentOutcome>, SelectorEffectRecord), CustomerError> {
     let prepared = prepare_admitted(
         admitted,
         pending,
@@ -483,7 +486,7 @@ fn commit_release_custody(
         &req.legacy_unit_approvals,
         unit_host,
     )?);
-    let _effect = publish_sealed_selector(&intent, &sealed)?;
+    let effect = publish_sealed_selector(&intent, &sealed)?;
     if let Some(uc) = custody.unit_custody.as_mut() {
         uc.reload_and_sync(unit_host)?;
     }
@@ -492,15 +495,16 @@ fn commit_release_custody(
         inputs.approved_ver,
         inputs.posture,
     )?);
-    if req.enroll_default {
-        Ok(Some(apply_default_enrollment(
+    let enrollment = if req.enroll_default {
+        Some(apply_default_enrollment(
             boot_host,
             &env.approval_dir,
             inputs.approved_ver,
-        )?))
+        )?)
     } else {
-        Ok(None)
-    }
+        None
+    };
+    Ok((enrollment, effect))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -521,14 +525,17 @@ fn admit_apply_transaction<'a>(
     ),
     CustomerError,
 > {
-    check_units_inactive_and_disabled(unit_host)?;
-    validate_unit_plan(
-        &candidate.bundle_dir,
-        prior.prior_root.as_deref(),
-        &env.product_root,
-        &env.systemd_dir,
-        &req.legacy_unit_approvals,
-    )?;
+    let check_units = |host: &dyn UnitHost| {
+        check_install_units(
+            host,
+            &candidate.bundle_dir,
+            prior.prior_root.as_deref(),
+            &env.product_root,
+            &env.systemd_dir,
+            &req.legacy_unit_approvals,
+        )
+    };
+    check_units(unit_host)?;
 
     let releases_dir = ensure_dir_no_follow(
         &env.releases_dir(),
@@ -564,6 +571,9 @@ fn admit_apply_transaction<'a>(
         CustomerState::Absent
     };
     let mut observe = || {
+        if env.require_root {
+            verify_quiesced_install(env, prior, || check_units(unit_host))?;
+        }
         Ok(PackageObservation {
             snapshot: LifecycleSnapshot {
                 state: initial_state,
@@ -590,19 +600,12 @@ fn admit_apply_transaction<'a>(
     ))
 }
 
-pub(super) fn verify_install(
-    req: &InstallRequest,
-    env: &InstallEnvironment,
-    preverified_sig: Option<VerifiedSignature>,
-) -> Result<VerifiedCandidate, CustomerError> {
-    let inputs = validate_apply_inputs(req)?;
-    open_verified_candidate(req, env, &inputs, preverified_sig)
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_verified_apply(
     req: &InstallRequest,
     env: &InstallEnvironment,
     candidate: VerifiedCandidate,
+    installer_lock: Option<&InstallerLock>,
     unit_host: &mut dyn UnitHost,
     boot_host: &impl BootPolicyHost,
     memory_obs: &mut dyn FnMut() -> Option<MemoryObservation>,
@@ -633,6 +636,9 @@ pub(super) fn execute_verified_apply(
         &selector,
         inputs.approved_ver,
     )?;
+    if let Some(lock) = installer_lock {
+        lock.record_package_plan(req.enroll_default)?;
+    }
     let (admitted, pending, releases_id) = admit_apply_transaction(
         req, env, &inputs, &candidate, &streamed, &prior, unit_host, memory_obs,
     )?;
@@ -665,18 +671,27 @@ pub(super) fn execute_verified_apply(
         boot_host,
         &mut custody,
     ) {
-        Ok(enroll_outcome) => finish_committed_apply(
-            env,
-            &prior,
-            &selector,
-            &stage_root,
-            &admitted,
-            &pending,
-            inputs.approved_ver,
-            inputs.posture,
-            enroll_outcome,
-            stdout,
-        ),
+        Ok((enroll_outcome, effect)) => {
+            if let Some(lock) = installer_lock {
+                let enrolled = matches!(enroll_outcome, Some(EnrollmentOutcome::Enrolled { .. }));
+                lock.record_committed(admitted.guard(), &effect, enrolled)
+                    .map_err(|error| {
+                        recovery_err(format!("cannot retain committed runtime: {error}"))
+                    })?;
+            }
+            finish_committed_apply(
+                env,
+                &prior,
+                &selector,
+                &stage_root,
+                &admitted,
+                &pending,
+                inputs.approved_ver,
+                inputs.posture,
+                enroll_outcome,
+                stdout,
+            )
+        }
         Err(err) => {
             match rollback_failed_apply(
                 admitted.guard(),
