@@ -2052,7 +2052,12 @@ if dmesg_text="$(dmesg --level=err,warn 2>&1)"; then dmesg_readable=1; else dmes
 dmesg_sha="$(printf '%s' "$dmesg_text" | sha256sum 2>/dev/null | awk '{print $1}')"
 [ -n "$dmesg_sha" ] || dmesg_sha=unavailable
 dxg_fortify="$(printf '%s\n' "$dmesg_text" | grep -F -c 'memcpy: detected field-spanning write' || true)"
-wait_boot="$(printf '%s\n' "$dmesg_text" | grep -F -c 'WaitForBootProcess: /sbin/init failed to start within' || true)"
+wait_boot=unavailable
+if boot_journal="$(timeout -k 1s 3s journalctl -b -k --no-pager -o cat 2>/dev/null)" &&
+   [ -n "$boot_journal" ]; then
+  wait_boot="$(printf '%s\n' "$boot_journal" |
+    grep -Ec 'WaitForBootProcess(:[0-9]+)?: /sbin/init failed to start within' || true)"
+fi
 journal_unclean="$(printf '%s\n' "$dmesg_text" | grep -Eic 'journal.*(unclean|corrupt)|uncleanly shut down' || true)"
 p9_cancelled="$(printf '%s\n' "$dmesg_text" | grep -Eic 'p9.*Operation canceled' || true)"
 kernel_fatals="$(printf '%s\n' "$dmesg_text" | grep -Eic 'kernel panic|BUG:|Oops:|general protection fault' || true)"
