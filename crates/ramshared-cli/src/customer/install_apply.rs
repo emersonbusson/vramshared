@@ -53,6 +53,7 @@ use super::{CustomerError, CustomerReason, CustomerState};
 use crate::cascade::boot_policy_effect::{BootPolicyHost, CASCADE_UNIT};
 use crate::cascade::posture::Posture;
 use crate::installed_image::{observe_installed_input_bundle_digest, sha256_reader};
+use crate::operation_progress::{OperationProgressGuard, PACKAGE_COMMIT, PACKAGE_VERIFY};
 use crate::release_identity::{MAX_SEALED_TEXT_BYTES, read_release_version};
 
 mod drain_verification;
@@ -454,6 +455,9 @@ fn commit_release_custody(
         &candidate.signature,
         prep_paths,
     )?;
+    if let Some(progress) = prep_paths.progress {
+        progress.update_package(PACKAGE_COMMIT, inputs.approved_ver, None);
+    }
     custody.prepared_release_loc =
         Some((prepared.tree.path().to_path_buf(), prepared.tree.identity()));
     let prev_ev = prior
@@ -612,6 +616,12 @@ pub(super) fn execute_verified_apply(
     stdout: &mut dyn Write,
 ) -> Result<CommittedInstall, CustomerError> {
     let inputs = validate_apply_inputs(req)?;
+    let progress = installer_lock
+        .filter(|_| env.require_root)
+        .map(|_| OperationProgressGuard::start_package_install());
+    if let Some(progress) = &progress {
+        progress.update_package(PACKAGE_VERIFY, inputs.approved_ver, None);
+    }
     let requirement = memory_policy();
     let streamed = candidate
         .declared
@@ -650,6 +660,7 @@ pub(super) fn execute_verified_apply(
         parent_identity: releases_id,
         name: inputs.approved_ver,
         reserve_bytes: INSTALL_RESERVE_BYTES,
+        progress: progress.as_ref(),
     };
     let mut custody = CommitCustodyState {
         unit_custody: None,

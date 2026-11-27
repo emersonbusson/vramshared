@@ -34,8 +34,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::customer) struct StopProcess {
-    pid: NonZeroU32,
-    start_ticks: u64,
+    pub(super) pid: NonZeroU32,
+    pub(super) start_ticks: u64,
 }
 
 #[derive(Debug)]
@@ -338,6 +338,8 @@ mod tests {
             ttl_ms: 500,
             owner_pid: 9,
             owner_start_ticks: 23,
+            upgrade: None,
+            package_files: None,
         };
         wait.observe(at(1), control, Some(&progress));
         progress.updated_at_unix_ms = 10;

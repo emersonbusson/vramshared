@@ -157,6 +157,7 @@ fn exercise_publication_boundaries(
         parent_identity: tree_parent_id,
         name: "linked",
         reserve_bytes: 0,
+        progress: None,
     };
     let linked = crate::customer::package_prepare::resume(
         &linked_guard,

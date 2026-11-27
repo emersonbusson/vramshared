@@ -30,7 +30,7 @@ use super::transition_custody::{
     clear_journal_file, open_directory_no_follow, open_named_file, read_journal_body,
     validate_directory, validate_regular,
 };
-use crate::operation_progress::unix_epoch_ms;
+use crate::operation_progress::{UpgradeDrainProgress, unix_epoch_ms};
 use crate::workload::{current_boot_id, valid_boot_id};
 
 pub(super) mod systemd;
@@ -43,6 +43,39 @@ const OBSERVATION_WINDOW: Duration = Duration::from_secs(180);
 const STALL_WINDOW: Duration = Duration::from_secs(45);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 static STAGING_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+/// Project display-safe versions from the current stop owned by this process.
+pub(crate) fn observe_upgrade_drain(pid: u32, start_ticks: u64) -> Option<UpgradeDrainProgress> {
+    read_upgrade_drain(&TransitionPaths::production(), pid, start_ticks)
+}
+
+fn read_upgrade_drain(
+    paths: &TransitionPaths,
+    pid: u32,
+    start_ticks: u64,
+) -> Option<UpgradeDrainProgress> {
+    let body = read_journal_body(paths, OsStr::new(RECEIPT_NAME), RECEIPT_LABEL).ok()??;
+    let receipt: Receipt = serde_json::from_str(&body).ok()?;
+    let Phase::Submitted {
+        process: Some(process),
+        ..
+    } = receipt.phase
+    else {
+        return None;
+    };
+    if receipt.schema_version != 1
+        || receipt.boot_id != current_boot_id().ok()?
+        || !receipt.prior_runtime.cascade_active
+        || process.pid.get() != pid
+        || process.start_ticks != start_ticks
+    {
+        return None;
+    }
+    UpgradeDrainProgress::new(
+        receipt.inputs.previous_release,
+        receipt.inputs.candidate_release,
+    )
+}
 
 pub(super) fn require_no_drain(paths: &TransitionPaths) -> Result<(), CustomerError> {
     if read_journal_body(paths, OsStr::new(RECEIPT_NAME), RECEIPT_LABEL)?.is_some() {

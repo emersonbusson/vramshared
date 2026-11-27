@@ -132,7 +132,7 @@ fn exercise_stage_space_change(
     enroll_pending(&guard, pending).unwrap();
     let ceiling = crate::customer::test_space::SpaceCeiling::new();
     let mut staged = 0;
-    let result = stage_all_members_with_hook(&guard, pending, bundle, &stage, 0, &mut |count| {
+    let result = stage_all_members_with_hook(&guard, pending, bundle, &stage, 0, &mut |count, _total| {
         staged = count;
         if count == 1 {
             ceiling.set(Some(0));

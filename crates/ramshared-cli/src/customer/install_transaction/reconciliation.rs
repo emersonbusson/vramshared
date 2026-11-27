@@ -143,6 +143,7 @@ fn reconcile_complete(
                 parent_identity: (releases_meta.dev(), releases_meta.ino()),
                 name: target_ver,
                 reserve_bytes: INSTALL_RESERVE_BYTES,
+                progress: None,
             },
         )?;
     }

@@ -67,7 +67,7 @@ pub(super) enum EnrollmentOutcome {
     Warned { warning: &'static str },
 }
 
-pub(super) fn valid_release_token_segment(release: &str) -> bool {
+pub(crate) fn valid_release_token_segment(release: &str) -> bool {
     !release.is_empty()
         && release.len() <= 128
         && release

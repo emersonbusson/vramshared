@@ -26,6 +26,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod package_install;
+
+pub(crate) use package_install::{
+    PACKAGE_COMMIT, PACKAGE_STAGE, PACKAGE_VERIFY, PackageFileProgress,
+};
+
 pub(crate) const OPERATION_PROGRESS_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_OPERATION_PROGRESS_BYTES: usize = 16 * 1024;
 pub(crate) const DEFAULT_PROGRESS_TTL_MS: u64 = 15_000;
@@ -51,6 +57,29 @@ pub(crate) enum OperationKind {
     StressTest,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UpgradeDrainProgress {
+    pub(crate) previous: String,
+    pub(crate) candidate: String,
+}
+
+impl UpgradeDrainProgress {
+    pub(crate) fn new(previous: String, candidate: String) -> Option<Self> {
+        let value = Self {
+            previous,
+            candidate,
+        };
+        value.valid().then_some(value)
+    }
+
+    fn valid(&self) -> bool {
+        self.previous != self.candidate
+            && [self.previous.as_str(), self.candidate.as_str()]
+                .into_iter()
+                .all(crate::customer::valid_release_token_segment)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct OperationProgressV1 {
     pub(crate) schema_version: u32,
@@ -70,6 +99,10 @@ pub(crate) struct OperationProgressV1 {
     pub(crate) ttl_ms: u64,
     pub(crate) owner_pid: u32,
     pub(crate) owner_start_ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upgrade: Option<UpgradeDrainProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_files: Option<PackageFileProgress>,
 }
 
 impl OperationProgressV1 {
@@ -165,6 +198,16 @@ fn validate_record_shape(record: &OperationProgressV1) -> bool {
         && (MIN_PROGRESS_TTL_MS..=MAX_PROGRESS_TTL_MS).contains(&record.ttl_ms)
         && record.started_at_unix_ms <= record.updated_at_unix_ms
         && record.owner_pid > 0
+        && record
+            .upgrade
+            .as_ref()
+            .is_none_or(|upgrade| record.kind == OperationKind::Teardown && upgrade.valid())
+        && record.package_files.is_none_or(|files| {
+            record.kind == OperationKind::SetupInstall
+                && record.phase == PACKAGE_STAGE
+                && files.total > 0
+                && files.completed <= files.total
+        })
 }
 
 pub(crate) fn read_live_operation_progress() -> Option<OperationProgressV1> {
@@ -275,7 +318,27 @@ pub(crate) struct OperationProgressReporter {
 }
 
 impl OperationProgressReporter {
+    fn system_teardown_process(&self) -> Option<(u32, u64)> {
+        let guard = lock_unpoisoned(&self.shared);
+        (guard.enabled
+            && guard.record.kind == OperationKind::Teardown
+            && guard.path == Path::new(SYSTEM_OPERATION_PROGRESS_PATH))
+        .then_some((guard.record.owner_pid, guard.record.owner_start_ticks))
+    }
+
+    fn attach_upgrade(&self, upgrade: UpgradeDrainProgress) {
+        lock_unpoisoned(&self.shared).record.upgrade = Some(upgrade);
+    }
+
     pub(crate) fn update(&self, update: ProgressUpdate<'_>) {
+        self.update_with_files(update, None);
+    }
+
+    fn update_with_files(
+        &self,
+        update: ProgressUpdate<'_>,
+        package_files: Option<PackageFileProgress>,
+    ) {
         let mut guard = lock_unpoisoned(&self.shared);
         let now = (guard.now_fn)();
         let total_steps = guard.record.total_steps.max(1);
@@ -287,6 +350,7 @@ impl OperationProgressReporter {
         guard.record.target = update.target.map(ToOwned::to_owned);
         guard.record.completed_bytes = completed_bytes;
         guard.record.total_bytes = total_bytes;
+        guard.record.package_files = package_files;
         guard.record.throughput_mib_per_s = update
             .throughput_mib_per_s
             .filter(|rate| rate.is_finite() && *rate >= 0.0);
@@ -315,6 +379,8 @@ impl OperationProgressReporter {
                     ttl_ms: DEFAULT_PROGRESS_TTL_MS,
                     owner_pid: 1,
                     owner_start_ticks: 0,
+                    upgrade: None,
+                    package_files: None,
                 },
                 now_fn: unix_epoch_ms,
             })),
@@ -378,6 +444,8 @@ impl OperationProgressGuard {
                 ttl_ms: clamped_ttl,
                 owner_pid,
                 owner_start_ticks: start_ticks,
+                upgrade: None,
+                package_files: None,
             },
             now_fn,
         };
@@ -502,6 +570,8 @@ impl SwapoffProgressTracker {
             .spawn(move || {
                 let (lock, cvar) = &*worker_signal;
                 let mut stopped = lock_unpoisoned(lock);
+                let mut upgrade_probe = reporter.system_teardown_process();
+                let mut next_upgrade_probe = std::time::Instant::now();
                 while !*stopped {
                     let wait = cvar.wait_timeout(stopped, poll_interval);
                     stopped = match wait {
@@ -513,6 +583,17 @@ impl SwapoffProgressTracker {
                     }
                     drop(stopped);
 
+                    if let Some((pid, start_ticks)) = upgrade_probe
+                        && std::time::Instant::now() >= next_upgrade_probe
+                    {
+                        if let Some(upgrade) =
+                            crate::customer::observe_upgrade_drain(pid, start_ticks)
+                        {
+                            reporter.attach_upgrade(upgrade);
+                            upgrade_probe = None;
+                        }
+                        next_upgrade_probe = std::time::Instant::now() + Duration::from_secs(1);
+                    }
                     let Some(current_used) = read_swap_used_bytes_from(&swaps_path, &device_path)
                     else {
                         stopped = lock_unpoisoned(lock);
@@ -577,10 +658,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-    struct TestTempDir(PathBuf);
+    pub(super) struct TestTempDir(PathBuf);
 
     impl TestTempDir {
-        fn new(prefix: &str) -> Self {
+        pub(super) fn new(prefix: &str) -> Self {
             static DIR_SEQ: AtomicU64 = AtomicU64::new(1);
             let seq = DIR_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
@@ -591,7 +672,7 @@ mod tests {
             Self(dir)
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.0
         }
     }

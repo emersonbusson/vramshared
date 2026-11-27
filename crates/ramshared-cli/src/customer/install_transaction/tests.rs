@@ -1490,6 +1490,7 @@ fn install_args_plan_reconcile_and_apply_error_paths_cover_all_refusals() {
             parent_identity: (rel_meta.dev(), rel_meta.ino()),
             name: ver3,
             reserve_bytes: INSTALL_RESERVE_BYTES,
+            progress: None,
         };
         let prepared = crate::customer::package_prepare::prepare_admitted(
             &admitted,
