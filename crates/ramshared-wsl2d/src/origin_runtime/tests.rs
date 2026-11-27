@@ -213,7 +213,7 @@ fn unconfirmed_initial_failure_refuses_replacement_and_shutdown() {
         Duration::from_secs(3),
         Duration::from_millis(10)
     ));
-    assert!(resources.exited.load(std::sync::atomic::Ordering::Acquire));
+    assert!(resources.exit_status.get().is_some());
     assert!(
         !resources
             .stop_active
