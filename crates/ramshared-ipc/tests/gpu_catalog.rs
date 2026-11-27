@@ -305,12 +305,13 @@ fn catalog_bounds_complete_maximum_inventory() {
         );
     }
     let wire = session(7, 2)
-        .seal(SECRET, &ack(), Some(observation(4999)))
+        .seal(SECRET, &ack(), Some(observation(GPU_BUDGET_MAX_AGE_MS - 1)))
         .unwrap();
     assert!(
         session(7, 2)
             .open(SECRET, &ack(), &wire, 4, timing(start, 1))
-            .is_err()
+            .unwrap()
+            .is_none()
     );
     assert!(
         session(7, 2)
@@ -397,11 +398,66 @@ fn catalog_requires_negotiated_version_nonempty_key_and_fresh_nonces() {
                     received: start + Duration::from_millis(1) + Duration::from_micros(500)
                 }
             )
-            .is_err()
+            .unwrap()
+            .is_none()
     );
     assert!(
         session(7, 2)
             .open(SECRET, &ack(), b"not JSON", 4, timing(start, 1))
             .is_err()
+    );
+}
+
+#[test]
+fn catalog_expiry_in_transit_keeps_the_authenticated_round_and_memory() {
+    let start = Instant::now();
+    let mut heartbeat = ack();
+    heartbeat.host_memory = Some(HostMemoryTelemetry {
+        sampled_at_unix_ms: 100,
+        total_bytes: 1024,
+        available_bytes: 800,
+        commit_total_bytes: 512,
+        commit_limit_bytes: 2048,
+        page_size_bytes: 4096,
+        vmmem_wsl_working_set_bytes: None,
+    });
+    let mut host = session(7, 2);
+    let mut guest = host.clone();
+    let wire = host
+        .seal(
+            SECRET,
+            &heartbeat,
+            Some(observation(GPU_BUDGET_MAX_AGE_MS - 1)),
+        )
+        .unwrap();
+    let received = start + Duration::from_millis(1);
+    let expired = guest
+        .open_verified(SECRET, &heartbeat, &wire, 4, timing(start, 1))
+        .expect("an expired observation must not reject a valid heartbeat");
+    assert!(expired.catalog.is_none());
+    assert_eq!(
+        expired
+            .host_memory
+            .unwrap()
+            .sample(received, 101)
+            .unwrap()
+            .available_bytes,
+        800
+    );
+    assert_eq!(guest.round(), 5);
+    assert!(
+        guest
+            .open(SECRET, &heartbeat, &wire, 4, timing(start, 1))
+            .is_err()
+    );
+
+    let fresh = host
+        .seal(SECRET, &heartbeat, Some(observation(100)))
+        .unwrap();
+    assert!(
+        guest
+            .open(SECRET, &heartbeat, &fresh, 5, timing(start, 2))
+            .unwrap()
+            .is_some()
     );
 }
