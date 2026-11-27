@@ -103,6 +103,7 @@ fn daemon_survives_abrupt_gpu_worker_kill() {
         .spawn()
         .unwrap();
 
+    let worker_pid = child.id();
     let mut supervisor = IsolatedWorkerSupervisor {
         child: Some(WorkerChildHandle::Process(ChildWorkerProcess::new(child))),
     };
@@ -153,6 +154,14 @@ fn daemon_survives_abrupt_gpu_worker_kill() {
     assert_eq!(backend.origin_state(), DurableOriginState::Ready);
     assert_eq!(backend.cache_state(), OriginCacheState::Unavailable);
 
+    let (_, mut runtime, mut starter) = respawn_fixture(false, true);
+    runtime.supervisor = Some(supervisor);
+    recover_isolated_gpu_worker_if_failed(&mut starter, &backend, &mut runtime, false);
+    let reason = runtime.unavailable_reason.as_deref().unwrap();
+    assert!(reason.contains(&format!("pid {worker_pid}")));
+    assert!(reason.contains("SIGKILL"));
+    assert!(runtime.supervisor.is_none());
+
     // Subsequent writes and reads also succeed against origin
     let next_data = vec![0x77; 4096];
     assert!(backend.write_at(4096, &next_data).is_ok());
@@ -202,7 +211,7 @@ fn the_gpu_cache_unavailability_is_declared_with_its_reason() {
     // SPEC DT-3: a worker that exited while the cache is not serving leaves a
     // cause behind, so the status document never carries a bare "the cache is
     // off" with no explanation.
-    let reason = gpu_cache_unavailable_reason(OriginCacheState::Off, true)
+    let reason = gpu_cache_unavailable_reason(OriginCacheState::Off, true, None)
         .expect("an exited worker with a non-serving cache has a cause");
     assert!(
         reason.contains("worker exited") && reason.contains("OFF"),
@@ -210,13 +219,13 @@ fn the_gpu_cache_unavailability_is_declared_with_its_reason() {
     );
     // A cache that is still serving has no cause to publish.
     assert_eq!(
-        gpu_cache_unavailable_reason(OriginCacheState::Active, true),
+        gpu_cache_unavailable_reason(OriginCacheState::Active, true, None),
         None
     );
     // A live worker with a released cache is a deliberate release, not a
     // death: the release path publishes its own reason.
     assert_eq!(
-        gpu_cache_unavailable_reason(OriginCacheState::Off, false),
+        gpu_cache_unavailable_reason(OriginCacheState::Off, false, None),
         None
     );
 }
@@ -289,6 +298,9 @@ fn respawn_budget_exhausts_and_origin_fallback_enters_cooldown() {
         assert!(runtime.supervisor.is_none());
     }
 
+    // A worker can complete startup and then stop serving without an exit
+    // observation. Cooldown still explains the unavailable cache.
+    runtime.unavailable_reason = None;
     recover_and_settle(&mut starter, &backend, &mut runtime, true);
     assert_eq!(
         starter.attempts.load(Ordering::SeqCst),
@@ -300,6 +312,11 @@ fn respawn_budget_exhausts_and_origin_fallback_enters_cooldown() {
         !runtime.budget.allows_respawn(),
         "the retry budget must remain closed during cooldown"
     );
+    assert_eq!(
+        runtime.unavailable_reason.as_deref(),
+        Some("GPU cache is in retry cooldown after 3 worker respawns"),
+    );
+    assert_eq!(backend.origin_state(), DurableOriginState::Ready);
 }
 
 #[test]

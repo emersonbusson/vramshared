@@ -280,7 +280,7 @@ impl Starter {
             && let Some(previous) = self.first_worker.as_ref()
         {
             self.replacement_after_exit.store(
-                previous.exited.load(Ordering::Acquire)
+                previous.exit_status.get().is_some()
                     && !previous.stop_active.load(Ordering::Acquire)
                     && !previous.reaper_active.load(Ordering::Acquire),
                 Ordering::Release,
@@ -475,7 +475,7 @@ fn exercise_origin_io(
 ) {
     assert!(resources.stop_active.load(Ordering::Acquire));
     assert_worker_is_live(resources);
-    assert!(!resources.exited.load(Ordering::Acquire));
+    assert!(!resources.exit_status.get().is_some());
     assert!(owner.reserve(None).is_err());
     let started = Instant::now();
     let mut first = vec![0; 4096];
@@ -495,7 +495,7 @@ fn exercise_origin_io(
         resources.stop_active.load(Ordering::Acquire),
         "the worker stopped before I/O completed"
     );
-    assert!(!resources.exited.load(Ordering::Acquire));
+    assert!(!resources.exit_status.get().is_some());
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         1,
@@ -562,7 +562,7 @@ fn disconnect_initial_peer(
         !peer_thread.is_finished(),
         "IPC peer exited before fault injection"
     );
-    assert!(!resources.exited.load(Ordering::Acquire));
+    assert!(!resources.exit_status.get().is_some());
     assert_worker_is_live(resources);
     cleanup
         .peer
@@ -580,7 +580,7 @@ fn assert_replacement(
     replacement_after_exit: &AtomicBool,
 ) {
     assert!(
-        resources.exited.load(Ordering::Acquire),
+        resources.exit_status.get().is_some(),
         "the old worker was not observed exiting"
     );
     assert!(
@@ -780,7 +780,7 @@ fn run_socket_journey(marker: std::path::PathBuf) {
     result.expect("unarmed daemon shutdown");
     daemon.join().unwrap();
     assert!(
-        replacement.resources.exited.load(Ordering::Acquire),
+        replacement.resources.exit_status.get().is_some(),
         "replacement exit was not confirmed"
     );
     replacement.peer_thread.join().unwrap();
@@ -794,7 +794,7 @@ fn run_socket_journey(marker: std::path::PathBuf) {
     cleanup.jobs.take();
     cleanup.listener.take();
     assert!(
-        resources.exited.load(Ordering::Acquire),
+        resources.exit_status.get().is_some(),
         "worker exit was not observed"
     );
     let deadline = Instant::now() + Duration::from_secs(3);

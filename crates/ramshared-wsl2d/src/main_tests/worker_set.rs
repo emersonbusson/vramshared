@@ -109,7 +109,7 @@ fn pending_first_creator_cannot_skip_later_native_stop() {
     );
     assert!(owned, "unconfirmed native child lost its exact custody");
     assert!(reconciled);
-    assert!(resources.exited.load(Ordering::Acquire));
+    assert!(resources.exit_status.get().is_some());
     assert!(owner.reserve().is_ok());
 }
 

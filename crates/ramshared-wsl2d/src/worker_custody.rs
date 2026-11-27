@@ -7,11 +7,13 @@
 //! Process-lifetime ownership and admission for one isolated GPU worker.
 
 use std::io;
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+#[cfg(test)]
+mod exit_tests;
 mod host_memory;
 #[cfg(test)]
 mod memory_tests;
@@ -30,7 +32,8 @@ pub(super) struct WorkerResources {
     pub(super) pid: u32,
     pub(super) child: Arc<Mutex<Child>>,
     pub(super) identity_lost: Arc<AtomicBool>,
-    pub(super) exited: Arc<AtomicBool>,
+    // Publish one terminal wait result before any observer treats the slot as exited.
+    pub(super) exit_status: Arc<OnceLock<ExitStatus>>,
     pub(super) reaper_active: Arc<AtomicBool>,
     pub(super) stop_active: Arc<AtomicBool>,
     stop_retry_after: Arc<AtomicU64>,
@@ -95,7 +98,7 @@ impl WorkerResources {
         if self.stop_active.load(Ordering::Acquire) {
             return Ok(false);
         }
-        if self.exited.load(Ordering::Acquire) {
+        if self.exit_status.get().is_some() {
             return self.release_host_memory_if_settled();
         }
         let mut child = self.child.try_lock().map_err(|error| match error {
@@ -108,8 +111,8 @@ impl WorkerResources {
             return Err(rustix::io::Errno::CHILD.into());
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                self.exited.store(true, Ordering::Release);
+            Ok(Some(status)) => {
+                let _ = self.exit_status.set(status);
                 self.release_host_memory_if_settled()
             }
             Ok(None) => Ok(false),
@@ -125,7 +128,7 @@ impl WorkerResources {
     fn release_host_memory_if_settled(&self) -> io::Result<bool> {
         self.host_memory.release_if_settled(
             self.identity_lost.load(Ordering::Acquire),
-            self.exited.load(Ordering::Acquire),
+            self.exit_status.get().is_some(),
             self.stop_active.load(Ordering::Acquire),
             self.reaper_active.load(Ordering::Acquire),
         )
@@ -153,7 +156,7 @@ impl Reservation {
             pid,
             child: Arc::new(Mutex::new(child)),
             identity_lost: Arc::new(AtomicBool::new(false)),
-            exited: Arc::new(AtomicBool::new(false)),
+            exit_status: Arc::new(OnceLock::new()),
             reaper_active: Arc::new(AtomicBool::new(false)),
             stop_active: Arc::new(AtomicBool::new(false)),
             stop_retry_after: Arc::new(AtomicU64::new(0)),
@@ -188,7 +191,7 @@ pub(super) struct ChildWorkerProcess {
     pid: u32,
     pub(super) child: std::sync::Arc<std::sync::Mutex<Child>>,
     identity_lost: Arc<AtomicBool>,
-    exited: Arc<AtomicBool>,
+    exit_status: Arc<OnceLock<ExitStatus>>,
     reaper_active: Arc<AtomicBool>,
     stop_active: Arc<AtomicBool>,
     stop_retry_after: Arc<AtomicU64>,
@@ -212,13 +215,17 @@ impl ChildWorkerProcess {
             pid,
             child: worker.child,
             identity_lost: worker.identity_lost,
-            exited: worker.exited,
+            exit_status: worker.exit_status,
             reaper_active: worker.reaper_active,
             stop_active: worker.stop_active,
             stop_retry_after: worker.stop_retry_after,
             kill_requested: worker.kill_requested,
             stop_start_error_reported: worker.stop_start_error_reported,
         }
+    }
+
+    pub(super) fn exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status.get().copied()
     }
 
     pub(super) fn stop_is_quiescent(&self) -> bool {
@@ -251,7 +258,7 @@ impl ChildWorkerProcess {
         &self,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
     ) -> io::Result<()> {
-        if self.identity_lost.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
+        if self.identity_lost.load(Ordering::Acquire) || self.exit_status.get().is_some() {
             return Err(io::Error::other(
                 "GPU worker is no longer eligible for stop",
             ));
@@ -270,7 +277,7 @@ impl ChildWorkerProcess {
         if stop_clock_ms() < self.stop_retry_after.load(Ordering::Acquire) {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        if self.identity_lost.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
+        if self.identity_lost.load(Ordering::Acquire) || self.exit_status.get().is_some() {
             return Err(io::Error::other(
                 "GPU worker is no longer eligible for stop",
             ));
@@ -336,7 +343,7 @@ impl WorkerProcessControl for ChildWorkerProcess {
         if self.identity_lost.load(Ordering::Acquire) {
             return Err(rustix::io::Errno::CHILD.into());
         }
-        if self.exited.load(Ordering::Acquire) {
+        if self.exit_status.get().is_some() {
             return Ok(true);
         }
         let mut child = self.try_child()?;
@@ -346,15 +353,15 @@ impl WorkerProcessControl for ChildWorkerProcess {
         }) {
             self.identity_lost.store(true, Ordering::Release);
         }
-        if result.as_ref().is_ok_and(Option::is_some) {
-            self.exited.store(true, Ordering::Release);
+        if let Ok(Some(status)) = result {
+            let _ = self.exit_status.set(status);
         }
         result.map(|status| status.is_some())
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
         let mut child = self.try_child()?;
-        if self.exited.load(Ordering::Acquire) {
+        if self.exit_status.get().is_some() {
             return Err(std::io::Error::other("GPU worker has exited"));
         }
         if self.kill_requested.load(Ordering::Acquire) {
@@ -369,7 +376,7 @@ impl WorkerProcessControl for ChildWorkerProcess {
         if self.identity_lost.load(Ordering::Acquire) {
             return Err(rustix::io::Errno::CHILD.into());
         }
-        if self.exited.load(Ordering::Acquire) {
+        if self.exit_status.get().is_some() {
             return Err(std::io::Error::other("GPU worker has exited"));
         }
         if self
@@ -379,7 +386,7 @@ impl WorkerProcessControl for ChildWorkerProcess {
         {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        if self.identity_lost.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
+        if self.identity_lost.load(Ordering::Acquire) || self.exit_status.get().is_some() {
             self.reaper_active.store(false, Ordering::Release);
             return Err(std::io::Error::other(
                 "GPU worker is no longer eligible for a reaper",
@@ -387,17 +394,19 @@ impl WorkerProcessControl for ChildWorkerProcess {
         }
         let child = std::sync::Arc::clone(&self.child);
         let identity = Arc::clone(&self.identity_lost);
-        let exited = Arc::clone(&self.exited);
+        let exit_status = Arc::clone(&self.exit_status);
         let active = Arc::clone(&self.reaper_active);
         let result = std::thread::Builder::new()
             .name("ramshared-gpu-worker-reaper".into())
             .spawn(move || {
                 if let Ok(mut child) = child.lock()
                     && !identity.load(Ordering::Acquire)
-                    && !exited.load(Ordering::Acquire)
+                    && exit_status.get().is_none()
                 {
                     match child.wait() {
-                        Ok(_) => exited.store(true, Ordering::Release),
+                        Ok(status) => {
+                            let _ = exit_status.set(status);
+                        }
                         Err(error)
                             if error.raw_os_error()
                                 == Some(rustix::io::Errno::CHILD.raw_os_error()) =>
@@ -623,9 +632,13 @@ mod tests {
         let (child, input) = held_child();
         let worker = owner.reserve().unwrap().bind(child);
         worker.reaper_active.store(true, Ordering::Release);
-        worker.exited.store(true, Ordering::Release);
+        assert!(
+            worker
+                .exit_status
+                .set(std::os::unix::process::ExitStatusExt::from_raw(0))
+                .is_ok()
+        );
         assert!(owner.reserve().is_err());
-        worker.exited.store(false, Ordering::Release);
         worker.reaper_active.store(false, Ordering::Release);
         worker.identity_lost.store(true, Ordering::Release);
         assert_eq!(
