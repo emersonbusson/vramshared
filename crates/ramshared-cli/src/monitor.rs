@@ -360,6 +360,7 @@ pub fn collect_observation(benchmark_evidence: &Path) -> Result<Observation, Mon
 }
 
 fn mark_observation_refresh_failed(observation: &mut Observation, age: Duration) {
+    observation.operation_progress = crate::operation_progress::read_live_operation_progress();
     observation.sample_age_ms = age.as_millis().min(u128::from(u64::MAX)) as u64;
     if !observation
         .errors

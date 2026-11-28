@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use super::super::CustomerError;
 use super::super::install_apply::{CommittedInstall, verify_committed_request};
 use super::super::install_args::InstallRequest;
-use super::super::install_drain::{CommitWitness, DrainInputs, InstallerLock};
+use super::super::install_drain::{CommitWitness, DrainInputs, InstallPhase, InstallerLock};
 use super::super::install_fs::{digest, read_bounded_regular_at};
 use super::super::install_lifecycle::{
     ActivationOutcome, LifecycleHost, UpgradeQuiescenceState, finish_upgrade_lifecycle,
@@ -52,6 +52,7 @@ pub(super) fn resume_committed_install(
     let Some((inputs, witness, prior)) = lock.committed_runtime()? else {
         return Ok(None);
     };
+    lock.start_progress(Some(&inputs.candidate_release));
     let posture = verify_committed_request(req, env, &inputs, signature)?;
     let selected = verify_selected_runtime(env, &inputs, &witness, posture)?;
     if witness.enrolled
@@ -79,6 +80,7 @@ pub(super) fn resume_committed_install(
             .enrolled
             .then(|| EnrollmentOutcome::Enrolled { warnings: vec![] }),
     };
+    lock.progress_phase(InstallPhase::Finalize);
     let (committed, activation) = finish_upgrade_lifecycle(
         &quiescence,
         lifecycle,
