@@ -32,7 +32,13 @@ impl Fixture {
             std::process::id()
         ));
         let path = root.join(MANAGED_ROOT).join("origin/test.img");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        use std::os::unix::fs::DirBuilderExt;
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path.parent().unwrap())
+            .unwrap();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -533,4 +539,137 @@ fn native_creation_proof_rejects_foreign_or_changed_origins() {
     assert_eq!(fs::metadata(&path).unwrap().len(), 8192);
     let (_, recovered) = volume.recover_creation(&request).unwrap();
     assert_eq!(recovered, manifest);
+}
+
+#[test]
+fn native_origin_proc_fd_publication_links_held_inode_and_refuses_existing_or_symlink() {
+    use rustix::fs::{Mode, OFlags, openat};
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let volume = NativeOriginVolume::open(&fixture.mount, fixture.uid).unwrap();
+    let parent_path = fixture.path.parent().unwrap();
+    let parent = OpenOptions::new().read(true).open(parent_path).unwrap();
+
+    // Pre-existing regular file and symlink targets must both fail with EEXIST
+    // without overwriting or modifying the existing entry.
+    let existing_regular = parent_path.join("existing-regular.img");
+    fs::write(&existing_regular, b"keep-regular").unwrap();
+    let existing_symlink = parent_path.join("existing-symlink.img");
+    symlink("/dev/null", &existing_symlink).unwrap();
+
+    let anon = File::from(
+        openat(
+            &parent,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap(),
+    );
+    let anon_ino = descriptor_stat(&anon).unwrap().stx_ino;
+    assert_eq!(
+        publication::link_anonymous_via_proc_fd(
+            &anon,
+            &parent,
+            std::ffi::OsStr::new("existing-regular.img")
+        ),
+        Err(rustix::io::Errno::EXIST)
+    );
+    assert_eq!(fs::read(&existing_regular).unwrap(), b"keep-regular");
+    assert_eq!(
+        publication::link_anonymous_via_proc_fd(
+            &anon,
+            &parent,
+            std::ffi::OsStr::new("existing-symlink.img")
+        ),
+        Err(rustix::io::Errno::EXIST)
+    );
+    assert!(
+        fs::symlink_metadata(&existing_symlink)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // Linking to an absent leaf binds the exact held anonymous inode.
+    let mut fallback_used = false;
+    publication::link_anonymous_with_fallback(Err(rustix::io::Errno::NOENT), &mut || {
+        fallback_used = true;
+        publication::link_anonymous_via_proc_fd(
+            &anon,
+            &parent,
+            std::ffi::OsStr::new("published-via-proc-fd.img"),
+        )
+    })
+    .unwrap();
+    assert!(fallback_used);
+    assert_eq!(
+        publication::link_anonymous_with_fallback(Err(rustix::io::Errno::EXIST), &mut || {
+            panic!("non-ENOENT primary error must not invoke /proc/self/fd fallback")
+        }),
+        Err(rustix::io::Errno::EXIST)
+    );
+    let published = parent_path.join("published-via-proc-fd.img");
+    assert_eq!(fs::metadata(&published).unwrap().ino(), anon_ino);
+
+    // High-level create_sealed also refuses pre-existing regular files and symlinks.
+    for leaf in ["origin/existing-regular.img", "origin/existing-symlink.img"] {
+        let req = ResourceTarget::LinuxFileOriginRequest {
+            filesystem_uuid: "fixture-fs".into(),
+            device_identity: "fixture-device".into(),
+            managed_relative_path: leaf.into(),
+            allocated_bytes: 8192,
+        };
+        assert!(volume.create_sealed(&req, creator).is_err());
+    }
+    assert_eq!(fs::read(&existing_regular).unwrap(), b"keep-regular");
+    assert!(
+        fs::symlink_metadata(&existing_symlink)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // Concurrent race during creator callback: a file appearing at the final leaf
+    // between require_absent() and link_anonymous_inode() must fail EEXIST without
+    // overwriting the racing file.
+    let race_path = volume.reviewed_path("origin/raced-leaf.img").unwrap();
+    let race_req = ResourceTarget::LinuxFileOriginRequest {
+        filesystem_uuid: "fixture-fs".into(),
+        device_identity: "fixture-device".into(),
+        managed_relative_path: "origin/raced-leaf.img".into(),
+        allocated_bytes: 8192,
+    };
+    let race_err = volume
+        .create_sealed(&race_req, |target| {
+            fs::write(&race_path, b"raced-content").unwrap();
+            creator(target)
+        })
+        .unwrap_err();
+    assert!(race_err.contains("publish sealed native origin exclusively"));
+    assert_eq!(fs::read(&race_path).unwrap(), b"raced-content");
+
+    // verify_creation rejects non-file targets and mutated xattr proofs.
+    let clean_req = ResourceTarget::LinuxFileOriginRequest {
+        filesystem_uuid: "fixture-fs".into(),
+        device_identity: "fixture-device".into(),
+        managed_relative_path: "origin/verify-check.img".into(),
+        allocated_bytes: 8192,
+    };
+    let (sealed_file, mut sealed_manifest) = volume.create_sealed(&clean_req, creator).unwrap();
+    let mut bad_target_manifest = sealed_manifest.clone();
+    bad_target_manifest.target = clean_req;
+    assert!(
+        volume
+            .verify_creation(&sealed_file, &bad_target_manifest)
+            .is_err()
+    );
+    sealed_manifest.approval_id = "mutated-label".into();
+    assert!(
+        volume
+            .verify_creation(&sealed_file, &sealed_manifest)
+            .unwrap_err()
+            .contains("changed before publication")
+    );
 }

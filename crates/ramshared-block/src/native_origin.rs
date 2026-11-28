@@ -19,6 +19,8 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxFlags, mkdirat, op
 
 mod publication;
 
+pub use publication::link_anonymous_inode;
+
 const MANAGED_ROOT: &str = "var/lib/ramshared";
 const STAT_BLOCK_BYTES: u64 = 512;
 

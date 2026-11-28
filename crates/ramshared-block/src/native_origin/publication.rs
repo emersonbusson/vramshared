@@ -10,8 +10,68 @@ use super::*;
 use ramshared_config::native_origin::NativeOriginManifest;
 use ramshared_config::resource_profile::MAX_RESOURCE_PROFILE_BYTES;
 use rustix::fs::{FallocateFlags, XattrFlags, fallocate, fchmod, fgetxattr, fsetxattr, linkat};
+use std::os::fd::AsRawFd;
 
 const CREATION_ATTRIBUTE: &str = "user.ramshared.creation";
+
+pub(super) fn link_anonymous_with_fallback(
+    primary: rustix::io::Result<()>,
+    fallback: &mut dyn FnMut() -> rustix::io::Result<()>,
+) -> rustix::io::Result<()> {
+    match primary {
+        Ok(()) => Ok(()),
+        // Linux < 6.10 returns ENOENT for linkat(AT_EMPTY_PATH) on an unlinked
+        // O_TMPFILE without CAP_DAC_READ_SEARCH; link the exact held descriptor
+        // via /proc/self/fd/<fd> with AT_SYMLINK_FOLLOW, still failing EEXIST on
+        // any pre-existing target file or symlink.
+        Err(rustix::io::Errno::NOENT) => fallback(),
+        Err(err) => Err(err),
+    }
+}
+
+/// Exclusively publish the held anonymous inode as a leaf in the held parent.
+/// The caller owns validation of both descriptors and the destination name.
+pub fn link_anonymous_inode(
+    file: &File,
+    parent: &File,
+    leaf: &std::ffi::OsStr,
+) -> rustix::io::Result<()> {
+    link_anonymous_with_fallback(
+        linkat(file, "", parent, leaf, AtFlags::EMPTY_PATH),
+        &mut || link_anonymous_via_proc_fd(file, parent, leaf),
+    )
+}
+
+pub(super) fn link_anonymous_via_proc_fd(
+    file: &File,
+    parent: &File,
+    leaf: &std::ffi::OsStr,
+) -> rustix::io::Result<()> {
+    use rustix::fs::{PROC_SUPER_MAGIC, fstat, fstatfs, open, statat};
+    use rustix::io::Errno;
+
+    let proc_fds = open(
+        "/proc/self/fd",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    if fstatfs(&proc_fds)?.f_type != PROC_SUPER_MAGIC {
+        return Err(Errno::XDEV);
+    }
+    let source = file.as_raw_fd().to_string();
+    let held = fstat(file)?;
+    let observed = statat(&proc_fds, source.as_str(), AtFlags::empty())?;
+    if held.st_dev != observed.st_dev || held.st_ino != observed.st_ino {
+        return Err(Errno::STALE);
+    }
+    linkat(
+        &proc_fds,
+        source.as_str(),
+        parent,
+        leaf,
+        AtFlags::SYMLINK_FOLLOW,
+    )
+}
 
 fn read_creation(file: &File) -> Result<NativeOriginManifest, String> {
     let mut bytes = vec![0; MAX_RESOURCE_PROFILE_BYTES];
@@ -60,7 +120,7 @@ impl NativeOriginVolume {
         self.revalidate()?;
         // This is the same held anonymous inode, never a pathname lookup of a
         // staging file. Existing final names, including symlinks, are refused.
-        linkat(&file, "", &parent, &leaf, AtFlags::EMPTY_PATH)
+        link_anonymous_inode(&file, &parent, &leaf)
             .map_err(|error| format!("publish sealed native origin exclusively: {error}"))?;
         parent.sync_all().map_err(|error| error.to_string())?;
         self.verify(&target)?;
