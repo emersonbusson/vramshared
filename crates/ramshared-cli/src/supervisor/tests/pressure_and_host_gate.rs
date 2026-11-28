@@ -33,6 +33,7 @@ fn emergency_kill_is_bound_to_the_successfully_termed_identity_across_ledger_cha
         &SupervisorDecision {
             state: SupervisorState::Emergency,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             actions: vec![SupervisorAction::TerminateDiscardable],
         },
         &paths,
@@ -49,6 +50,7 @@ fn emergency_kill_is_bound_to_the_successfully_termed_identity_across_ledger_cha
         &SupervisorDecision {
             state: SupervisorState::Emergency,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             actions: vec![SupervisorAction::KillDiscardable],
         },
         &ActionPaths {
@@ -165,6 +167,7 @@ fn supervisor_action_errors_are_bounded_single_line_and_control_free() {
         &SupervisorDecision {
             state: SupervisorState::Critical,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             actions: vec![SupervisorAction::FreezeDiscardable],
         },
         &ActionPaths {
@@ -205,6 +208,7 @@ fn supervisor_publishes_every_action_outcome_in_execution_order() {
     let decision = SupervisorDecision {
         state: SupervisorState::Critical,
         healthy_samples: 0,
+        cache_recovery_samples: 0,
         actions: vec![
             SupervisorAction::ReduceVramCache,
             SupervisorAction::CloseAdmission,
@@ -274,6 +278,7 @@ fn stale_invocation_id_refuses_all_systemctl_actions() {
     let decision = SupervisorDecision {
         state: SupervisorState::Emergency,
         healthy_samples: 0,
+        cache_recovery_samples: 0,
         actions: vec![
             SupervisorAction::FreezeDiscardable,
             SupervisorAction::ThawDiscardable,
@@ -350,6 +355,7 @@ fn unsupported_ledger_schema_refuses_scope_cleanup_without_runner_action() {
     let decision = SupervisorDecision {
         state: SupervisorState::Emergency,
         healthy_samples: 0,
+        cache_recovery_samples: 0,
         actions: vec![
             SupervisorAction::FreezeDiscardable,
             SupervisorAction::TerminateDiscardable,
@@ -471,6 +477,7 @@ fn action_executor_records_refusals_without_touching_a_unit() {
     let decision = SupervisorDecision {
         state: SupervisorState::Critical,
         healthy_samples: 0,
+        cache_recovery_samples: 0,
         actions: vec![SupervisorAction::FreezeDiscardable],
     };
     let unused_ledger = root.join("never-used/reservations.json");
@@ -571,6 +578,7 @@ fn freeze_discardable_without_managed_reservations_is_not_a_ledger_failure() {
     let decision = SupervisorDecision {
         state: SupervisorState::Critical,
         healthy_samples: 0,
+        cache_recovery_samples: 0,
         actions: vec![SupervisorAction::FreezeDiscardable],
     };
     for (label, ledger) in [

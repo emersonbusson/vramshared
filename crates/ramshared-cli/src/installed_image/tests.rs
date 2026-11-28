@@ -1049,3 +1049,21 @@ fn sealed_release_tui_origin_promotes_unknown_only_under_sealed_releases_root() 
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn top_build_identity_shows_the_running_release_candidate() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let baseline = format_build_identity("1.0.5", commit, "clean");
+    assert_eq!(
+        format_top_build_identity("1.0.5", commit, "clean", None),
+        baseline
+    );
+    assert_eq!(
+        format_top_build_identity("1.0.5", commit, "clean", Some("v1.0.5")),
+        baseline
+    );
+    assert_eq!(
+        format_top_build_identity("1.0.5", commit, "clean", Some("v1.0.6-rc.3")),
+        format!("{baseline} · release v1.0.6-rc.3")
+    );
+}

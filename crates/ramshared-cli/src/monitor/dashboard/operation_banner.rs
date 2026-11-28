@@ -70,12 +70,13 @@ fn build_cli_operation_banner(
     language: Language,
     now_unix_ms: u64,
 ) -> OperationBannerContent {
-    if progress.kind == OperationKind::SetupInstall
-        && matches!(
-            progress.phase.as_str(),
-            PACKAGE_VERIFY | PACKAGE_STAGE | PACKAGE_COMMIT
-        )
-    {
+    if matches!(
+        progress.kind,
+        OperationKind::SetupInstall | OperationKind::ReleaseInstall
+    ) && matches!(
+        progress.phase.as_str(),
+        PACKAGE_VERIFY | PACKAGE_STAGE | PACKAGE_COMMIT
+    ) {
         return package::build_package_banner(progress, language, now_unix_ms);
     }
     let downloading =
@@ -107,27 +108,39 @@ fn build_cli_operation_banner(
             border_color: Color::Cyan,
         };
     }
-    let pct = progress.percent();
-    let bar = make_bar(u64::from(pct), BANNER_BAR_WIDTH);
+    let install = progress.kind == OperationKind::ReleaseInstall;
     let step_label = dashboard_phrase(language, DashboardPhrase::StepLabel);
     let phase_label = operation_phase_label(language, &progress.phase);
-    let primary_line = if let Some(target) = progress.target.as_deref() {
-        format!(
-            " {bar} {pct:>3}% · {phase_label} ({target}) · {step_label} {}/{}",
-            progress.step_index, progress.total_steps
-        )
+    let target = progress
+        .target
+        .as_deref()
+        .map_or_else(String::new, |name| format!(" ({name})"));
+    let step = format!(
+        "{step_label} {}/{}",
+        progress.step_index, progress.total_steps
+    );
+    let primary_line = if install && progress.total_bytes == 0 {
+        format!(" {phase_label}{target} · {step}")
     } else {
-        format!(
-            " {bar} {pct:>3}% · {phase_label} · {step_label} {}/{}",
-            progress.step_index, progress.total_steps
-        )
+        let pct = progress.percent();
+        let bar = make_bar(u64::from(pct), BANNER_BAR_WIDTH);
+        format!(" {bar} {pct:>3}% · {phase_label}{target} · {step}")
     };
 
     let mut details = Vec::new();
     if progress.total_bytes > 0 {
+        let (count, prefix) = if install {
+            let label = dashboard_phrase(language, DashboardPhrase::RemainingLabel);
+            (
+                progress.total_bytes - progress.completed_bytes,
+                format!("{label} "),
+            )
+        } else {
+            (progress.completed_bytes, String::new())
+        };
         details.push(format!(
-            "{} / {}",
-            fmt_bytes(progress.completed_bytes, language),
+            "{prefix}{} / {}",
+            fmt_bytes(count, language),
             fmt_bytes(progress.total_bytes, language)
         ));
     }
@@ -263,7 +276,6 @@ mod tests {
         MemoryObservation, MemoryScope, ProcessMemoryTotals, TierDeviceNames,
     };
     use crate::monitor::render::{DashHistory, DashboardMetadata};
-    use crate::operation_progress::OperationKind;
 
     fn sample_observation() -> Observation {
         let mut status = BTreeMap::new();
@@ -296,6 +308,53 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn installer_banner_uses_phase_or_actual_remaining_bytes() {
+        let mut progress = OperationProgressV1 {
+            schema_version: 1,
+            operation_id: "1-2-3".into(),
+            kind: OperationKind::ReleaseInstall,
+            phase: "release_verify".into(),
+            step_index: 1,
+            total_steps: 4,
+            target: Some("v1.0.6-rc.4".into()),
+            completed_bytes: 0,
+            total_bytes: 0,
+            throughput_mib_per_s: None,
+            started_at_unix_ms: 1_000,
+            updated_at_unix_ms: 2_000,
+            ttl_ms: 15_000,
+            owner_pid: 99,
+            owner_start_ticks: 111,
+            upgrade: None,
+            package_files: None,
+        };
+        let trust = build_cli_operation_banner(&progress, Language::PtBr, 9_000);
+        assert!(
+            trust
+                .primary_line
+                .contains("verificando pacote (v1.0.6-rc.4)")
+        );
+        assert!(!trust.primary_line.contains('%'));
+        assert_eq!(trust.secondary_line.trim(), "8s");
+
+        progress.phase = "swapoff".into();
+        progress.step_index = 2;
+        progress.completed_bytes = 128 * 1024 * 1024;
+        progress.total_bytes = 512 * 1024 * 1024;
+        let drain = build_cli_operation_banner(&progress, Language::En, 11_000);
+        assert!(
+            drain
+                .primary_line
+                .contains("25% · draining swap (v1.0.6-rc.4)")
+        );
+        assert!(
+            drain
+                .secondary_line
+                .contains("remaining 384.0 MiB / 512.0 MiB · 10s")
+        );
     }
 
     #[test]

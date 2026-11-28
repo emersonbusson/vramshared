@@ -508,6 +508,11 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
     // SPEC swap-drain-safety RF-2/DT-3: the strict gate first. When the drain
     // cannot fit in RAM, create the transient absorber, credit only its free
     // space, and re-evaluate. The read-only `--plan` never creates one.
+    let progress_guard = paths.start_operation_progress(
+        crate::operation_progress::OperationKind::Teardown,
+        "prepare",
+        plan.actions.len().max(1) as u32,
+    );
     let mut swaps = current_entries;
     let mut emergency = retained(paths, &swaps, true)?;
     let observation = sample_headroom(
@@ -532,6 +537,14 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
             "[down] swapoff headroom: BLOCKED deficit={} B; creating a transient emergency swap",
             shortfall
         );
+        progress_guard.update(crate::operation_progress::ProgressUpdate {
+            phase: "release_prepare_absorber",
+            step_index: 1,
+            target: None,
+            completed_bytes: 0,
+            total_bytes: 0,
+            throughput_mib_per_s: None,
+        });
         let Some(created) = create_emergency_swap(runner, paths, shortfall) else {
             return Err(CascadeError::Precondition(headroom.refusal_message()));
         };
@@ -591,11 +604,6 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
 
     // ALWAYS swapoff before NBD disconnect/daemon stop. A swapoff error returns
     // here, leaving runtime records, daemon, and NBD device untouched.
-    let progress_guard = paths.start_operation_progress(
-        crate::operation_progress::OperationKind::Teardown,
-        "prepare",
-        plan.actions.len().max(1) as u32,
-    );
     let executor = RuntimeNbdLifecycleExecutor::new(
         runner,
         paths,

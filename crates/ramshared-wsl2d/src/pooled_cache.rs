@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use ramshared_block::isolated_origin::{
-    POOLED_PAGE_BYTES, PooledCacheClient, PooledLookupReply, PooledReadTelemetry,
+    POOLED_PAGE_BYTES, POOLED_STAGING_SLOTS, PooledCacheClient, PooledLookupReply,
+    PooledReadTelemetry,
 };
 use ramshared_ipc::cache_wire::{
     CacheFrameBuffer, CacheFrameHeader, CacheOpcode, CacheScope, read_into, write_frame_with,
@@ -57,6 +58,8 @@ pub struct PooledGuestStatus {
     pub deadline_overruns: u64,
     pub peer_refusals: u64,
     pub origin_fallback_bytes: u64,
+    #[serde(default)]
+    pub quarantined_slots: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,6 +219,27 @@ impl GuestCacheSession {
         self.scope.as_ref()
     }
 
+    /// Activate a freshly authenticated pooled epoch after a bounded reconnect.
+    pub fn activate_rebound(&self, proof: &HostBootstrapProof) -> bool {
+        if self.configured_profile != CacheProfile::Pooled || proof.scope.epoch == 0 {
+            return false;
+        }
+        if proof.host_cid != VMADDR_CID_HOST
+            || !proof.scope.verify_host_proof(&proof.key, &proof.host_proof)
+        {
+            self.peer_refusals.fetch_add(1, Ordering::AcqRel);
+            return false;
+        }
+        self.epoch.store(proof.scope.epoch, Ordering::Release);
+        self.generation_changes.fetch_add(1, Ordering::AcqRel);
+        let _ = self
+            .effective_mode
+            .lock()
+            .map(|mut mode| *mode = EffectiveCacheMode::PooledActive);
+        let _ = self.reason.lock().map(|mut slot| *slot = None);
+        true
+    }
+
     pub fn retire_to_origin_only(&self, reason: &str) {
         let prev = self.epoch.swap(0, Ordering::AcqRel);
         if prev != 0 {
@@ -234,21 +258,38 @@ impl GuestCacheSession {
 
     pub fn status(&self, telemetry: Option<PooledReadTelemetry>) -> PooledGuestStatus {
         let t = telemetry.unwrap_or_default();
+        let epoch = self.active_epoch();
+        let mut effective_mode = self
+            .effective_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(EffectiveCacheMode::PooledOriginOnly);
+        let mut reason = self.reason.lock().ok().and_then(|r| r.clone());
+        let all_slots_quarantined = t.quarantined_slots as usize >= POOLED_STAGING_SLOTS;
+        if effective_mode == EffectiveCacheMode::PooledActive
+            && (epoch == 0 || all_slots_quarantined)
+        {
+            effective_mode = EffectiveCacheMode::PooledOriginOnly;
+            if reason.is_none() {
+                reason = Some(if all_slots_quarantined {
+                    "lookup_slots_quarantined".into()
+                } else {
+                    "pooled_epoch_retired".into()
+                });
+            }
+        }
         PooledGuestStatus {
             configured_profile: self.configured_profile,
-            effective_mode: self
-                .effective_mode
-                .lock()
-                .map(|m| *m)
-                .unwrap_or(EffectiveCacheMode::PooledOriginOnly),
-            reason: self.reason.lock().ok().and_then(|r| r.clone()),
-            epoch: self.active_epoch(),
+            effective_mode,
+            reason,
+            epoch,
             generation_changes: self.generation_changes.load(Ordering::Acquire),
             hits: t.hits,
             misses: t.misses,
             deadline_overruns: t.deadline_overruns,
             peer_refusals: self.peer_refusals.load(Ordering::Acquire) + t.poison_retirements,
             origin_fallback_bytes: t.origin_fallbacks.saturating_mul(POOLED_PAGE_BYTES as u64),
+            quarantined_slots: t.quarantined_slots,
         }
     }
 }
@@ -300,8 +341,11 @@ impl PooledCacheClient for StreamPooledClient {
         deadline: Instant,
         dst: &mut [u8; POOLED_PAGE_BYTES],
     ) -> PooledLookupReply {
-        if self.closed.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return PooledLookupReply::TimedOut;
+        if self.closed.load(Ordering::Acquire) {
+            return PooledLookupReply::TransportError;
+        }
+        if Instant::now() >= deadline {
+            return PooledLookupReply::Busy;
         }
         let Ok(mut guard) = self.inner.try_lock() else {
             return PooledLookupReply::Busy;
@@ -367,19 +411,22 @@ impl PooledCacheClient for StreamPooledClient {
         };
         guard.next_corr = corr.saturating_add(1);
         let inner = &mut *guard;
-        if write_frame_with(&mut inner.stream, &mut inner.wbuf, req, Some(page)).is_err() {
+        if let Err(err) = write_frame_with(&mut inner.stream, &mut inner.wbuf, req, Some(page)) {
+            eprintln!("[ramsharedd] pooled offer write failed: {err}");
             self.closed.store(true, Ordering::Release);
             return false;
         }
         match read_into(&mut inner.stream, &mut inner.rbuf) {
-            Ok(reply)
-                if self.scope.admit_reply(&req, &reply.header).is_ok()
-                    && reply.header.opcode == CacheOpcode::Accepted =>
-            {
-                true
-            }
-            Ok(reply) if self.scope.admit_reply(&req, &reply.header).is_ok() => false,
-            _ => {
+            Ok(reply) => match self.scope.admit_reply(&req, &reply.header) {
+                Ok(()) => reply.header.opcode == CacheOpcode::Accepted,
+                Err(err) => {
+                    eprintln!("[ramsharedd] pooled offer reply refused: {err}");
+                    self.closed.store(true, Ordering::Release);
+                    false
+                }
+            },
+            Err(err) => {
+                eprintln!("[ramsharedd] pooled offer read failed: {err}");
                 self.closed.store(true, Ordering::Release);
                 false
             }
@@ -388,5 +435,9 @@ impl PooledCacheClient for StreamPooledClient {
 
     fn close_poisoned(&self, _epoch: u64) {
         self.closed.store(true, Ordering::Release);
+    }
+
+    fn is_transport_closed(&self) -> bool {
+        self.is_closed()
     }
 }

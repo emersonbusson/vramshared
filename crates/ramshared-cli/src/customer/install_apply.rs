@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::install_args::{InstallRequest, utc_timestamp_now};
-use super::install_drain::InstallerLock;
+use super::install_drain::{InstallPhase, InstallerLock};
 use super::install_fs::{ensure_dir_no_follow, fs_error, read_bounded_regular_at};
 use super::install_tokens::{
     ApprovalTokenCustody, EnrollmentOutcome, apply_default_enrollment,
@@ -53,7 +53,7 @@ use super::{CustomerError, CustomerReason, CustomerState};
 use crate::cascade::boot_policy_effect::{BootPolicyHost, CASCADE_UNIT};
 use crate::cascade::posture::Posture;
 use crate::installed_image::{observe_installed_input_bundle_digest, sha256_reader};
-use crate::operation_progress::{OperationProgressGuard, PACKAGE_COMMIT, PACKAGE_VERIFY};
+use crate::operation_progress::PACKAGE_COMMIT;
 use crate::release_identity::{MAX_SEALED_TEXT_BYTES, read_release_version};
 
 mod drain_verification;
@@ -622,13 +622,11 @@ pub(super) fn execute_verified_apply(
     memory_obs: &mut dyn FnMut() -> Option<MemoryObservation>,
     stdout: &mut dyn Write,
 ) -> Result<CommittedInstall, CustomerError> {
-    let inputs = validate_apply_inputs(req)?;
-    let progress = installer_lock
-        .filter(|_| env.require_root)
-        .map(|_| OperationProgressGuard::start_package_install());
-    if let Some(progress) = &progress {
-        progress.update_package(PACKAGE_VERIFY, inputs.approved_ver, None);
+    if let Some(lock) = installer_lock {
+        lock.progress_phase(InstallPhase::Stage);
     }
+    let inputs = validate_apply_inputs(req)?;
+    let progress = installer_lock.and_then(InstallerLock::package_progress);
     let requirement = memory_policy();
     let streamed = candidate
         .declared
@@ -667,7 +665,7 @@ pub(super) fn execute_verified_apply(
         parent_identity: releases_id,
         name: inputs.approved_ver,
         reserve_bytes: INSTALL_RESERVE_BYTES,
-        progress: progress.as_ref(),
+        progress,
     };
     let mut custody = CommitCustodyState {
         unit_custody: None,
@@ -691,6 +689,7 @@ pub(super) fn execute_verified_apply(
     ) {
         Ok((enroll_outcome, effect)) => {
             if let Some(lock) = installer_lock {
+                lock.progress_phase(InstallPhase::Finalize);
                 let enrolled = matches!(enroll_outcome, Some(EnrollmentOutcome::Enrolled { .. }));
                 lock.record_committed(admitted.guard(), &effect, enrolled)
                     .map_err(|error| {
@@ -726,6 +725,9 @@ pub(super) fn execute_verified_apply(
             Ok(committed)
         }
         Err(err) => {
+            if let Some(lock) = installer_lock {
+                lock.progress_phase(InstallPhase::Rollback);
+            }
             match rollback_failed_apply(
                 admitted.guard(),
                 &pending,

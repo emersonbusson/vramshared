@@ -301,3 +301,100 @@ fn upgrade_display_uses_only_the_bound_live_stop_receipt() {
     installer.publish(&receipt).unwrap();
     assert_eq!(read_upgrade_drain(&fixture.paths, 720, 9000), None);
 }
+
+#[test]
+fn installer_owns_the_candidate_and_relays_only_the_bound_stop() {
+    use crate::operation_progress::{
+        INSTALLER_PROGRESS_FILE, OperationKind, OperationProgressGuard, ProgressUpdate,
+        read_dashboard_progress, unix_epoch_ms,
+    };
+    use std::path::Path;
+
+    let fixture = Fixture::new();
+    let installer_path = fixture.root.join(INSTALLER_PROGRESS_FILE);
+    let general_path = fixture.paths.lock_root.join("operation-progress.json");
+    let proc_root = Path::new("/proc");
+    let snapshot = || {
+        read_dashboard_progress(&installer_path, &general_path, proc_root, unix_epoch_ms()).unwrap()
+    };
+
+    let lock = InstallerLock::acquire(&fixture.paths).unwrap();
+    lock.start_progress(Some("v1.0.6-rc.4"));
+    let initial = snapshot();
+    assert_eq!(initial.kind, OperationKind::ReleaseInstall);
+    assert_eq!(initial.phase, "release_verify");
+    assert_eq!(initial.target.as_deref(), Some("v1.0.6-rc.4"));
+    assert!(InstallerLock::acquire(&fixture.paths).is_err());
+    lock.start_progress(Some("v1.0.7"));
+    assert_eq!(snapshot().operation_id, initial.operation_id);
+    assert_eq!(snapshot().target, initial.target);
+
+    lock.progress_phase(InstallPhase::CheckDrain);
+    assert_eq!(snapshot().phase, "release_check_drain");
+    let child = OperationProgressGuard::start_with(
+        general_path.clone(),
+        proc_root,
+        OperationKind::Teardown,
+        "prepare",
+        3,
+        15_000,
+        unix_epoch_ms,
+    );
+    child.update(ProgressUpdate {
+        phase: "swapoff",
+        step_index: 2,
+        target: Some("/dev/zram0"),
+        completed_bytes: 32,
+        total_bytes: 64,
+        throughput_mib_per_s: Some(4.0),
+    });
+    let record = crate::operation_progress::read_live_operation_progress_from(
+        &general_path,
+        proc_root,
+        unix_epoch_ms(),
+    )
+    .unwrap();
+    assert_eq!(snapshot().phase, "release_check_drain");
+    let process = unit(
+        "deactivating",
+        "stop",
+        "success",
+        "7",
+        record.owner_pid,
+        record.owner_start_ticks,
+    )
+    .process
+    .unwrap();
+    let now = Instant::now();
+    let mut wait = WaitForProgress::new(now);
+    lock.progress_drain(wait.observe(now, process, Some(&record)));
+    let draining = snapshot();
+    assert_eq!(draining.operation_id, initial.operation_id);
+    assert_eq!(draining.target, initial.target);
+    assert_eq!(draining.step_index, 2);
+    assert_eq!(draining.phase, "swapoff");
+    assert_eq!((draining.completed_bytes, draining.total_bytes), (32, 64));
+
+    let mut foreign = record.clone();
+    foreign.owner_start_ticks += 1;
+    foreign.completed_bytes = 64;
+    lock.progress_drain(wait.observe(now, process, Some(&foreign)));
+    assert_eq!(snapshot().phase, "release_drain");
+    assert_eq!(snapshot().total_bytes, 0);
+    assert_eq!(snapshot().target, initial.target);
+    for (phase, label) in [
+        (InstallPhase::Stage, "release_stage"),
+        (InstallPhase::Finalize, "release_finalize"),
+        (InstallPhase::Rollback, "release_rollback"),
+    ] {
+        lock.progress_phase(phase);
+        assert_eq!(snapshot().phase, label);
+    }
+
+    drop(lock);
+    assert!(!installer_path.exists());
+    assert_eq!(snapshot().operation_id, record.operation_id);
+    let second = InstallerLock::acquire(&fixture.paths).unwrap();
+    second.start_progress(Some("invalid\nrelease"));
+    assert_eq!(snapshot().target, None);
+}

@@ -31,10 +31,13 @@ pub(super) struct OriginRuntime {
     pub(super) workers: WorkerSet,
     pub(super) native_session: Option<Arc<super::native_cache::NativeCacheSession>>,
     pub(super) pooled_session: Option<Arc<ramshared_wsl2d::pooled_cache::GuestCacheSession>>,
+    pub(super) pooled_reconnect:
+        Option<ramshared_wsl2d::pooled_cache::connector::PooledReconnectWorker>,
 }
 
 impl Drop for OriginRuntime {
     fn drop(&mut self) {
+        self.pooled_reconnect.take();
         if let Some(session) = &self.native_session {
             session.revoke();
         }
@@ -171,15 +174,16 @@ fn build_with_profile<S: NbdRuntimeStarter + ?Sized>(
         admission.clone(),
     )
     .map_err(|error| error.0)?;
-    let (backend, pooled_session) =
+    let (backend, pooled) =
         maybe_attach_pooled_cache(profile_path, "origin-cache", &origin_binding, size, backend)?;
-    if let Some(pooled_session) = pooled_session {
+    if let Some((pooled_session, pooled_reconnect)) = pooled {
         return Ok(OriginRuntime {
             backend: Arc::new(backend),
             admission: Some(admission),
             workers: WorkerSet::default(),
             native_session: None,
             pooled_session: Some(pooled_session),
+            pooled_reconnect,
         });
     }
     let mut runtime = OriginRuntime {
@@ -188,6 +192,7 @@ fn build_with_profile<S: NbdRuntimeStarter + ?Sized>(
         workers: WorkerSet::default(),
         native_session: None,
         pooled_session: None,
+        pooled_reconnect: None,
     };
     let plan = starter.origin_worker_plan(size, reserve)?;
     attach_workers(&mut runtime, starter, plan, size, reserve)?;
@@ -195,13 +200,12 @@ fn build_with_profile<S: NbdRuntimeStarter + ?Sized>(
 }
 
 type OriginBackend = AuthoritativeOriginBackend<FileOrigin, OriginCache>;
-type PooledAttachResult = Result<
-    (
-        OriginBackend,
-        Option<Arc<ramshared_wsl2d::pooled_cache::GuestCacheSession>>,
-    ),
-    Box<dyn std::error::Error>,
->;
+type PooledAttachment = (
+    Arc<ramshared_wsl2d::pooled_cache::GuestCacheSession>,
+    Option<ramshared_wsl2d::pooled_cache::connector::PooledReconnectWorker>,
+);
+type PooledAttachResult =
+    Result<(OriginBackend, Option<PooledAttachment>), Box<dyn std::error::Error>>;
 
 fn maybe_attach_pooled_cache(
     profile_path: &std::path::Path,
@@ -226,16 +230,26 @@ fn maybe_attach_pooled_cache(
         return Ok((backend, None));
     }
     let status = pooled_session.status(None);
-    if let Some(state) = pooled_read {
-        backend = backend.with_pooled_read(state);
-    }
+    backend = backend.with_pooled_read(
+        pooled_read.unwrap_or_else(ramshared_block::isolated_origin::PooledReadState::new_retired),
+    );
+    let pooled_session = Arc::new(pooled_session);
+    let pooled_reconnect = backend.pooled_read_arc().map(|pooled_arc| {
+        ramshared_wsl2d::pooled_cache::connector::PooledReconnectWorker::spawn(
+            profile_path.to_path_buf(),
+            origin_binding.to_string(),
+            size,
+            Arc::clone(&pooled_session),
+            pooled_arc,
+        )
+    });
     eprintln!(
         "[ramsharedd] mode={mode_label} cache={} epoch={} reason={}",
         status.effective_mode.as_str(),
         status.epoch,
         status.reason.as_deref().unwrap_or("none")
     );
-    Ok((backend, Some(Arc::new(pooled_session))))
+    Ok((backend, Some((pooled_session, pooled_reconnect))))
 }
 
 fn active_profile_path() -> &'static std::path::Path {
@@ -360,20 +374,21 @@ fn build_native<S: NbdRuntimeStarter + ?Sized>(
         ),
     }
     .map_err(|error| error.0)?;
-    let (backend, pooled_session) = maybe_attach_pooled_cache(
+    let (backend, pooled) = maybe_attach_pooled_cache(
         profile_path,
         "native-origin",
         &origin_binding,
         size,
         backend,
     )?;
-    if let Some(pooled_session) = pooled_session {
+    if let Some((pooled_session, pooled_reconnect)) = pooled {
         return Ok(OriginRuntime {
             backend: Arc::new(backend),
             admission: None,
             workers: WorkerSet::default(),
             native_session: session,
             pooled_session: Some(pooled_session),
+            pooled_reconnect,
         });
     }
     let mut runtime = OriginRuntime {
@@ -382,6 +397,7 @@ fn build_native<S: NbdRuntimeStarter + ?Sized>(
         workers: WorkerSet::default(),
         native_session: session.clone(),
         pooled_session: None,
+        pooled_reconnect: None,
     };
     if let Some(session) = session {
         if session.policy.is_some() {

@@ -113,6 +113,7 @@ pub(super) fn run_isolated_guarded_transition_fixture() {
         state: SupervisorState::Guarded,
         actions: vec![SupervisorAction::CloseAdmission],
         healthy_samples: 0,
+        cache_recovery_samples: 0,
     };
     let runner = FakeUnitRunner {
         calls: RefCell::new(Vec::new()),

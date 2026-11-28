@@ -9,6 +9,7 @@
 
 //! Durable ownership of a systemd stop that may outlive the installer.
 
+use std::cell::OnceCell;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::num::NonZeroU32;
@@ -33,6 +34,9 @@ use super::transition_custody::{
 use crate::operation_progress::{UpgradeDrainProgress, unix_epoch_ms};
 use crate::workload::{current_boot_id, valid_boot_id};
 
+mod progress;
+pub(super) use progress::InstallPhase;
+use progress::InstallerProgress;
 pub(super) mod systemd;
 use systemd::{ObservedUnit, StopHost, StopProcess, WaitForProgress};
 
@@ -148,10 +152,12 @@ pub(super) enum DrainOutcome {
 pub(super) struct InstallerLock {
     paths: TransitionPaths,
     lock_file: File,
+    progress: OnceCell<InstallerProgress>,
 }
 
 impl Drop for InstallerLock {
     fn drop(&mut self) {
+        drop(self.progress.take());
         let _ = flock(&self.lock_file, FlockOperation::Unlock);
     }
 }
@@ -169,6 +175,7 @@ impl InstallerLock {
             Ok(()) => Ok(Self {
                 paths: paths.clone(),
                 lock_file: file,
+                progress: OnceCell::new(),
             }),
             Err(rustix::io::Errno::WOULDBLOCK) => Err(busy_refusal(
                 "another installer is handling a release transition",
@@ -425,6 +432,7 @@ impl InstallerLock {
         systemd: &dyn StopHost,
     ) -> Result<DrainOutcome, CustomerError> {
         self.revalidate()?;
+        self.progress_phase(InstallPhase::CheckDrain);
         let existing = self.read()?;
         if existing.is_none() && !live.cascade_active {
             return Ok(DrainOutcome::Unneeded);
@@ -469,6 +477,7 @@ impl InstallerLock {
                 receipt
             }
         };
+        self.progress_drain(None);
         let mut progress = WaitForProgress::new(Instant::now());
         loop {
             let observation = systemd.observe()?;
@@ -494,7 +503,11 @@ impl InstallerLock {
                             receipt.phase = bound;
                             self.publish(&receipt)?;
                         }
-                        progress.observe(Instant::now(), process, systemd.progress().as_ref());
+                        let sample = systemd.progress();
+                        let owned = progress.observe(Instant::now(), process, sample.as_ref());
+                        self.progress_drain(owned);
+                    } else {
+                        self.progress_drain(None);
                     }
                     let now = Instant::now();
                     if progress.expired(now, systemd.observation_window(), STALL_WINDOW) {

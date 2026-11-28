@@ -257,6 +257,9 @@ fn execute_request(
         InstallMode::Apply => {
             require_root(env)?;
             let lock = installer_lock(env, lifecycle)?;
+            if let Some(lock) = &lock {
+                lock.start_progress(req.approved_version.as_deref());
+            }
             finish_pending_drain(req, env, lock.as_ref(), unit_host, boot_host)?;
             if let Some((committed, activation)) = resume_committed_install(
                 req,
@@ -702,6 +705,9 @@ fn run_auto_update_apply<B: BootPolicyHost>(
         }
         AutoUpdateDecision::Upgrade(current, posture) => (current, posture),
     };
+    if let Some(lock) = lock {
+        lock.start_progress(Some(&validated.candidate));
+    }
     apply_req.posture = Some(posture);
     let (verified, drain) = verify_install(
         &apply_req,

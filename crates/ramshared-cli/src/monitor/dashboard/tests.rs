@@ -915,6 +915,53 @@ fn matched_host_activity_survives_cache_off() {
 }
 
 #[test]
+fn main_gpu_panel_names_the_missing_worker_budget_beside_live_host_activity() {
+    let mut observation = wddm_observation();
+    observation.gpu = None;
+    observation
+        .status
+        .insert("cache_state".into(), json!("UNAVAILABLE"));
+    for (language, budget, activity, ambiguous) in [
+        (
+            Language::En,
+            "Worker VRAM budget: not measured",
+            "Host WDDM VideoEncode",
+            "GPU: unavailable",
+        ),
+        (
+            Language::PtBr,
+            "Orçamento de VRAM do worker: não medido",
+            "WDDM host VideoEncode",
+            "GPU: indisponível",
+        ),
+    ] {
+        let mut terminal = Terminal::new(TestBackend::new(148, 42)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &observation,
+                    &DashHistory::default(),
+                    &metadata(),
+                    language,
+                    Screen::Main,
+                );
+            })
+            .unwrap();
+        let output = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(output.contains(budget), "{budget}");
+        assert!(output.contains(activity), "{activity}");
+        assert!(!output.contains(ambiguous), "{ambiguous}");
+    }
+}
+
+#[test]
 fn activity_meter_handles_windows_clock_ahead_of_guest() {
     let mut observation = wddm_observation();
     let sample = observation.status.get_mut("host_gpu_activity").unwrap();
