@@ -387,6 +387,7 @@ fn installed_update_submits_stop_only_for_an_admitted_drain_route() {
             live: LiveRuntimeState {
                 cascade_active: true,
                 supervisor_active: true,
+                host_gate_active: false,
                 health_active: true,
                 health_enabled: true,
                 boot_enrolled: true,
