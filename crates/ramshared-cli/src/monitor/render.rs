@@ -42,9 +42,9 @@ use crate::installed_image::{
     BUILD_GIT_SHA, BUILD_TREE_STATE, InstallKind, InstallationIdentityCache, PRODUCT_ROOT,
     ProcessInstallOrigin, cli_install_entries, current_release_version,
     current_running_executable_metadata, current_running_executable_path,
-    current_running_executable_sha256, effective_tui_reexec_origin, format_build_identity,
-    format_installed_identity_lines, format_running_identity_line, restart_target,
-    running_install_status_from_metadata, selected_release_version,
+    current_running_executable_sha256, effective_tui_reexec_origin,
+    format_installed_identity_lines, format_running_identity_line, format_top_build_identity,
+    restart_target, running_install_status_from_metadata, selected_release_version,
 };
 use crate::release_coherence::{client_banner, previous_release_hint};
 use crate::zram_compression::{
@@ -610,17 +610,19 @@ impl DashboardMetadata {
             direct_install.as_ref(),
             active_install.as_ref(),
         );
+        let running_release = current_release_version();
         let update_notice = client_banner(
             reexec_origin,
-            current_release_version().as_deref(),
+            running_release.as_deref(),
             selected_release_version().as_deref(),
             previous_release_hint().as_deref(),
         );
         Self {
-            version_line: format_build_identity(
+            version_line: format_top_build_identity(
                 env!("CARGO_PKG_VERSION"),
                 BUILD_GIT_SHA,
                 BUILD_TREE_STATE,
+                running_release.as_deref(),
             ),
             running_line: format_running_identity_line(
                 env!("CARGO_PKG_VERSION"),

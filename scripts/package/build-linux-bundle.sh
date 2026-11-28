@@ -79,6 +79,28 @@ fi
   exit 1
 }
 
+# The installer requires root-owned trust inputs with no group or other write
+# access. A filesystem that synthesizes mode bits produces a signed archive
+# that still fails installer trust checks.
+validate_bundle_output_modes() (
+  mkdir -p -- "$OUT_ROOT" || return 1
+  local probe
+  probe=$(mktemp -d "$OUT_ROOT/.ramshared-package-mode.XXXXXXXX") || return 1
+  trap 'rm -f -- "$probe/member"; rmdir -- "$probe"' EXIT
+  chmod 0700 "$probe" || return 1
+  : >"$probe/member" || return 1
+  chmod 0644 "$probe/member" || return 1
+  [[ $(stat -c %a "$probe") == 700 && $(stat -c %a "$probe/member") == 644 ]] || return 1
+  chmod 0755 "$probe/member" || return 1
+  [[ $(stat -c %a "$probe/member") == 755 ]]
+)
+
+if ! validate_bundle_output_modes; then
+  printf 'package output must preserve POSIX modes: %s\n' "$OUT_ROOT" >&2
+  exit 1
+fi
+umask 022
+
 if [[ $SKIP_BUILD -eq 0 ]]; then
   cargo build -p ramshared-cli -p ramshared-wsl2d --release
 fi
