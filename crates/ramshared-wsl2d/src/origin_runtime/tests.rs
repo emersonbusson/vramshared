@@ -569,7 +569,8 @@ fn maybe_attach_pooled_cache_bypasses_independent_worker_for_staged_pooled_profi
         backend,
     )
     .unwrap();
-    let session = pooled.expect("staged pooled profile suppresses independent worker");
+    let (session, _reconnect) =
+        pooled.expect("staged pooled profile suppresses independent worker");
     assert!(!session.spawns_independent_worker());
     assert_eq!(
         session.status(None).effective_mode.as_str(),

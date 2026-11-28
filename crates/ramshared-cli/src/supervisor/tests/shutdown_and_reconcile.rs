@@ -30,6 +30,7 @@ fn sample_parsers_and_atomic_publication_are_bounded() {
         state: SupervisorState::Guarded,
         actions: vec![SupervisorAction::CloseAdmission],
         healthy_samples: 17,
+        cache_recovery_samples: 3,
     };
     let supervisor_identity = OwnerIdentity::current().unwrap();
     let action_results = [SupervisorActionResult::from_result(
@@ -49,6 +50,7 @@ fn sample_parsers_and_atomic_publication_are_bounded() {
         serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
     assert_eq!(value["control_state"], "GUARDED");
     assert_eq!(value["healthy_samples"], 17);
+    assert_eq!(value["cache_recovery_samples"], 3);
     assert_eq!(value["action_results"][0]["action"], "close_admission");
     assert_eq!(value["daemon_instance_id"], "fixture-daemon");
     if std::path::Path::new("/proc/pressure/memory").exists() {
@@ -69,6 +71,7 @@ fn close_admission_publishes_a_serialized_closed_gate_before_guarded_state() {
         state: SupervisorState::Guarded,
         actions: vec![SupervisorAction::CloseAdmission],
         healthy_samples: 0,
+        cache_recovery_samples: 0,
     };
     let runtime = root.join("runtime");
     let ledger = ledger_root.join("reservations.json");
@@ -107,6 +110,7 @@ fn close_admission_publishes_a_serialized_closed_gate_before_guarded_state() {
         state: SupervisorState::Healthy,
         actions: Vec::new(),
         healthy_samples: 60,
+        cache_recovery_samples: 0,
     };
     apply_decision_with(
         &state_path,
@@ -145,6 +149,7 @@ fn critical_actions_remain_executable_when_admission_transition_busy() {
             SupervisorAction::RequestReclaim,
         ],
         healthy_samples: 0,
+        cache_recovery_samples: 0,
     };
     let identity = OwnerIdentity::current().unwrap();
     let runner = FakeUnitRunner {
@@ -216,6 +221,7 @@ fn deterministic_admission_close_failure_still_terminates_the_supervisor() {
         state: SupervisorState::Guarded,
         actions: vec![SupervisorAction::CloseAdmission],
         healthy_samples: 0,
+        cache_recovery_samples: 0,
     };
     let identity = OwnerIdentity::current().unwrap();
     let runner = FakeUnitRunner {
@@ -262,6 +268,7 @@ fn transient_admission_lock_contention_does_not_terminate_the_supervisor() {
         state: SupervisorState::Guarded,
         actions: vec![SupervisorAction::CloseAdmission],
         healthy_samples: 0,
+        cache_recovery_samples: 0,
     };
     let identity = OwnerIdentity::current().unwrap();
 

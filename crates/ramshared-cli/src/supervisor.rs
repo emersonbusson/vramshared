@@ -208,6 +208,7 @@ pub struct SupervisorDecision {
     pub state: SupervisorState,
     pub actions: Vec<SupervisorAction>,
     pub healthy_samples: u32,
+    pub cache_recovery_samples: u32,
 }
 
 #[derive(Debug)]
@@ -217,6 +218,7 @@ pub struct Supervisor {
     critical_psi_samples: u32,
     emergency_psi_samples: u32,
     healthy_samples: u32,
+    cache_recovery_samples: u32,
     emergency_kill_eligible_ms: Option<u64>,
     emergency_kill_sent: bool,
     discardable_frozen: bool,
@@ -231,6 +233,7 @@ impl Default for Supervisor {
             critical_psi_samples: 0,
             emergency_psi_samples: 0,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             emergency_kill_eligible_ms: None,
             emergency_kill_sent: false,
             discardable_frozen: false,
@@ -297,12 +300,12 @@ impl Supervisor {
             || self.critical_psi_samples >= 5;
         let guarded = sample.memory_available_bytes < sample.control_reserve_bytes
             || self.guarded_psi_samples >= 3;
-        let fully_healthy = sample.memory_available_bytes
-            >= sample
-                .control_reserve_bytes
-                .saturating_add(memory_policy::RECOVERY_MARGIN_BYTES)
-            && sample.psi_full_avg10 < 1.0
-            && sample.sample_delay_ms < 3_000;
+        let calm = sample.psi_full_avg10 < 1.0 && sample.sample_delay_ms < 3_000;
+        let fully_healthy = calm
+            && sample.memory_available_bytes
+                >= sample
+                    .control_reserve_bytes
+                    .saturating_add(memory_policy::RECOVERY_MARGIN_BYTES);
 
         let requested = if emergency {
             SupervisorState::Emergency
@@ -314,6 +317,15 @@ impl Supervisor {
             SupervisorState::Healthy
         };
 
+        self.cache_recovery_samples = streak(
+            self.cache_recovery_samples,
+            requested == SupervisorState::Healthy
+                && calm
+                && sample.memory_available_bytes
+                    >= sample
+                        .control_reserve_bytes
+                        .saturating_add(memory_policy::CACHE_RECOVERY_MARGIN_BYTES),
+        );
         let previous_state = self.state;
         if requested == SupervisorState::Healthy {
             self.healthy_samples = streak(self.healthy_samples, fully_healthy);
@@ -378,6 +390,7 @@ impl Supervisor {
             state: self.state,
             actions,
             healthy_samples: self.healthy_samples,
+            cache_recovery_samples: self.cache_recovery_samples,
         }
     }
 

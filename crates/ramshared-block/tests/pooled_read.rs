@@ -586,3 +586,171 @@ fn authoritative_origin_trait_delegation_telemetry_and_offer_slot_saturation() {
         h.join().unwrap();
     }
 }
+
+#[test]
+fn pooled_offer_transport_close_retires_epoch_and_rebind_restores_hits_cleanly() {
+    struct ClosingOfferClient {
+        closed: AtomicBool,
+        fail_offer: AtomicBool,
+        pages: Mutex<HashMap<(u64, u64, u64), [u8; POOLED_PAGE_BYTES]>>,
+        poisoned: Mutex<Vec<u64>>,
+    }
+    impl PooledCacheClient for ClosingOfferClient {
+        fn lookup_into(
+            &self,
+            epoch: u64,
+            offset: u64,
+            content_gen: u64,
+            slot_gen: u64,
+            _deadline: Instant,
+            dst: &mut [u8; POOLED_PAGE_BYTES],
+        ) -> PooledLookupReply {
+            if self.closed.load(Ordering::Acquire) {
+                return PooledLookupReply::TransportError;
+            }
+            let guard = self.pages.lock().unwrap();
+            let Some(page) = guard.get(&(epoch, offset, content_gen)) else {
+                return PooledLookupReply::Miss;
+            };
+            dst.copy_from_slice(page);
+            PooledLookupReply::Hit {
+                epoch,
+                slot_gen,
+                content_gen,
+                crc: pooled_crc32c(page),
+            }
+        }
+        fn offer_copy(
+            &self,
+            epoch: u64,
+            offset: u64,
+            content_gen: u64,
+            page: &[u8; POOLED_PAGE_BYTES],
+            _crc: u32,
+        ) -> bool {
+            if self.fail_offer.load(Ordering::Acquire) {
+                self.closed.store(true, Ordering::Release);
+                return false;
+            }
+            self.pages
+                .lock()
+                .unwrap()
+                .insert((epoch, offset, content_gen), *page);
+            true
+        }
+        fn close_poisoned(&self, epoch: u64) {
+            self.closed.store(true, Ordering::Release);
+            self.poisoned.lock().unwrap().push(epoch);
+        }
+        fn is_transport_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+    }
+
+    let origin = SharedOrigin(Arc::new(MemOrigin::new(64 * 1024)));
+    // Boot in retired state (e.g. host initially offline): origin reads work without panics.
+    let backend = Arc::new(
+        AuthoritativeOriginBackend::new(origin.clone(), DisabledCache, 64 * 1024, 4096)
+            .unwrap()
+            .with_pooled_read(PooledReadState::new_retired()),
+    );
+    let pooled = backend.pooled_read_arc().unwrap();
+    assert_eq!(pooled.active_epoch(), 0);
+    assert!(
+        !pooled.rebind_client(0, SharedClient(Arc::new(MockPooledClient::new()))),
+        "epoch 0 must be refused on rebind"
+    );
+
+    let v1 = [0x42u8; POOLED_PAGE_BYTES];
+    backend.write_at(0, &v1).unwrap();
+    let mut out = [0u8; POOLED_PAGE_BYTES];
+    backend.read_at(0, &mut out).unwrap();
+    assert_eq!(out, v1);
+
+    // Bind first transport whose offer closes the stream; epoch must retire immediately
+    // with zero quarantined lookup slots.
+    let c1 = Arc::new(ClosingOfferClient {
+        closed: AtomicBool::new(false),
+        fail_offer: AtomicBool::new(true),
+        pages: Mutex::new(HashMap::new()),
+        poisoned: Mutex::new(Vec::new()),
+    });
+    struct ArcClosing(Arc<ClosingOfferClient>);
+    impl PooledCacheClient for ArcClosing {
+        fn lookup_into(
+            &self,
+            epoch: u64,
+            offset: u64,
+            content_gen: u64,
+            slot_gen: u64,
+            deadline: Instant,
+            dst: &mut [u8; POOLED_PAGE_BYTES],
+        ) -> PooledLookupReply {
+            self.0
+                .lookup_into(epoch, offset, content_gen, slot_gen, deadline, dst)
+        }
+        fn offer_copy(
+            &self,
+            epoch: u64,
+            offset: u64,
+            content_gen: u64,
+            page: &[u8; POOLED_PAGE_BYTES],
+            crc: u32,
+        ) -> bool {
+            self.0.offer_copy(epoch, offset, content_gen, page, crc)
+        }
+        fn close_poisoned(&self, epoch: u64) {
+            self.0.close_poisoned(epoch);
+        }
+        fn is_transport_closed(&self) -> bool {
+            self.0.is_transport_closed()
+        }
+    }
+    assert!(pooled.rebind_client(5, ArcClosing(Arc::clone(&c1))));
+    assert_eq!(pooled.active_epoch(), 5);
+    backend.read_at(0, &mut out).unwrap();
+    assert_eq!(out, v1);
+    assert_eq!(
+        pooled.active_epoch(),
+        0,
+        "offer transport close must retire epoch immediately"
+    );
+    assert_eq!(pooled.telemetry().quarantined_slots, 0);
+    assert_eq!(*c1.poisoned.lock().unwrap(), vec![5]);
+
+    // Rebind onto a fresh client (even if a restarted host reuses epoch=5) and verify hits work.
+    let c2 = Arc::new(ClosingOfferClient {
+        closed: AtomicBool::new(false),
+        fail_offer: AtomicBool::new(false),
+        pages: Mutex::new(HashMap::new()),
+        poisoned: Mutex::new(Vec::new()),
+    });
+    assert!(pooled.rebind_client(5, ArcClosing(Arc::clone(&c2))));
+    assert_eq!(pooled.active_epoch(), 5);
+    // Miss -> SSD -> offer accepted -> next read hits VRAM!
+    backend.read_at(0, &mut out).unwrap();
+    assert_eq!(out, v1);
+    origin
+        .write_all_at(0, &[0xCCu8; POOLED_PAGE_BYTES])
+        .unwrap();
+    backend.read_at(0, &mut out).unwrap();
+    assert_eq!(out, v1);
+    assert_eq!(pooled.telemetry().hits, 1);
+    origin.write_all_at(0, &v1).unwrap();
+
+    // Quarantine both slots via TimedOut, then rebind onto a fresh epoch: idle quarantined slots
+    // from the dead transport are cleared cleanly and lookups serve hits again.
+    let bad = SharedClient(Arc::new(MockPooledClient::new()));
+    *bad.0.fault.lock().unwrap() = FaultMode::TimedOut;
+    assert!(pooled.rebind_client(6, bad));
+    backend.read_at(0, &mut out).unwrap();
+    backend.read_at(0, &mut out).unwrap();
+    assert_eq!(pooled.telemetry().quarantined_slots, 2);
+
+    let healthy = SharedClient(Arc::new(MockPooledClient::new()));
+    assert!(pooled.rebind_client(7, healthy));
+    assert_eq!(pooled.telemetry().quarantined_slots, 0);
+    backend.read_at(0, &mut out).unwrap();
+    backend.read_at(0, &mut out).unwrap();
+    assert_eq!(pooled.telemetry().hits, 2);
+}

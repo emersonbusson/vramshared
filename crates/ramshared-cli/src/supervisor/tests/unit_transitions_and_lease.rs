@@ -419,6 +419,7 @@ fn action_executor_covers_cache_freeze_reclaim_thaw_and_kill() {
     let decision = SupervisorDecision {
         state: SupervisorState::Emergency,
         healthy_samples: 0,
+        cache_recovery_samples: 0,
         actions: vec![
             SupervisorAction::CloseAdmission,
             SupervisorAction::ReduceVramCache,
@@ -453,6 +454,7 @@ fn action_executor_covers_cache_freeze_reclaim_thaw_and_kill() {
         &SupervisorDecision {
             state: SupervisorState::Emergency,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             actions: vec![SupervisorAction::KillDiscardable],
         },
         &ActionPaths {
@@ -506,6 +508,7 @@ fn freeze_persists_exact_pending_identity_before_effect_and_never_falls_back() {
         &SupervisorDecision {
             state: SupervisorState::Critical,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             actions: vec![SupervisorAction::FreezeDiscardable],
         },
         &ActionPaths {
@@ -530,6 +533,7 @@ fn freeze_persists_exact_pending_identity_before_effect_and_never_falls_back() {
         &SupervisorDecision {
             state: SupervisorState::Emergency,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             actions: vec![SupervisorAction::ThawDiscardable],
         },
         &ActionPaths {
@@ -586,6 +590,7 @@ fn freeze_applied_write_failure_recovers_exact_pending_identity_after_restart() 
         &SupervisorDecision {
             state: SupervisorState::Critical,
             healthy_samples: 0,
+            cache_recovery_samples: 0,
             actions: vec![SupervisorAction::FreezeDiscardable],
         },
         &ActionPaths {

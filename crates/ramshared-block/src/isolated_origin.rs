@@ -15,7 +15,7 @@ use crate::{BlockBackend, IoError, WriteOptions};
 use ramshared_vram::{
     GpuAdapterIdentity, GpuBudgetTelemetry, GpuUtilizationTelemetry, WorkerCacheTelemetry,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 mod cache_client;
@@ -47,7 +47,7 @@ pub struct AuthoritativeOriginBackend<O, C> {
     block: u32,
     state: Mutex<BackendState>,
     admission: Box<dyn CacheAdmission>,
-    pooled: Option<PooledReadState>,
+    pooled: Option<Arc<PooledReadState>>,
 }
 
 struct BackendState {
@@ -98,12 +98,18 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
 
     /// Attach a locally fenced pooled read cache leaf.
     pub fn with_pooled_read(mut self, pooled: PooledReadState) -> Self {
-        self.pooled = Some(pooled);
+        self.pooled = Some(Arc::new(pooled));
         self
     }
 
     pub fn pooled_read(&self) -> Option<&PooledReadState> {
-        self.pooled.as_ref()
+        self.pooled.as_deref()
+    }
+
+    /// Clone a shared reference to the attached pooled read state for bounded
+    /// out-of-band reconnect supervision.
+    pub fn pooled_read_arc(&self) -> Option<Arc<PooledReadState>> {
+        self.pooled.as_ref().map(Arc::clone)
     }
 
     /// Whether the cache may be used right now (DT-9), revoking what is
@@ -556,11 +562,16 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
             if destination.is_empty() {
                 return Ok(());
             }
-            pooled.snapshot(offset, destination.len())
+            pooled.snapshot_with_incarnation(offset, destination.len())
         };
-        if let Some((epoch, content_gen)) = snapshot
-            && let Some(attempt) =
-                pooled.try_lookup_remote(epoch, offset, content_gen, inherited_deadline)
+        if let Some((incarnation, epoch, content_gen)) = snapshot
+            && let Some(attempt) = pooled.try_lookup_remote(
+                incarnation,
+                epoch,
+                offset,
+                content_gen,
+                inherited_deadline,
+            )
         {
             let _range = self.ranges.read(offset, destination.len())?;
             self.require_ready_origin()?;
@@ -585,10 +596,10 @@ impl<O: OriginStorage, C: BestEffortCache> AuthoritativeOriginBackend<O, C> {
             if let Ok(mut s) = self.state.lock() {
                 s.telemetry.fallback_reads = s.telemetry.fallback_reads.saturating_add(1);
             }
-            pooled.snapshot(offset, destination.len())
+            pooled.snapshot_with_incarnation(offset, destination.len())
         };
-        if let Some((epoch, content_gen)) = offer_snap {
-            pooled.offer_after_origin_read(epoch, offset, content_gen, destination);
+        if let Some((incarnation, epoch, content_gen)) = offer_snap {
+            pooled.offer_after_origin_read(incarnation, epoch, offset, content_gen, destination);
         }
         Ok(())
     }

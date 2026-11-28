@@ -62,6 +62,14 @@ impl CacheStatusPublisher {
                 == context
                     .control_admission
                     .map(ControlPlaneCacheAdmission::control_state)
+            && last
+                .pooled_cache
+                .as_ref()
+                .map(|p| (p.effective_mode, p.epoch))
+                == context.pooled_session.map(|session| {
+                    let st = session.status(cache.pooled_read().map(|p| p.telemetry()));
+                    (st.effective_mode, st.epoch)
+                })
             && cache
                 .try_control_cache(|client| {
                     client.state().as_str() == last.cache_state
@@ -188,10 +196,17 @@ fn snapshot(
     } = context;
     let pooled_cache = pooled_session.map(|session| {
         let pooled_tel = cache.pooled_read().map(|p| {
+            let tel = p.telemetry();
             if p.active_epoch() == 0 && session.active_epoch() != 0 {
                 session.retire_to_origin_only("pooled_epoch_retired");
+            } else if tel.quarantined_slots as usize
+                >= ramshared_block::isolated_origin::POOLED_STAGING_SLOTS
+                && session.active_epoch() != 0
+            {
+                p.retire_epoch();
+                session.retire_to_origin_only("lookup_slots_quarantined");
             }
-            p.telemetry()
+            tel
         });
         session.status(pooled_tel)
     });

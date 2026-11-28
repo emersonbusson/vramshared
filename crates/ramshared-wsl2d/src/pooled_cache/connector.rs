@@ -10,10 +10,12 @@
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use ramshared_block::isolated_origin::PooledReadState;
+use ramshared_block::isolated_origin::{POOLED_STAGING_SLOTS, PooledReadState};
 use ramshared_ipc::cache_wire::{
     CacheClientFinish, CacheClientHello, CacheGuestRole, CacheScope,
     origin_fingerprint_from_binding, read_host_challenge, write_client_finish, write_client_hello,
@@ -32,11 +34,14 @@ use super::{
 const MAX_KEY_FILE_BYTES: u64 = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Hard socket timeout above the 2 ms DT-6 soft deadline so a single first-page
-/// GPU warmup or scheduling jitter tick triggers clean SSD fallback via the 2 ms
-/// `PooledReadState` deadline without permanently poisoning framing, while a truly
-/// stalled host still closes and retires cleanly within 20 ms.
-const STEADY_SOCKET_TIMEOUT: Duration = Duration::from_millis(20);
+/// Hard socket timeout above the 8 ms DT-6 soft deadline so a single first-page
+/// GPU warmup or CPU scheduling spike on a constrained guest triggers clean SSD
+/// fallback via the `PooledReadState` deadline without prematurely tearing
+/// down valid framing, while a truly stalled host still closes and retires within 50 ms.
+const STEADY_SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
+/// Minimum cooldown between bounded pooled-cache reconnect attempts.
+pub const POOLED_RECONNECT_COOLDOWN: Duration = Duration::from_secs(30);
+const RECONNECT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Load a 256-bit secret key without following symlinks and enforcing strict file mode.
 pub fn read_pooled_key(path: &Path) -> Result<[u8; 32], String> {
@@ -267,4 +272,184 @@ where
     let nonce = random_nonce().map_err(|e| format!("nonce:{e}"))?;
     let stream = dial(doc.data_port)?;
     handshake_and_wrap(stream, role, doc.data_port, key, fp, extent_bytes, nonce)
+}
+
+/// Attempt one bounded RSCP v1 reconnect and atomically rebind `pooled` + `session`.
+pub fn try_reconnect_pooled_with_dialer<S, D>(
+    selection: Result<CacheProfileSelection, ProfileError>,
+    actual_origin_binding: &str,
+    extent_bytes: u64,
+    session: &GuestCacheSession,
+    pooled: &PooledReadState,
+    dial: D,
+) -> Result<u64, String>
+where
+    S: VsockStreamTrait + 'static,
+    D: FnOnce(u32) -> Result<S, String>,
+{
+    let doc = match selection {
+        Ok(CacheProfileSelection::Staged(doc)) if doc.profile == CacheProfile::Pooled => doc,
+        Ok(_) => return Err("profile_not_pooled".into()),
+        Err(err) => return Err(format!("malformed_profile:{err}")),
+    };
+    let (proof, client) = attempt_pooled_connect(&doc, actual_origin_binding, extent_bytes, dial)?;
+    let epoch = proof.scope.epoch;
+    if !pooled.rebind_client(epoch, client) || !session.activate_rebound(&proof) {
+        pooled.retire_epoch();
+        session.retire_to_origin_only("reconnect_activation_refused");
+        return Err("reconnect_activation_refused".into());
+    }
+    Ok(epoch)
+}
+
+/// Out-of-band bounded reconnect supervisor for a pooled guest session.
+///
+/// Never blocks NBD origin I/O; wakes immediately and joins on `Drop`.
+pub struct PooledReconnectWorker {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PooledReconnectWorker {
+    pub fn spawn(
+        profile_path: PathBuf,
+        origin_binding: String,
+        extent_bytes: u64,
+        session: Arc<GuestCacheSession>,
+        pooled: Arc<PooledReadState>,
+    ) -> Self {
+        Self::spawn_with_dialer(
+            profile_path,
+            origin_binding,
+            extent_bytes,
+            POOLED_RECONNECT_COOLDOWN,
+            session,
+            pooled,
+            |is_wsl, port| {
+                if is_wsl {
+                    listen_vsock(port, CONNECT_TIMEOUT).map_err(|e| e.to_string())
+                } else {
+                    connect_vsock(VMADDR_CID_HOST, port, CONNECT_TIMEOUT).map_err(|e| e.to_string())
+                }
+            },
+        )
+    }
+
+    pub fn spawn_with_dialer<S, D>(
+        profile_path: PathBuf,
+        origin_binding: String,
+        extent_bytes: u64,
+        cooldown: Duration,
+        session: Arc<GuestCacheSession>,
+        pooled: Arc<PooledReadState>,
+        mut dial: D,
+    ) -> Self
+    where
+        S: VsockStreamTrait + 'static,
+        D: FnMut(bool, u32) -> Result<S, String> + Send + 'static,
+    {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_bg = Arc::clone(&stop);
+        let poll = RECONNECT_POLL_INTERVAL.min(cooldown.max(Duration::from_millis(5)));
+        let thread = std::thread::Builder::new()
+            .name("pooled-reconnect".into())
+            .spawn(move || {
+                let mut next_attempt = if pooled.active_epoch() == 0 {
+                    Some(Instant::now() + cooldown)
+                } else {
+                    None
+                };
+                let mut last_logged: Option<String> = None;
+                loop {
+                    if wait_for_stop(&stop_bg, Duration::ZERO) {
+                        break;
+                    }
+                    let tel = pooled.telemetry();
+                    let all_quarantined = tel.quarantined_slots as usize >= POOLED_STAGING_SLOTS;
+                    if all_quarantined && pooled.active_epoch() != 0 {
+                        pooled.retire_epoch();
+                        session.retire_to_origin_only("lookup_slots_quarantined");
+                    }
+                    if pooled.active_epoch() != 0 {
+                        next_attempt = None;
+                        if wait_for_stop(&stop_bg, poll) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if session.active_epoch() != 0 {
+                        session.retire_to_origin_only("pooled_epoch_retired");
+                    }
+                    let deadline = *next_attempt.get_or_insert_with(|| Instant::now() + cooldown);
+                    let now = Instant::now();
+                    if now < deadline {
+                        if wait_for_stop(&stop_bg, (deadline - now).min(poll)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    let selection = load_boot_profile(&profile_path);
+                    let is_wsl = matches!(
+                        &selection,
+                        Ok(CacheProfileSelection::Staged(doc)) if doc.role == "wsl2"
+                    );
+                    match try_reconnect_pooled_with_dialer(
+                        selection,
+                        &origin_binding,
+                        extent_bytes,
+                        &session,
+                        &pooled,
+                        |port| dial(is_wsl, port),
+                    ) {
+                        Ok(epoch) => {
+                            eprintln!(
+                                "[ramsharedd] pooled cache reconnected epoch={epoch} mode=pooled_active"
+                            );
+                            next_attempt = None;
+                            last_logged = None;
+                        }
+                        Err(reason) => {
+                            session.retire_to_origin_only(&reason);
+                            if last_logged.as_deref() != Some(reason.as_str()) {
+                                eprintln!(
+                                    "[ramsharedd] pooled cache reconnect deferred: {reason}"
+                                );
+                                last_logged = Some(reason);
+                            }
+                            next_attempt = Some(Instant::now() + cooldown);
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+fn wait_for_stop(stop: &(Mutex<bool>, Condvar), dur: Duration) -> bool {
+    let Ok(guard) = stop.0.lock() else {
+        return true;
+    };
+    if *guard {
+        return true;
+    }
+    if dur.is_zero() {
+        return false;
+    }
+    stop.1
+        .wait_timeout(guard, dur)
+        .map(|(g, _)| *g)
+        .unwrap_or(true)
+}
+
+impl Drop for PooledReconnectWorker {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.stop.0.lock() {
+            *guard = true;
+            self.stop.1.notify_all();
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
 }

@@ -7,14 +7,14 @@
 //! Locally fenced optional pooled read cache over an authoritative SSD origin.
 //! SPEC: the protocol specification §DT-5, §DT-6, §DT-9.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use super::range_lock::{RangeLocks, STRIPES};
 
 pub const POOLED_PAGE_BYTES: usize = 4096;
-pub const DEFAULT_POOLED_LOOKUP_BUDGET: Duration = Duration::from_millis(2);
+pub const DEFAULT_POOLED_LOOKUP_BUDGET: Duration = Duration::from_millis(8);
 pub const POOLED_STAGING_SLOTS: usize = 2;
 
 /// Deterministic Castagnoli CRC32C matching `ramshared_ipc::cache_wire::crc32c`.
@@ -66,6 +66,11 @@ pub trait PooledCacheClient: Send + Sync {
     ) -> bool;
 
     fn close_poisoned(&self, epoch: u64);
+
+    /// Report whether the underlying transport stream has already closed.
+    fn is_transport_closed(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -133,6 +138,7 @@ impl StagingPool {
 }
 
 pub(super) struct LookupAttempt {
+    incarnation: u64,
     slot_idx: usize,
     slot_gen: u64,
     deadline: Instant,
@@ -140,11 +146,18 @@ pub(super) struct LookupAttempt {
     buf: Box<[u8; POOLED_PAGE_BYTES]>,
 }
 
+struct BoundPooledClient {
+    incarnation: u64,
+    epoch: u64,
+    client: Arc<dyn PooledCacheClient>,
+}
+
 pub struct PooledReadState {
     epoch: AtomicU64,
+    incarnation: AtomicU64,
     stripes: [AtomicU64; STRIPES],
     lookup_budget: Duration,
-    client: Box<dyn PooledCacheClient>,
+    client: RwLock<Option<BoundPooledClient>>,
     pool: Mutex<StagingPool>,
 }
 
@@ -153,16 +166,37 @@ impl PooledReadState {
         Self::with_budget(epoch, DEFAULT_POOLED_LOOKUP_BUDGET, client)
     }
 
+    /// Construct a retired pooled read state so origin stripe generations are
+    /// tracked from boot and a live transport can be rebound later without
+    /// rebuilding the authoritative origin backend.
+    pub fn new_retired() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            incarnation: AtomicU64::new(0),
+            stripes: std::array::from_fn(|_| AtomicU64::new(1)),
+            lookup_budget: DEFAULT_POOLED_LOOKUP_BUDGET,
+            client: RwLock::new(None),
+            pool: Mutex::new(StagingPool::new()),
+        }
+    }
+
     pub fn with_budget(
         epoch: u64,
         lookup_budget: Duration,
         client: impl PooledCacheClient + 'static,
     ) -> Self {
+        let incarnation = u64::from(epoch != 0);
+        let bound = (epoch != 0).then(|| BoundPooledClient {
+            incarnation,
+            epoch,
+            client: Arc::new(client),
+        });
         Self {
             epoch: AtomicU64::new(epoch),
+            incarnation: AtomicU64::new(incarnation),
             stripes: std::array::from_fn(|_| AtomicU64::new(1)),
             lookup_budget,
-            client: Box::new(client),
+            client: RwLock::new(bound),
             pool: Mutex::new(StagingPool::new()),
         }
     }
@@ -175,19 +209,89 @@ impl PooledReadState {
         self.pool.lock().ok().map(|mut p| f(&mut p))
     }
 
+    fn client_for(&self, incarnation: u64, epoch: u64) -> Option<Arc<dyn PooledCacheClient>> {
+        let guard = self.client.read().ok()?;
+        guard
+            .as_ref()
+            .filter(|bound| bound.incarnation == incarnation && bound.epoch == epoch)
+            .map(|bound| Arc::clone(&bound.client))
+    }
+
     pub fn telemetry(&self) -> PooledReadTelemetry {
         self.with_pool(|p| p.telemetry).unwrap_or_default()
     }
 
     pub fn retire_epoch(&self) {
-        let prev = self.epoch.swap(0, Ordering::AcqRel);
-        if prev != 0 {
+        self.retire_if_matches(None);
+    }
+
+    fn retire_if_matches(&self, expected_incarnation: Option<u64>) {
+        let (prev_epoch, prev_client) = {
+            let Ok(mut guard) = self.client.write() else {
+                return;
+            };
+            if let Some(expected) = expected_incarnation
+                && guard
+                    .as_ref()
+                    .is_none_or(|bound| bound.incarnation != expected)
+            {
+                return;
+            }
+            let prev_epoch = self.epoch.swap(0, Ordering::AcqRel);
+            let prev_client = guard.take();
+            (prev_epoch, prev_client)
+        };
+        if prev_epoch != 0 {
             let _ = self.with_pool(|pool| {
                 pool.telemetry.poison_retirements =
                     pool.telemetry.poison_retirements.saturating_add(1);
             });
-            self.client.close_poisoned(prev);
+            if let Some(bound) = prev_client {
+                bound.client.close_poisoned(prev_epoch);
+            }
         }
+    }
+
+    /// Atomically bind a fresh authenticated transport on a new local incarnation
+    /// without disturbing stripe content generations or blocking SSD origin I/O.
+    pub fn rebind_client(&self, new_epoch: u64, client: impl PooledCacheClient + 'static) -> bool {
+        if new_epoch == 0 {
+            return false;
+        }
+        let (prev_epoch, prev_client) = {
+            let Ok(mut guard) = self.client.write() else {
+                return false;
+            };
+            let prev_epoch = self.epoch.swap(0, Ordering::AcqRel);
+            let next_incarnation = self
+                .incarnation
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            let prev_client = guard.replace(BoundPooledClient {
+                incarnation: next_incarnation,
+                epoch: new_epoch,
+                client: Arc::new(client),
+            });
+            (prev_epoch, prev_client)
+        };
+        if prev_epoch != 0
+            && let Some(bound) = prev_client
+        {
+            bound.client.close_poisoned(prev_epoch);
+        }
+        // Release idle lookup slots quarantined under the retired transport
+        // without touching any slot still held by an in-flight call.
+        let _ = self.with_pool(|pool| {
+            for slot in &mut pool.lookup {
+                if !slot.in_use && slot.quarantined {
+                    slot.quarantined = false;
+                }
+            }
+            pool.telemetry.quarantined_slots =
+                pool.lookup.iter().filter(|slot| slot.quarantined).count() as u64;
+        });
+        self.epoch.store(new_epoch, Ordering::Release);
+        true
     }
 
     /// Advance all touched stripe generations under the write range guard before origin I/O.
@@ -209,24 +313,37 @@ impl PooledReadState {
 
     /// Snapshot `(epoch, content_gen)` for an eligible aligned 4 KiB read under range lock.
     pub fn snapshot(&self, offset: u64, len: usize) -> Option<(u64, u64)> {
+        self.snapshot_with_incarnation(offset, len)
+            .map(|(_, epoch, gen_val)| (epoch, gen_val))
+    }
+
+    pub(super) fn snapshot_with_incarnation(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Option<(u64, u64, u64)> {
         let epoch = self.active_epoch();
+        let incarnation = self.incarnation.load(Ordering::Acquire);
         if epoch == 0
+            || incarnation == 0
             || len != POOLED_PAGE_BYTES
             || !offset.is_multiple_of(POOLED_PAGE_BYTES as u64)
         {
             return None;
         }
         let gen_val = self.stripes[RangeLocks::stripe_index(offset)].load(Ordering::Acquire);
-        Some((epoch, gen_val))
+        Some((incarnation, epoch, gen_val))
     }
 
     pub(super) fn try_lookup_remote(
         &self,
+        incarnation: u64,
         epoch: u64,
         offset: u64,
         content_gen: u64,
         inherited_deadline: Option<Instant>,
     ) -> Option<LookupAttempt> {
+        let client = self.client_for(incarnation, epoch)?;
         let now = Instant::now();
         let deadline = now.checked_add(self.lookup_budget).unwrap_or(now);
         let deadline = inherited_deadline.map_or(deadline, |inh| deadline.min(inh));
@@ -247,10 +364,9 @@ impl PooledReadState {
             })
             .flatten()?;
         let (slot_idx, slot_gen, mut buf) = acquired;
-        let reply =
-            self.client
-                .lookup_into(epoch, offset, content_gen, slot_gen, deadline, &mut buf);
+        let reply = client.lookup_into(epoch, offset, content_gen, slot_gen, deadline, &mut buf);
         Some(LookupAttempt {
+            incarnation,
             slot_idx,
             slot_gen,
             deadline,
@@ -270,6 +386,7 @@ impl PooledReadState {
     ) -> bool {
         let mut accepted = false;
         let mut poison = false;
+        let same_incarnation = self.incarnation.load(Ordering::Acquire) == attempt.incarnation;
         let timed_out = matches!(attempt.reply, PooledLookupReply::TimedOut);
         let deadline_exceeded = Instant::now() > attempt.deadline;
         match attempt.reply {
@@ -290,7 +407,8 @@ impl PooledReadState {
                         pool.telemetry.deadline_overruns =
                             pool.telemetry.deadline_overruns.saturating_add(1);
                     });
-                } else if current_epoch != snapshot_epoch
+                } else if !same_incarnation
+                    || current_epoch != snapshot_epoch
                     || current_gen != snapshot_gen
                     || content_gen != snapshot_gen
                     || destination.len() != POOLED_PAGE_BYTES
@@ -326,7 +444,7 @@ impl PooledReadState {
             let slot = &mut pool.lookup[attempt.slot_idx];
             slot.buf = Some(attempt.buf);
             slot.in_use = false;
-            if timed_out {
+            if timed_out && same_incarnation {
                 slot.quarantined = true;
                 pool.telemetry.quarantined_slots =
                     pool.telemetry.quarantined_slots.saturating_add(1);
@@ -336,7 +454,7 @@ impl PooledReadState {
             }
         });
         if poison {
-            self.retire_epoch();
+            self.retire_if_matches(Some(attempt.incarnation));
         }
         accepted
     }
@@ -349,6 +467,7 @@ impl PooledReadState {
 
     pub(super) fn offer_after_origin_read(
         &self,
+        incarnation: u64,
         epoch: u64,
         offset: u64,
         content_gen: u64,
@@ -357,6 +476,9 @@ impl PooledReadState {
         if self.active_epoch() != epoch || data.len() != POOLED_PAGE_BYTES {
             return;
         }
+        let Some(client) = self.client_for(incarnation, epoch) else {
+            return;
+        };
         let acquired = self
             .with_pool(|pool| {
                 let slot = StagingPool::try_acquire(&mut pool.offer);
@@ -371,9 +493,8 @@ impl PooledReadState {
         };
         buf.copy_from_slice(data);
         let crc = pooled_crc32c(&buf[..]);
-        let submitted = self
-            .client
-            .offer_copy(epoch, offset, content_gen, &buf, crc);
+        let submitted = client.offer_copy(epoch, offset, content_gen, &buf, crc);
+        let transport_closed = !submitted && client.is_transport_closed();
         let _ = self.with_pool(|pool| {
             let slot = &mut pool.offer[slot_idx];
             slot.buf = Some(buf);
@@ -384,6 +505,9 @@ impl PooledReadState {
                 pool.telemetry.offers_dropped = pool.telemetry.offers_dropped.saturating_add(1);
             }
         });
+        if transport_closed {
+            self.retire_if_matches(Some(incarnation));
+        }
     }
 
     /// Release a previously quarantined lookup slot only after the caller verified settlement.
