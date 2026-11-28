@@ -132,6 +132,22 @@ pub(crate) fn format_build_identity(version: &str, commit: &str, tree_state: &st
     )
 }
 
+/// Name the sealed release in Top when it differs from the product version.
+pub(crate) fn format_top_build_identity(
+    version: &str,
+    commit: &str,
+    tree_state: &str,
+    release: Option<&str>,
+) -> String {
+    let title = format_build_identity(version, commit, tree_state);
+    match release {
+        Some(release) if release.strip_prefix('v').unwrap_or(release) != version => {
+            format!("{title} · release {release}")
+        }
+        _ => title,
+    }
+}
+
 pub(crate) fn build_info_lines() -> String {
     let commit = full_commit_sha(BUILD_GIT_SHA).unwrap_or_else(|| "unavailable".to_string());
     let tree_state = normalized_tree_state(BUILD_TREE_STATE);
