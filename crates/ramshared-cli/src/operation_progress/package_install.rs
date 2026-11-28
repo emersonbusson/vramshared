@@ -10,8 +10,6 @@
 
 use super::*;
 
-const PACKAGE_PHASE_TTL_MS: u64 = 120_000;
-
 pub(crate) const PACKAGE_VERIFY: &str = "package_verify";
 pub(crate) const PACKAGE_STAGE: &str = "package_stage";
 pub(crate) const PACKAGE_COMMIT: &str = "package_commit";
@@ -29,18 +27,6 @@ impl PackageFileProgress {
 }
 
 impl OperationProgressGuard {
-    pub(crate) fn start_package_install() -> Self {
-        Self::start_with(
-            PathBuf::from(SYSTEM_OPERATION_PROGRESS_PATH),
-            Path::new("/proc"),
-            OperationKind::SetupInstall,
-            PACKAGE_VERIFY,
-            3,
-            PACKAGE_PHASE_TTL_MS,
-            unix_epoch_ms,
-        )
-    }
-
     pub(crate) fn update_package(
         &self,
         phase: &'static str,
@@ -48,8 +34,8 @@ impl OperationProgressGuard {
         package_files: Option<PackageFileProgress>,
     ) {
         let step_index = match phase {
-            PACKAGE_STAGE => 2,
-            PACKAGE_COMMIT => 3,
+            PACKAGE_STAGE => 3,
+            PACKAGE_COMMIT => 4,
             _ => 1,
         };
         self.reporter().update_with_files(
@@ -81,9 +67,9 @@ mod tests {
         let guard = OperationProgressGuard::start_with(
             path.clone(),
             proc_root,
-            OperationKind::SetupInstall,
+            OperationKind::ReleaseInstall,
             PACKAGE_VERIFY,
-            3,
+            4,
             DEFAULT_PROGRESS_TTL_MS,
             unix_epoch_ms,
         );
@@ -95,6 +81,7 @@ mod tests {
         guard.update_package(PACKAGE_STAGE, "v1.0.3", Some(files));
         let mut staged = read().expect("staging record");
         assert_eq!(staged.package_files, Some(files));
+        assert_eq!(staged.step_index, 3);
         assert_eq!(files.percent(), 0);
         staged.package_files = Some(PackageFileProgress {
             completed: 5,

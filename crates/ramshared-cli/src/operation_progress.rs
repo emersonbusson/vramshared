@@ -39,6 +39,7 @@ pub(crate) const MIN_PROGRESS_TTL_MS: u64 = 500;
 pub(crate) const MAX_PROGRESS_TTL_MS: u64 = 3_600_000;
 pub(crate) const MAX_FUTURE_SKEW_MS: u64 = 5_000;
 pub(crate) const SWAPOFF_POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const INSTALLER_PROGRESS_FILE: &str = "ramshared-installer-progress.json";
 pub(crate) const SYSTEM_OPERATION_PROGRESS_PATH: &str = "/run/ramshared/operation-progress.json";
 pub(crate) const OPERATION_PROGRESS_PATH_ENV: &str = "RAMSHARED_OPERATION_PROGRESS_PATH";
 pub(crate) const UPDATE_DOWNLOAD_PATH: &str = "/run/ramshared/update-download-progress.json";
@@ -54,6 +55,7 @@ pub(crate) enum OperationKind {
     SwapRebalance,
     CascadeUp,
     SetupInstall,
+    ReleaseInstall,
     ReleaseSync,
     StorageBenchmark,
     StressTest,
@@ -205,8 +207,10 @@ fn validate_record_shape(record: &OperationProgressV1) -> bool {
             .as_ref()
             .is_none_or(|upgrade| record.kind == OperationKind::Teardown && upgrade.valid())
         && record.package_files.is_none_or(|files| {
-            record.kind == OperationKind::SetupInstall
-                && record.phase == PACKAGE_STAGE
+            matches!(
+                record.kind,
+                OperationKind::SetupInstall | OperationKind::ReleaseInstall
+            ) && record.phase == PACKAGE_STAGE
                 && files.total > 0
                 && files.completed <= files.total
         })
@@ -214,15 +218,27 @@ fn validate_record_shape(record: &OperationProgressV1) -> bool {
 
 pub(crate) fn read_live_operation_progress() -> Option<OperationProgressV1> {
     let path = resolve_operation_progress_path();
+    let installer = Path::new("/run").join(INSTALLER_PROGRESS_FILE);
     let proc = Path::new("/proc");
     let now = unix_epoch_ms();
-    read_live_operation_progress_from(&path, proc, now).or_else(|| {
+    read_dashboard_progress(&installer, &path, proc, now).or_else(|| {
         if path == Path::new(SYSTEM_OPERATION_PROGRESS_PATH) {
             read_live_operation_progress_from(Path::new(UPDATE_DOWNLOAD_PATH), proc, now)
         } else {
             None
         }
     })
+}
+
+pub(crate) fn read_dashboard_progress(
+    installer: &Path,
+    general: &Path,
+    proc_root: &Path,
+    now: u64,
+) -> Option<OperationProgressV1> {
+    read_live_operation_progress_from(installer, proc_root, now)
+        .filter(|record| record.kind == OperationKind::ReleaseInstall)
+        .or_else(|| read_live_operation_progress_from(general, proc_root, now))
 }
 
 pub(crate) fn read_live_operation_progress_from(
@@ -335,6 +351,12 @@ impl OperationProgressReporter {
 
     fn attach_upgrade(&self, upgrade: UpgradeDrainProgress) {
         lock_unpoisoned(&self.shared).record.upgrade = Some(upgrade);
+    }
+
+    pub(crate) fn refresh(&self) {
+        let mut state = lock_unpoisoned(&self.shared);
+        state.record.updated_at_unix_ms = (state.now_fn)().max(state.record.started_at_unix_ms);
+        state.publish();
     }
 
     pub(crate) fn update(&self, update: ProgressUpdate<'_>) {

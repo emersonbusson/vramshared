@@ -245,19 +245,17 @@ impl WaitForProgress {
         }
     }
 
-    pub(super) fn observe(
+    pub(super) fn observe<'a>(
         &mut self,
         now: Instant,
         process: StopProcess,
-        record: Option<&OperationProgressV1>,
-    ) {
-        let Some(record) = record.filter(|record| {
+        record: Option<&'a OperationProgressV1>,
+    ) -> Option<&'a OperationProgressV1> {
+        let record = record.filter(|record| {
             record.kind == OperationKind::Teardown
                 && record.owner_pid == process.pid.get()
                 && record.owner_start_ticks == process.start_ticks
-        }) else {
-            return;
-        };
+        })?;
         let point = (record.step_index, record.completed_bytes);
         match self.mark.as_mut() {
             None => self.mark = Some((record.operation_id.clone(), point)),
@@ -265,8 +263,10 @@ impl WaitForProgress {
                 *prior = point;
                 self.last_advance = now;
             }
-            Some(_) => {}
+            Some((id, prior)) if *id == record.operation_id && point == *prior => {}
+            Some(_) => return None,
         }
+        Some(record)
     }
 
     pub(super) fn expired(&self, now: Instant, max: Duration, stall: Duration) -> bool {
