@@ -450,6 +450,41 @@ fn released_zram_reset_uses_the_observed_remaining_device_set() {
 }
 
 #[test]
+fn busy_zram_reset_refuses_when_swap_reappears_during_the_wait() {
+    struct RearmedSwap;
+    impl CommandRunner for RearmedSwap {
+        fn run(&self, _command: &str, _args: &[&str]) -> Result<String, CascadeError> {
+            panic!("device effects must stop when zram reappears in the swap table")
+        }
+
+        fn native_zram_reset_after_swapoff(
+            &self,
+            _path: &Path,
+            revalidate: &mut dyn FnMut() -> Result<(), CascadeError>,
+        ) -> Result<(), CascadeError> {
+            TEST_SWAPS.with(|cell| *cell.borrow_mut() = Some(RECOVERY_SWAPS.into()));
+            let result = revalidate();
+            assert!(result.is_err(), "the retry must be refused");
+            result
+        }
+    }
+
+    let fixture = RecoveryFixture::new();
+    let zram = fixture.binding.devices[1].clone();
+    TEST_SWAPS.with(|cell| *cell.borrow_mut() = Some(FALLBACK_SWAPS.into()));
+    fixture.observations(vec![vec![zram.clone()], vec![zram.clone()]]);
+    let executor = RuntimeNbdLifecycleExecutor::new(
+        &RearmedSwap,
+        &fixture.paths,
+        &fixture.binding,
+        PeerState::Released,
+        None,
+    );
+    assert!(executor.reset_zram(&zram).is_err());
+    fixture.assert_preserved();
+}
+
+#[test]
 fn released_zram_reset_preserves_evidence_when_the_device_remains_live() {
     let fixture = RecoveryFixture::new();
     let zram = fixture.binding.devices[1].clone();

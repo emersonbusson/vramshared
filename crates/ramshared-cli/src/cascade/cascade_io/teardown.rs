@@ -163,6 +163,12 @@ impl<'a, R> RuntimeNbdLifecycleExecutor<'a, R> {
     }
 }
 
+fn prove_zram_reset_target(device: &BoundDeviceIdentity) -> Result<(), CascadeError> {
+    prove_exact_swap_absent(device)?;
+    // The block descriptor must be closed before the sysfs reset can succeed.
+    bind_device_for_effect(device)?.revalidate_named_identity()
+}
+
 impl<R: CommandRunner> NbdLifecycleExecutor for RuntimeNbdLifecycleExecutor<'_, R> {
     fn swapoff(&self, device: &BoundDeviceIdentity) -> Result<(), CascadeError> {
         let step = self.next_step();
@@ -236,15 +242,21 @@ impl<R: CommandRunner> NbdLifecycleExecutor for RuntimeNbdLifecycleExecutor<'_, 
         let swaps = read_swaps()?;
         let live_before = detect_live_managed_devices()?;
         authorize_bound_environment_for(self.binding, self.paths, &swaps, &live_before, self.peer)?;
-        prove_exact_swap_absent(device)?;
-        let pinned = bind_device_for_effect(device)?;
-        pinned.revalidate_named_identity()?;
-        // zramctl does not portably accept a proc-fd target because it derives
-        // the sysfs name from /dev/<name>. The kernel zram driver forbids reset
-        // while any process holds an open file descriptor (returning EBUSY).
-        // Revalidate the exact descriptor first, then close before invoking reset.
-        drop(pinned);
-        self.runner.native_zram_reset(Path::new(&device.path))?;
+        prove_zram_reset_target(device)?;
+        self.runner
+            .native_zram_reset_after_swapoff(Path::new(&device.path), &mut || {
+                let swaps = read_swaps()?;
+                let live_now = detect_live_managed_devices()?;
+                authorize_bound_environment_for(
+                    self.binding,
+                    self.paths,
+                    &swaps,
+                    &live_now,
+                    self.peer,
+                )?;
+                prove_exact_live_device_set(self.binding, &live_now, &live_before)?;
+                prove_zram_reset_target(device)
+            })?;
         let expected_after = live_before
             .iter()
             .filter(|expected| expected.kind != ManagedDeviceKind::Zram)
