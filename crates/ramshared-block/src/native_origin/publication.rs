@@ -29,7 +29,9 @@ pub(super) fn link_anonymous_with_fallback(
     }
 }
 
-fn link_anonymous_inode(
+/// Exclusively publish the held anonymous inode as a leaf in the held parent.
+/// The caller owns validation of both descriptors and the destination name.
+pub fn link_anonymous_inode(
     file: &File,
     parent: &File,
     leaf: &std::ffi::OsStr,

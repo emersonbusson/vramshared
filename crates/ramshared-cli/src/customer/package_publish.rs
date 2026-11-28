@@ -13,9 +13,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{
-    AtFlags, Mode, OFlags, XattrFlags, fchmod, fgetxattr, fsetxattr, linkat, openat, statat,
-};
+use ramshared_block::native_origin::link_anonymous_inode;
+use rustix::fs::{AtFlags, Mode, OFlags, XattrFlags, fchmod, fgetxattr, fsetxattr, openat, statat};
 
 use super::CustomerError;
 use super::package_source::DeclaredBundle;
@@ -370,14 +369,8 @@ fn publish_impl(
     before_link()?;
     revalidate_tree(guard, pending, bundle, tree)?;
     before_effect()?;
-    linkat(
-        &prepared.file,
-        "",
-        &prepared.parent,
-        &prepared.leaf,
-        AtFlags::EMPTY_PATH,
-    )
-    .map_err(|_| recovery_refusal("exclusive publication failed; retain journal"))?;
+    link_anonymous_inode(&prepared.file, &prepared.parent, &prepared.leaf)
+        .map_err(|_| recovery_refusal("exclusive publication failed; retain journal"))?;
     after_link().map_err(|_| recovery_refusal("publication interrupted; retain evidence"))?;
     finish_publication(
         guard,
