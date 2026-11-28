@@ -59,6 +59,7 @@ pub(super) fn publish_at(
         "schema_version": 3,
         "control_state": decision.state,
         "healthy_samples": decision.healthy_samples,
+        "cache_recovery_samples": decision.cache_recovery_samples,
         "action_results": action_results,
         "daemon_instance_id": daemon_instance_id,
         "supervisor_identity": supervisor_identity,

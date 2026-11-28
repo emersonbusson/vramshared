@@ -4,7 +4,7 @@
 // LinkedIn: https://www.linkedin.com/in/emersonbusson
 // Source: https://github.com/emersonbusson/vramshared
 // File: crates/ramshared-wsl2d/src/pressure_recovery.rs
-//! Fresh supervisor evidence for pressure-triggered cache recovery.
+//! Fresh supervisor evidence for bounded cache recovery.
 //! Parsing alone does not establish file or process custody.
 use serde_json::Value;
 
@@ -19,18 +19,34 @@ pub(crate) fn healthy_observation(value: &Value, daemon: &str, now: u64) -> bool
     };
     value.get("schema_version").and_then(Value::as_u64) == Some(3)
         && value.get("daemon_instance_id").and_then(Value::as_str) == Some(daemon)
-        && value.get("control_state").and_then(Value::as_str) == Some("HEALTHY")
-        && value
-            .get("healthy_samples")
-            .and_then(Value::as_u64)
-            .is_some_and(|n| (MIN_HEALTHY_SAMPLES..=u32::MAX as u64).contains(&n))
-        && value
-            .get("action_results")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
         && now
             .checked_sub(timestamp)
             .is_some_and(|age| age <= MAX_AGE_MS)
+        && eligible_recovery(value)
+}
+
+fn eligible_recovery(value: &Value) -> bool {
+    let Some(actions) = value.get("action_results").and_then(Value::as_array) else {
+        return false;
+    };
+    let streak = match value.get("control_state").and_then(Value::as_str) {
+        Some("HEALTHY") if actions.is_empty() => "healthy_samples",
+        Some("GUARDED") if matches!(actions.as_slice(), [close] if confirmed_close(close)) => {
+            "cache_recovery_samples"
+        }
+        _ => return false,
+    };
+    value
+        .get(streak)
+        .and_then(Value::as_u64)
+        .is_some_and(|n| (MIN_HEALTHY_SAMPLES..=u32::MAX as u64).contains(&n))
+}
+
+fn confirmed_close(action: &Value) -> bool {
+    action.as_object().is_some_and(|fields| fields.len() == 3)
+        && action.get("action").and_then(Value::as_str) == Some("close_admission")
+        && action.get("status").and_then(Value::as_str) == Some("succeeded")
+        && action.get("error").is_some_and(Value::is_null)
 }
 
 #[cfg(test)]
@@ -56,6 +72,62 @@ mod tests {
         ));
         assert!(!matching_pinned_observations(
             &first, &first, 43, "42-7", 10000
+        ));
+    }
+
+    #[test]
+    fn guarded_cache_requires_its_own_streak_and_a_closed_workload_gate() {
+        let good = json!({
+            "schema_version":3, "daemon_instance_id":"42-7", "control_state":"GUARDED",
+            "healthy_samples":0, "cache_recovery_samples":3, "written_at_unix_ms":10000,
+            "action_results":[{"action":"close_admission","status":"succeeded","error":null}],
+            "supervisor_identity":{"pid":42,"start_time":10,"boot_id":"boot","nonce":"first"}
+        });
+        assert!(healthy_observation(&good, "42-7", 15000));
+        assert!(matching_pinned_observations(
+            &good, &good, 42, "42-7", 15000
+        ));
+        assert!(!healthy_observation(&good, "42-7", 15001));
+        assert!(!healthy_observation(&good, "42-8", 10000));
+
+        let mut legacy = good.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_recovery_samples");
+        assert!(!healthy_observation(&legacy, "42-7", 10000));
+        for (key, value) in [
+            ("written_at_unix_ms", Value::Null),
+            ("action_results", Value::Null),
+            ("cache_recovery_samples", json!(2)),
+            ("cache_recovery_samples", json!(u64::MAX)),
+            ("control_state", json!("CRITICAL")),
+            ("control_state", json!("EMERGENCY")),
+            ("action_results", json!([])),
+            (
+                "action_results",
+                json!([{"action":"close_admission","status":"failed","error":"busy"}]),
+            ),
+            (
+                "action_results",
+                json!([{"action":"close_admission","status":"succeeded"}]),
+            ),
+        ] {
+            let mut refused = good.clone();
+            refused[key] = value;
+            assert!(
+                !healthy_observation(&refused, "42-7", 10000),
+                "{key}: {refused}"
+            );
+            assert!(!matching_pinned_observations(
+                &good, &refused, 42, "42-7", 10000
+            ));
+        }
+
+        let mut replaced = good.clone();
+        replaced["supervisor_identity"]["nonce"] = json!("replaced");
+        assert!(!matching_pinned_observations(
+            &good, &replaced, 42, "42-7", 10000
         ));
     }
 
@@ -244,18 +316,17 @@ pub(crate) fn pin_healthy_supervisor(
     daemon: &str,
     now: u64,
 ) -> Option<std::os::fd::OwnedFd> {
-    use rustix::process::{Pid, PidfdFlags, pidfd_open};
     pin_verified_with(
         || verified_healthy_supervisor(path, daemon, now),
-        |pid| {
-            pidfd_open(
-                Pid::from_raw(i32::try_from(pid).ok()?)?,
-                PidfdFlags::empty(),
-            )
-            .ok()
-        },
+        open_supervisor_pidfd,
         pidfd_alive,
     )
+}
+
+fn open_supervisor_pidfd(pid: u64) -> Option<std::os::fd::OwnedFd> {
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+    let pid = Pid::from_raw(i32::try_from(pid).ok()?)?;
+    pidfd_open(pid, PidfdFlags::empty()).ok()
 }
 
 fn pin_verified_with(
@@ -294,15 +365,15 @@ pub(crate) fn pidfd_alive(pinned: &std::os::fd::OwnedFd) -> bool {
 mod pidfd_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use rustix::process::{Pid, PidfdFlags, pidfd_open};
     #[test]
     fn held_pidfd_detects_owned_child_exit() {
+        assert!(open_supervisor_pidfd(0).is_none());
+        assert!(open_supervisor_pidfd(u64::MAX).is_none());
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .unwrap();
-        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-        let fd = pidfd_open(pid, PidfdFlags::empty()).unwrap();
+        let fd = open_supervisor_pidfd(u64::from(child.id())).unwrap();
         assert!(pidfd_alive(&fd));
         child.kill().unwrap();
         child.wait().unwrap();
@@ -447,6 +518,11 @@ mod verifier_fixture_tests {
         };
         let verify = || verified_healthy_supervisor_with(&document, "42-7", 10000, &paths);
         assert!(verify().is_some());
+        let wrong_owner = SupervisorPaths {
+            owner_uid: paths.owner_uid ^ 1,
+            ..paths
+        };
+        assert!(verified_healthy_supervisor_with(&document, "42-7", 10000, &wrong_owner).is_none());
         let saved_boot = root.join("saved-boot");
         std::fs::rename(&boot, &saved_boot).unwrap();
         assert!(verify().is_none());

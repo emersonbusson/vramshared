@@ -8,6 +8,7 @@
 
 pub(crate) const GUARDED_PSI_FULL_AVG10_PERCENT: f64 = 2.0;
 pub(crate) const RECOVERY_MARGIN_BYTES: u64 = 1024 * 1024 * 1024;
+pub(super) const CACHE_RECOVERY_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 const MIN_CONTROL_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Return the control reserve using the same byte-precise rounding as admission.

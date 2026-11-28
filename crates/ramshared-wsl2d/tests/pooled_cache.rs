@@ -353,10 +353,11 @@ fn pooled_boot_retains_origin_when_host_is_absent_and_refuses_aliased_swap() {
 
     wire_client.close_poisoned(4);
     assert!(wire_client.is_closed());
+    assert!(wire_client.is_transport_closed());
     assert!(!wire_client.offer_copy(4, 0, 1, &page, crc32c(&page)));
     assert_eq!(
         wire_client.lookup_into(4, 0, 1, 10, deadline, &mut dst),
-        PooledLookupReply::TimedOut
+        PooledLookupReply::TransportError
     );
 
     active.retire_to_origin_only("peer_closed");

@@ -55,6 +55,7 @@ fn runtime_cycle_and_apply_error_paths_preserve_state_and_report_failures() {
         state: SupervisorState::Healthy,
         actions: Vec::new(),
         healthy_samples: 1,
+        cache_recovery_samples: 0,
     };
     let paths = ActionPaths {
         runtime: &runtime,
@@ -135,6 +136,7 @@ fn runtime_cycle_and_apply_error_paths_preserve_state_and_report_failures() {
                 SupervisorAction::RequestReclaim,
             ],
             healthy_samples: 0,
+            cache_recovery_samples: 0,
         },
         &no_ts_paths,
         &runner,
@@ -148,4 +150,40 @@ fn runtime_cycle_and_apply_error_paths_preserve_state_and_report_failures() {
     assert!(query_unit_invocation_id("not-a-valid-unit").is_err());
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cache_recovery_observes_headroom_before_workload_reopening() {
+    let reserve = 4 * GIB;
+    let mut supervisor = Supervisor::default();
+    let mut sample = PressureSample {
+        memory_available_bytes: reserve - 1,
+        control_reserve_bytes: reserve,
+        psi_full_avg10: 0.2,
+        sample_delay_ms: 0,
+        elapsed_ms: 1000,
+    };
+    let guarded = supervisor.observe(sample);
+    assert_eq!(guarded.state, SupervisorState::Guarded);
+    assert_eq!(guarded.cache_recovery_samples, 0);
+
+    sample.memory_available_bytes = reserve + memory_policy::CACHE_RECOVERY_MARGIN_BYTES - 1;
+    assert_eq!(supervisor.observe(sample).cache_recovery_samples, 0);
+    sample.memory_available_bytes += 1;
+    for expected in 1..=3 {
+        let decision = supervisor.observe(sample);
+        assert_eq!(decision.cache_recovery_samples, expected);
+        assert_eq!(decision.state, SupervisorState::Guarded);
+        assert_eq!(decision.actions, vec![SupervisorAction::CloseAdmission]);
+        assert_eq!(decision.healthy_samples, 0);
+    }
+
+    sample.psi_full_avg10 = 1.0;
+    assert_eq!(supervisor.observe(sample).cache_recovery_samples, 0);
+    sample.psi_full_avg10 = 0.2;
+    assert_eq!(supervisor.observe(sample).cache_recovery_samples, 1);
+    sample.sample_delay_ms = 3000;
+    let emergency = supervisor.observe(sample);
+    assert_eq!(emergency.state, SupervisorState::Emergency);
+    assert_eq!(emergency.cache_recovery_samples, 0);
 }

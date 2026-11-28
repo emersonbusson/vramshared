@@ -322,7 +322,11 @@ fn draw_gpu(
             fmt_bytes(gpu.vram_reserve_enforced_mib.saturating_mul(MIB), language)
         )));
     } else {
-        lines.push(Line::from(format!(" {}: {}", text.gpu, text.unavailable)));
+        lines.push(Line::from(pick(
+            language,
+            " Worker VRAM budget: not measured",
+            " Orçamento de VRAM do worker: não medido",
+        )));
     }
     lines.push(Line::from(busy_line));
     if let Some(gpu) = observation.gpu.as_ref()
