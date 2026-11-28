@@ -372,6 +372,49 @@ fn seamless_auto_update_defers_with_zero_mutations_when_drain_is_unsafe() {
 }
 
 #[test]
+fn installed_update_submits_stop_only_for_an_admitted_drain_route() {
+    let units = FakeUnits {
+        states: BTreeMap::new(),
+    };
+    let boot = FakeBoot {
+        enabled: BTreeMap::new(),
+    };
+    for (safe, reason) in [
+        (false, "host_memory_unverified"),
+        (true, "ssd_absorber_available"),
+    ] {
+        let mut host = FakeLifecycle {
+            live: LiveRuntimeState {
+                cascade_active: true,
+                supervisor_active: true,
+                host_gate_active: false,
+                health_active: true,
+                health_enabled: true,
+                boot_enrolled: true,
+                active_managed_swap: true,
+            },
+            drain: Some(DrainSafetyVerdict {
+                safe,
+                reason: reason.into(),
+            }),
+            ..Default::default()
+        };
+        let outcome = prepare_seamless_auto_update(&units, &boot, &mut host).unwrap();
+        if safe {
+            assert!(matches!(outcome, PrepareUpgradeOutcome::Ready(_)));
+            assert_eq!(
+                host.events.first().unwrap(),
+                &format!("stop:{CASCADE_UNIT}")
+            );
+            assert_eq!(host.events.get(1).map(String::as_str), Some("down"));
+        } else {
+            assert_eq!(outcome, PrepareUpgradeOutcome::Deferred(reason.into()));
+            assert!(host.events.is_empty());
+        }
+    }
+}
+
+#[test]
 fn seamless_auto_update_drains_quiesces_and_reactivates_on_success() {
     let units = FakeUnits {
         states: BTreeMap::new(),

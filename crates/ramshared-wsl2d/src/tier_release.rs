@@ -16,8 +16,8 @@ pub use observation::{
     register_routine_host_storage,
 };
 use observation::{
-    has_routine_host_storage, observed_routine_host_memory, observed_routine_host_storage_free,
-    parse_drain_absorbers, parse_swap_rows, read_proc,
+    drain_absorbers, has_routine_host_storage, observe_drain, observed_routine_host_memory,
+    observed_routine_host_storage_free, parse_drain_absorbers, parse_swap_rows, read_proc,
 };
 
 use ramshared_block::swap_absorber::SwapAbsorber;
@@ -25,20 +25,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-fn drain_absorbers(
-    device: &str,
-    absorber: Option<&SwapAbsorber>,
-    io: &mut impl ReleaseIo,
-) -> Option<ramshared_tier::DrainDecision> {
-    let wsl_host = io.wsl_host_memory();
-    parse_drain_absorbers(
-        &io.read_proc("/proc/meminfo")?,
-        &io.read_proc("/proc/swaps")?,
-        device,
-    )?
-    .decision_with_host(absorber, wsl_host)
-}
 
 /// Free bytes on `root`'s filesystem (best-effort; `0` on any error).
 fn free_bytes(root: &std::path::Path) -> u64 {
@@ -587,18 +573,23 @@ fn release_managed_tier_with(
         eprintln!("[ramsharedd] tier release refused: host memory is unverified");
         return ReleaseOutcome::Refused;
     }
-    let Some(decision) = drain_absorbers(device, None, io) else {
+    let wsl_host = io.wsl_host_memory();
+    let Some(observed) = observe_drain(device, io) else {
         eprintln!("[ramsharedd] tier release refused: memory or exact target is unobserved");
+        return ReleaseOutcome::Refused;
+    };
+    let Some(decision) = observed.decision_with_host(None, wsl_host) else {
+        eprintln!("[ramsharedd] tier release refused: memory bounds are invalid");
         return ReleaseOutcome::Refused;
     };
     let emergency = if decision.is_safe() {
         None
     } else {
-        if !decision.absorber_can_help() {
+        let Some(shortfall) = observed.required_emergency_bytes(wsl_host) else {
             eprintln!("[ramsharedd] tier release refused: {}", decision.reason);
             return ReleaseOutcome::Refused;
-        }
-        let Some(backing) = create_emergency_swap(decision.deficit_bytes, deadline, io) else {
+        };
+        let Some(backing) = create_emergency_swap(shortfall, deadline, io) else {
             return ReleaseOutcome::Refused;
         };
         if !drain_absorbers(device, Some(&backing), io).is_some_and(|decision| decision.is_safe()) {

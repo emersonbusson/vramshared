@@ -31,6 +31,8 @@ const FULL_ACTIVATE_ORDER: [&str; 4] = [HEALTH_UNIT, HOST_GATE_UNIT, SUPERVISOR_
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DrainSafetyVerdict {
+    /// Whether owned stop preparation can be attempted. Teardown checks
+    /// live memory and any required absorber before swapoff.
     pub(super) safe: bool,
     pub(super) reason: String,
 }

@@ -151,6 +151,41 @@ fn candidate_roots_start_at_root_and_skip_mnt_c() {
 }
 
 #[test]
+fn emergency_preflight_refuses_unverified_or_short_storage_without_effects() {
+    let root = temp_root("observational");
+    let roots = std::slice::from_ref(&root);
+    let good_filesystem = |path: &Path| SwapAbsorber::check_directory_filesystem(path).is_ok();
+    let shortfall = 512 * MIB;
+    let minimum = RESERVE + shortfall + MIB;
+    assert!(provisioning_path_exists(
+        shortfall,
+        roots,
+        good_filesystem,
+        |_| Some(minimum)
+    ));
+    assert!(!provisioning_path_exists(
+        shortfall,
+        roots,
+        good_filesystem,
+        |_| Some(minimum - 1)
+    ));
+    assert!(!provisioning_path_exists(
+        shortfall,
+        roots,
+        good_filesystem,
+        |_| None
+    ));
+    assert!(!provisioning_path_exists(
+        shortfall,
+        &[PathBuf::from("/dev/shm")],
+        good_filesystem,
+        |_| panic!("capacity is irrelevant on a refused filesystem"),
+    ));
+    assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+    cleanup(&root);
+}
+
+#[test]
 fn create_skips_an_unwritable_root_and_uses_the_next() {
     let missing = std::env::temp_dir().join(format!(
         "ramshared-emergency-missing-{}-{}",
@@ -717,6 +752,7 @@ fn create_for_platform_dispatches_native_wsl2_and_refuses_unknown() {
         std::slice::from_ref(&native_root),
         &|_| Some(4 * GIB),
         match_obs,
+        &|_| Ok(()),
     );
     let native_ok = native_swap.is_some();
     drop(native_swap);
@@ -758,6 +794,7 @@ fn create_for_platform_dispatches_native_wsl2_and_refuses_unknown() {
             std::slice::from_ref(&dir),
             &|_| Some(50 * GIB),
             match_obs,
+            &|_| Ok(()),
         )
         .is_none()
     );
@@ -773,6 +810,7 @@ fn create_for_platform_dispatches_native_wsl2_and_refuses_unknown() {
             std::slice::from_ref(&dir),
             &|_| Some(50 * GIB),
             match_obs,
+            &|_| Ok(()),
         )
         .is_none()
     );
@@ -788,6 +826,7 @@ fn create_for_platform_dispatches_native_wsl2_and_refuses_unknown() {
         std::slice::from_ref(&dir),
         &|_| Some(50 * GIB),
         match_obs,
+        &|_| Ok(()),
     )
     .expect("wsl2 create under bounded host storage");
     assert!(native_ok);
@@ -795,3 +834,156 @@ fn create_for_platform_dispatches_native_wsl2_and_refuses_unknown() {
     drop(wsl_swap);
     cleanup(&dir);
 }
+
+#[test]
+fn retained_swap_record_precedes_activation_and_preserves_uncertain_backing() {
+    let root = temp_root("journal-order");
+    let paths = RuntimePaths::under(&root);
+    std::fs::create_dir(&paths.runtime_dir).unwrap();
+    let store = AbsorberRecordStore::open(&paths).unwrap();
+    {
+        let runner = FakeRunner::default();
+        assert!(
+            create_in_before_activation(
+                &runner,
+                MIB,
+                std::slice::from_ref(&root),
+                &|_| Some(100 * MIB),
+                &|_| Err(std::io::Error::other("injected record publication failure")),
+            )
+            .is_none()
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("swapon "))
+        );
+    }
+    let second = root.join("second");
+    std::fs::create_dir(&second).unwrap();
+    let runner = FakeRunner::failing("swapon");
+    assert!(
+        create_in_before_activation(&runner, MIB, &[second], &|_| Some(100 * MIB), &|backing| {
+            assert!(runner.calls().last().unwrap().starts_with("mkswap "));
+            assert!(store.load().unwrap().is_none());
+            backing.file().set_len(4 * MIB)?;
+            store.publish(backing)?;
+            assert!(store.load()?.is_some());
+            Ok(())
+        },)
+        .is_none()
+    );
+    assert!(runner.calls().last().unwrap().starts_with("swapon "));
+    let held = store.load().unwrap().unwrap();
+    let path = held.record.backing.path();
+    assert!(path.is_file());
+    assert!(retained(&paths, &[], true).is_err());
+    assert!(store.load().unwrap().is_some());
+    assert!(path.is_file());
+    let row = SwapEntry {
+        filename: path.to_str().unwrap().into(),
+        size_kb: 4096,
+        used_kb: 1024,
+        priority: 0,
+    };
+    let adoption = retained(&paths, std::slice::from_ref(&row), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(adoption.free_bytes(&[row]).unwrap(), 3 * MIB);
+    assert!(runner.calls().last().unwrap().starts_with("swapon "));
+    cleanup(&root);
+}
+
+#[test]
+fn retained_swap_record_replays_only_after_active_evidence_and_exact_absence() {
+    use crate::cascade::TEST_SWAPS_SEQUENCE;
+
+    let root = temp_root("journal-retry");
+    let paths = RuntimePaths::under(&root);
+    std::fs::create_dir(&paths.runtime_dir).unwrap();
+    let store = AbsorberRecordStore::open(&paths).unwrap();
+    let original = owned_fixture(root.join("retained.swap"), 4 * MIB);
+    let path = original.path.clone();
+    store.publish(original.backing()).unwrap();
+    let other = owned_fixture(root.join("other.swap"), 4 * MIB);
+    assert!(store.publish(other.backing()).is_err());
+    assert!(store.mark_active_observed(other.backing()).is_err());
+    assert!(retained(&paths, &[], false).is_err());
+
+    let rows = [SwapEntry {
+        filename: path.to_str().unwrap().into(),
+        size_kb: 4096,
+        used_kb: 512,
+        priority: 0,
+    }];
+    let resumed = retained(&paths, &rows, false).unwrap().unwrap();
+    resumed.record_active_observation(&paths).unwrap();
+    resumed.record_active_observation(&paths).unwrap();
+    drop(resumed);
+    drop(original);
+    assert!(retained(&paths, &[], false).unwrap().is_none());
+    assert!(path.is_file());
+
+    let header = "Filename Type Size Used Priority\n";
+    let reactivated = format!("{header}{} file 4096 512 0\n", path.display());
+    TEST_SWAPS_SEQUENCE.with(|queue| queue.borrow_mut().push_back(Ok(reactivated)));
+    assert!(retained(&paths, &[], true).is_err());
+    assert!(path.is_file());
+
+    TEST_SWAPS_SEQUENCE.with(|queue| queue.borrow_mut().push_back(Ok(header.into())));
+    assert!(retained(&paths, &[], true).unwrap().is_none());
+    assert!(!path.exists());
+    assert!(other.path.exists());
+    assert!(store.load().unwrap().is_none());
+    assert!(retained(&paths, &[], true).unwrap().is_none());
+
+    // Simulate the previous process exiting after unlink and before record clear.
+    store.publish(other.backing()).unwrap();
+    store.mark_active_observed(other.backing()).unwrap();
+    other.backing().remove_inactive(|| true).unwrap();
+    assert!(retained(&paths, &[], false).unwrap().is_none());
+    assert!(store.load().unwrap().is_some());
+    TEST_SWAPS_SEQUENCE.with(|queue| queue.borrow_mut().push_back(Ok(header.into())));
+    assert!(retained(&paths, &[], true).unwrap().is_none());
+    assert!(store.load().unwrap().is_none());
+    cleanup(&root);
+}
+
+#[test]
+fn retained_swap_record_refuses_a_stale_boot_or_replaced_journal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root("journal-stale");
+    let paths = RuntimePaths::under(&root);
+    std::fs::create_dir(&paths.runtime_dir).unwrap();
+    let store = AbsorberRecordStore::open(&paths).unwrap();
+    let swap = owned_fixture(root.join("occupied.swap"), 4 * MIB);
+    store.publish(swap.backing()).unwrap();
+    let record = paths.runtime_dir.join("emergency-absorber.json");
+    let old = std::fs::read(&record).unwrap();
+    store.mark_active_observed(swap.backing()).unwrap();
+    let held = store.load().unwrap().unwrap();
+    let old_name = record.with_extension("previous");
+    std::fs::rename(&record, &old_name).unwrap();
+    std::fs::copy(&old_name, &record).unwrap();
+    assert!(held.clear(&store).is_err());
+    assert!(record.is_file());
+    let mut json: serde_json::Value = serde_json::from_slice(&old).unwrap();
+    json["boot_id"] = "00000000-0000-0000-0000-000000000000".into();
+    std::fs::write(&record, serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(store.load().is_err());
+    std::fs::write(&record, old).unwrap();
+    assert!(store.load().unwrap().is_some());
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o660)).unwrap();
+    assert!(store.load().is_err());
+    let moved = record.with_extension("moved");
+    std::fs::rename(&record, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &record).unwrap();
+    assert!(store.load().is_err());
+    assert!(swap.path.exists());
+    cleanup(&root);
+}
+
+#[path = "emergency_swap_tests/prior_boot_absence.rs"]
+mod prior_boot_absence;

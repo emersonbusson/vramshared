@@ -9,6 +9,44 @@
 use super::*;
 
 #[test]
+fn down_plan_distinguishes_direct_assisted_and_blocked_routes() {
+    let mut sample = super::super::HeadroomSample {
+        budget: ramshared_tier::DrainBudget {
+            total_bytes: 16 * GIB,
+            available_bytes: 9 * GIB,
+            managed_bytes: 4 * GIB,
+            emergency_bytes: 0,
+        },
+        remaining_free_bytes: 10 * GIB,
+        guest_free_bytes: None,
+        platform: Some(ramshared_block::platform::PlatformKind::NativeLinux),
+        has_swapoff: true,
+        host: None,
+    };
+    let direct = sample.preview(|_| panic!("direct drain must not probe SSD capacity"));
+    assert!(direct.is_safe());
+    assert_eq!(direct.absorber_required_bytes, None);
+    assert_eq!(update_drain_admission(direct), (true, "safe".into()));
+    sample.budget.available_bytes = 3 * GIB;
+    let preview = sample.preview(|needed| needed > 0 && needed < 4 * GIB);
+    let needed = preview.absorber_required_bytes.unwrap();
+    assert!(!preview.is_safe(), "preview must not grant direct swapoff");
+    assert!(sample.decide(needed).is_safe());
+    assert!(!sample.decide(needed - 1).is_safe());
+    let rendered: serde_json::Value =
+        serde_json::from_str(&render_plan(&preview, true).unwrap()).unwrap();
+    assert_eq!(rendered["absorber_required_bytes"], needed);
+    assert_eq!(
+        update_drain_admission(preview),
+        (true, "ssd_absorber_available".into())
+    );
+    assert!(!update_drain_admission(sample.preview(|_| false)).0);
+    sample.platform = Some(ramshared_block::platform::PlatformKind::Wsl2);
+    let blocked = sample.preview(|_| panic!("missing host evidence must not probe SSD capacity"));
+    assert!(!update_drain_admission(blocked).0);
+}
+
+#[test]
 fn stale_recovery_preserves_record_if_origin_reappears() {
     let root = std::env::temp_dir().join(format!(
         "ramshared-reappeared-origin-{}",
@@ -157,6 +195,151 @@ fn live_wsl_headroom_rejects_a_swapoff_plan_without_mutation() {
         assert!(!decision.is_safe());
         assert_eq!(decision.reason, "host_memory_unverified");
     }
+}
+
+#[test]
+fn emergency_cleanup_revalidates_native_peer_without_windows_memory() {
+    use super::super::emergency_cleanup::{
+        authorize_peer_for_cleanup, retire_emergency_swap_with_budget,
+    };
+    use crate::cascade::cascade_io::absorber_record::AbsorberRecordStore;
+    use crate::cascade::cascade_io::emergency_swap::create_in;
+
+    #[derive(Default)]
+    struct AbsorberRunner(RefCell<Vec<String>>);
+
+    impl CommandRunner for AbsorberRunner {
+        fn run(&self, command: &str, args: &[&str]) -> Result<String, CascadeError> {
+            if command == "fallocate" {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(args[2])
+                    .unwrap()
+                    .set_len(args[1].parse().unwrap())
+                    .unwrap();
+            }
+            if command == "swapoff" {
+                TEST_SWAPS.with(|cell| *cell.borrow_mut() = Some(FALLBACK_SWAPS.into()));
+            }
+            self.0.borrow_mut().push(command.to_owned());
+            Ok(String::new())
+        }
+    }
+
+    let fixture = RecoveryFixture::new();
+    let paths = &fixture.paths;
+    let mut binding = fixture.binding.clone();
+    binding.daemon_pid = std::process::id();
+    binding.daemon_instance_id = daemon_instance_id_from_pid(binding.daemon_pid).unwrap();
+    let status = serde_json::json!({
+        "schema_version": 1,
+        "daemon_instance_id": binding.daemon_instance_id,
+        "written_at_unix_ms": unix_time_ms().unwrap(),
+        "ok": true,
+        "origin_state": "READY",
+        "cache_state": "OFF",
+        "logical_capacity_kib": 4096,
+        "ssd_origin_written_kib": 0,
+        "cache_fallback_reads": 0,
+        "cache_invalidations": 0,
+        "cache_releases": 0,
+        "cache_target_kib": 0,
+        "gpu_headroom_kib": null,
+        "vram_cached_kib": null
+    });
+    let evidence = serde_json::to_vec(&status).unwrap();
+    fs::write(&paths.cache_status_file, &evidence).unwrap();
+
+    assert!(matches!(
+        authorize_peer_for_cleanup(paths, &binding),
+        Ok(None)
+    ));
+
+    let runner = AbsorberRunner::default();
+    let absorber = create_in(
+        &runner,
+        1024 * 1024,
+        std::slice::from_ref(&fixture.root),
+        &|_| Some(GIB),
+    )
+    .unwrap();
+    assert_eq!(*runner.0.borrow(), ["fallocate", "mkswap", "swapon"]);
+    runner.0.borrow_mut().clear();
+    TEST_SWAPS.with(|cell| {
+        *cell.borrow_mut() = Some(format!(
+            "{FALLBACK_SWAPS}{} file 1024 1 0\n",
+            absorber.path.display()
+        ));
+    });
+    assert_eq!(
+        absorber.free_bytes(&read_swaps().unwrap()).unwrap(),
+        1023 * 1024
+    );
+    let active_swaps = TEST_SWAPS.with(|cell| cell.borrow().clone());
+    let original_backing = fs::metadata(&absorber.path).unwrap();
+    use std::os::unix::fs::MetadataExt;
+
+    let mut stale_boot = binding.clone();
+    stale_boot.boot_id = "00000000-0000-0000-0000-000000000000".into();
+    let mut replaced_socket = binding.clone();
+    replaced_socket.export_socket.inode ^= 1;
+    for (invalid, expected) in [
+        (&stale_boot, "boot identity"),
+        (&fixture.binding, "not running"),
+        (&replaced_socket, "export socket"),
+    ] {
+        for _ in 0..2 {
+            let error = authorize_peer_for_cleanup(paths, invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            retire_emergency_swap(&runner, paths, invalid, &absorber);
+            assert!(runner.0.borrow().is_empty());
+            let retained = fs::metadata(&absorber.path).unwrap();
+            assert_eq!(retained.ino(), original_backing.ino());
+            assert_eq!(retained.len(), original_backing.len());
+        }
+    }
+    TEST_SWAPS.with(|cell| *cell.borrow_mut() = Some(FALLBACK_SWAPS.into()));
+    retire_emergency_swap(&runner, paths, &binding, &absorber);
+    assert!(runner.0.borrow().is_empty());
+    assert!(absorber.path.exists());
+
+    TEST_SWAPS.with(|cell| *cell.borrow_mut() = active_swaps);
+    let budget = |targets: &[String], entries: &[SwapEntry], host| {
+        let actual_path = absorber.path.to_str().unwrap();
+        assert_eq!(
+            targets,
+            [crate::cascade::canonicalize_swap_path(actual_path)]
+        );
+        let (managed_bytes, remaining_free_bytes) =
+            swapoff_headroom::summarize_swaps(targets, &swap_amounts(entries));
+        assert_eq!(managed_bytes, 1024);
+        assert!(Option::<ramshared_tier::HostDrainMemory>::is_none(&host));
+        swapoff_headroom::evaluate(
+            managed_bytes,
+            remaining_free_bytes,
+            MemInfo {
+                total_bytes: 16 * GIB,
+                available_bytes: 8 * GIB,
+            },
+        )
+        .is_safe()
+    };
+    retire_emergency_swap_with_budget(&runner, paths, &binding, &absorber, budget);
+    assert!(runner.0.borrow().is_empty());
+    assert!(absorber.path.exists());
+
+    let store = AbsorberRecordStore::open(paths).unwrap();
+    store.publish(absorber.backing()).unwrap();
+    retire_emergency_swap_with_budget(&runner, paths, &binding, &absorber, budget);
+    assert_eq!(*runner.0.borrow(), ["swapoff"]);
+    assert!(!absorber.path.exists());
+    assert!(store.load().unwrap().is_none());
+
+    assert_eq!(fs::read(&paths.cache_status_file).unwrap(), evidence);
+    assert_eq!(
+        socket_identity(&paths.socket).unwrap(),
+        binding.export_socket
+    );
 }
 
 #[test]
@@ -576,6 +759,7 @@ fn attended_down_plan_reports_zero_absorber() {
         deficit_bytes: 320_908_493,
         verdict: HeadroomVerdict::Blocked,
         reason: "managed_swap_exceeds_headroom",
+        absorber_required_bytes: None,
     };
     let json = render_plan(&decision, true).expect("json plan");
     assert!(json.contains("\"emergency_bytes\":0"), "{json}");
@@ -596,6 +780,7 @@ fn plan_decision_renders_json_and_text_without_a_live_host() {
         deficit_bytes: 320_908_493,
         verdict: HeadroomVerdict::Blocked,
         reason: "managed_swap_exceeds_headroom",
+        absorber_required_bytes: None,
     };
     let json = render_plan(&decision, true).expect("json plan");
     assert!(json.contains("\"verdict\":\"blocked\""), "{json}");

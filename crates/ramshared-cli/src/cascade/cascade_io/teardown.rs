@@ -13,8 +13,10 @@
 //! runs. A step that cannot be proven complete leaves the ownership records
 //! in place rather than declaring the device free.
 
-use super::emergency_swap::{EmergencySwap, create as create_emergency_swap};
-use super::swapoff_headroom::{self, HeadroomDecision, SwapAmount};
+use super::emergency_swap::{
+    EmergencySwap, can_provision, create as create_emergency_swap, retained,
+};
+use super::swapoff_headroom::{self, HeadroomDecision, HeadroomSample, SwapAmount};
 use super::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,6 +163,12 @@ impl<'a, R> RuntimeNbdLifecycleExecutor<'a, R> {
     }
 }
 
+fn prove_zram_reset_target(device: &BoundDeviceIdentity) -> Result<(), CascadeError> {
+    prove_exact_swap_absent(device)?;
+    // The block descriptor must be closed before the sysfs reset can succeed.
+    bind_device_for_effect(device)?.revalidate_named_identity()
+}
+
 impl<R: CommandRunner> NbdLifecycleExecutor for RuntimeNbdLifecycleExecutor<'_, R> {
     fn swapoff(&self, device: &BoundDeviceIdentity) -> Result<(), CascadeError> {
         let step = self.next_step();
@@ -234,15 +242,21 @@ impl<R: CommandRunner> NbdLifecycleExecutor for RuntimeNbdLifecycleExecutor<'_, 
         let swaps = read_swaps()?;
         let live_before = detect_live_managed_devices()?;
         authorize_bound_environment_for(self.binding, self.paths, &swaps, &live_before, self.peer)?;
-        prove_exact_swap_absent(device)?;
-        let pinned = bind_device_for_effect(device)?;
-        pinned.revalidate_named_identity()?;
-        // zramctl does not portably accept a proc-fd target because it derives
-        // the sysfs name from /dev/<name>. The kernel zram driver forbids reset
-        // while any process holds an open file descriptor (returning EBUSY).
-        // Revalidate the exact descriptor first, then close before invoking reset.
-        drop(pinned);
-        self.runner.native_zram_reset(Path::new(&device.path))?;
+        prove_zram_reset_target(device)?;
+        self.runner
+            .native_zram_reset_after_swapoff(Path::new(&device.path), &mut || {
+                let swaps = read_swaps()?;
+                let live_now = detect_live_managed_devices()?;
+                authorize_bound_environment_for(
+                    self.binding,
+                    self.paths,
+                    &swaps,
+                    &live_now,
+                    self.peer,
+                )?;
+                prove_exact_live_device_set(self.binding, &live_now, &live_before)?;
+                prove_zram_reset_target(device)
+            })?;
         let expected_after = live_before
             .iter()
             .filter(|expected| expected.kind != ManagedDeviceKind::Zram)
@@ -333,6 +347,9 @@ impl<R: CommandRunner> NbdLifecycleExecutor for RuntimeNbdLifecycleExecutor<'_, 
             return Ok(());
         }
         prove_exact_live_device_set(self.binding, &live, &[])?;
+        if let Some(swap) = self.emergency {
+            retire_emergency_swap(self.runner, self.paths, self.binding, swap);
+        }
         stop_daemon_gracefully_at(self.paths, Duration::from_secs(10))
     }
 }
@@ -395,20 +412,31 @@ fn headroom_for_targets(
     emergency_bytes: u64,
     host: Option<ramshared_tier::HostDrainMemory>,
 ) -> Result<HeadroomDecision, CascadeError> {
+    Ok(sample_headroom(planned, swaps, host)?.decide(emergency_bytes))
+}
+
+fn sample_headroom(
+    planned: &[String],
+    swaps: &[SwapEntry],
+    host: Option<ramshared_tier::HostDrainMemory>,
+) -> Result<HeadroomSample, CascadeError> {
     let (mem, free_bytes) = swapoff_headroom::read_meminfo_with_free().map_err(|reason| {
         CascadeError::Precondition(format!("swapoff headroom unavailable: {reason}"))
     })?;
     let (managed, remaining) = swapoff_headroom::summarize_swaps(planned, &swap_amounts(swaps));
-    Ok(swapoff_headroom::evaluate_for_platform(
-        managed,
-        remaining,
-        emergency_bytes,
-        mem,
-        free_bytes,
-        swapoff_headroom::observed_platform(),
-        !planned.is_empty(),
+    Ok(HeadroomSample {
+        budget: ramshared_tier::DrainBudget {
+            total_bytes: mem.total_bytes,
+            available_bytes: mem.available_bytes,
+            managed_bytes: managed,
+            emergency_bytes: 0,
+        },
+        remaining_free_bytes: remaining,
+        guest_free_bytes: free_bytes,
+        platform: swapoff_headroom::observed_platform(),
+        has_swapoff: !planned.is_empty(),
         host,
-    ))
+    })
 }
 
 fn headroom_for_plan(
@@ -486,18 +514,25 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
         plan.actions.len().max(1) as u32,
     );
     let mut swaps = current_entries;
-    let mut emergency: Option<EmergencySwap> = None;
-    let mut headroom = headroom_for_plan_with_absorber_and_host(
-        &plan,
+    let mut emergency = retained(paths, &swaps, true)?;
+    let observation = sample_headroom(
+        &planned_swapoff_paths(&plan),
         &swaps,
-        0,
         live_host_memory(paths, &binding, PeerState::Live),
     )?;
+    let retained_credit = emergency
+        .as_ref()
+        .map(|swap| swap.free_bytes(&swaps))
+        .transpose()?
+        .unwrap_or(0);
+    let mut headroom = observation.decide(retained_credit);
     if !headroom.is_safe() {
-        if !headroom.absorber_can_help() {
+        if emergency.is_some() {
             return Err(CascadeError::Precondition(headroom.refusal_message()));
         }
-        let shortfall = headroom.deficit_bytes;
+        let Some(shortfall) = observation.required_absorber_bytes() else {
+            return Err(CascadeError::Precondition(headroom.refusal_message()));
+        };
         eprintln!(
             "[down] swapoff headroom: BLOCKED deficit={} B; creating a transient emergency swap",
             shortfall
@@ -510,7 +545,7 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
             total_bytes: 0,
             throughput_mib_per_s: None,
         });
-        let Some(created) = create_emergency_swap(runner, shortfall) else {
+        let Some(created) = create_emergency_swap(runner, paths, shortfall) else {
             return Err(CascadeError::Precondition(headroom.refusal_message()));
         };
         emergency = Some(created);
@@ -518,16 +553,24 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
             Ok(swaps) => swaps,
             Err(error) => {
                 if let Some(swap) = emergency.take() {
-                    swap.remove(runner);
+                    retire_emergency_swap(runner, paths, &binding, &swap);
                 }
                 return Err(error);
             }
         };
-        let absorber = emergency
+        let absorber = match emergency
             .as_ref()
             .map(|swap| swap.free_bytes(&swaps))
-            .transpose()?
-            .unwrap_or(0);
+            .transpose()
+        {
+            Ok(available) => available.unwrap_or(0),
+            Err(error) => {
+                if let Some(swap) = emergency.take() {
+                    retire_emergency_swap(runner, paths, &binding, &swap);
+                }
+                return Err(error);
+            }
+        };
         headroom = match headroom_for_plan_with_absorber_and_host(
             &plan,
             &swaps,
@@ -537,14 +580,14 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
             Ok(headroom) => headroom,
             Err(error) => {
                 if let Some(swap) = emergency.take() {
-                    swap.remove(runner);
+                    retire_emergency_swap(runner, paths, &binding, &swap);
                 }
                 return Err(error);
             }
         };
         if !headroom.is_safe() {
             if let Some(swap) = emergency.take() {
-                swap.remove(runner);
+                retire_emergency_swap(runner, paths, &binding, &swap);
             }
             return Err(CascadeError::Precondition(headroom.refusal_message()));
         }
@@ -571,8 +614,12 @@ pub(super) fn down_with_runtime<R: CommandRunner>(
     .with_progress(progress_guard.reporter());
     let outcome = execute_nbd_lifecycle_plan(&plan, &executor);
     drop(progress_guard);
-    if let Some(swap) = emergency.take() {
-        swap.remove(runner);
+    if outcome.is_err()
+        && let Some(swap) = emergency.take()
+        && !std::fs::symlink_metadata(&swap.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        retire_emergency_swap(runner, paths, &binding, &swap);
     }
     outcome?;
 
@@ -607,13 +654,29 @@ fn down_plan_with_paths(paths: &RuntimePaths, json: bool) -> Result<(), CascadeE
 pub(crate) fn evaluate_live_down_plan() -> Result<Option<(bool, String)>, CascadeError> {
     let paths = RuntimePaths::system();
     let swaps = read_swaps()?;
-    Ok(evaluate_down_plan_with_swaps(&paths, &swaps)?
+    Ok(evaluate_down_plan_with_swaps(&paths, &swaps, false)?
         .map(|decision| (decision.is_safe(), decision.reason.to_owned())))
+}
+
+/// Admit the installed owner's stop preparation. The eventual swapoff still
+/// requires fresh memory and the observed, live, descriptor-owned absorber.
+pub(crate) fn evaluate_live_update_drain_plan() -> Result<Option<(bool, String)>, CascadeError> {
+    let paths = RuntimePaths::system();
+    let swaps = read_swaps()?;
+    Ok(evaluate_down_plan_with_swaps(&paths, &swaps, true)?.map(update_drain_admission))
+}
+
+fn update_drain_admission(decision: HeadroomDecision) -> (bool, String) {
+    if decision.absorber_required_bytes.is_some() {
+        return (true, "ssd_absorber_available".into());
+    }
+    (decision.is_safe(), decision.reason.into())
 }
 
 fn evaluate_down_plan_with_swaps(
     paths: &RuntimePaths,
     swaps: &[SwapEntry],
+    preview_absorber: bool,
 ) -> Result<Option<HeadroomDecision>, CascadeError> {
     if !paths.lifecycle_binding_file.exists() {
         let has_runtime_evidence = paths.pid_file.exists()
@@ -633,13 +696,21 @@ fn evaluate_down_plan_with_swaps(
     let live_devices = detect_live_managed_devices()?;
     authorize_bound_environment(&binding, paths, swaps, &live_devices)?;
     let plan = plan_nbd_lifecycle(&binding, swaps, &live_devices)?;
-    let headroom = headroom_for_plan_with_absorber_and_host(
-        &plan,
+    let observation = sample_headroom(
+        &planned_swapoff_paths(&plan),
         swaps,
-        0,
         live_host_memory(paths, &binding, PeerState::Live),
     )?;
-    Ok(Some(headroom))
+    Ok(Some(if preview_absorber {
+        let reusable = retained(paths, swaps, false)?
+            .map(|swap| swap.free_bytes(swaps))
+            .transpose()?;
+        observation.preview(|needed| {
+            reusable.map_or_else(|| can_provision(needed), |credit| credit >= needed)
+        })
+    } else {
+        observation.decide(0)
+    }))
 }
 
 fn down_plan_with_swaps(
@@ -647,7 +718,7 @@ fn down_plan_with_swaps(
     swaps: &[SwapEntry],
     json: bool,
 ) -> Result<(), CascadeError> {
-    let Some(headroom) = evaluate_down_plan_with_swaps(paths, swaps)? else {
+    let Some(headroom) = evaluate_down_plan_with_swaps(paths, swaps, true)? else {
         if json {
             println!("{{\"verdict\":\"no_lifecycle\"}}");
         } else {
@@ -668,7 +739,7 @@ fn render_plan(decision: &HeadroomDecision, json: bool) -> Result<String, Cascad
         return serde_json::to_string(decision)
             .map_err(|error| CascadeError::Io(format!("encode swapoff plan: {error}")));
     }
-    Ok(format!(
+    let mut rendered = format!(
         "managed_swap={} B
 available={} B
 remaining_swap_free={} B (reported, not credited)
@@ -687,8 +758,15 @@ reason={}",
         decision.deficit_bytes,
         decision.verdict,
         decision.reason
-    ))
+    );
+    if let Some(bytes) = decision.absorber_required_bytes {
+        rendered.push_str(&format!("\nssd_absorber_required={bytes} B"));
+    }
+    Ok(rendered)
 }
+
+mod emergency_cleanup;
+use emergency_cleanup::retire_emergency_swap;
 
 mod released_peer;
 pub(super) use released_peer::down_recover_released_peer_with;

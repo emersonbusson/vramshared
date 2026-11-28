@@ -19,7 +19,10 @@ use std::process;
 
 use crate::cascade::SwapEntry;
 
-use super::CommandRunner;
+use super::{
+    CascadeError, CommandRunner, RuntimePaths,
+    absorber_record::{AbsorberRecordStore, HeldRecord},
+};
 
 const MIB: u64 = 1024 * 1024;
 const RESERVE: u64 = 64 * MIB;
@@ -39,6 +42,10 @@ impl EmergencySwap {
     /// Free bytes of this exact row, re-read from the caller's `/proc/swaps`
     /// snapshot. Absence or identity uncertainty is a refusal: a borrowed
     /// capability must name one exact live row before it can be credited.
+    pub(super) fn record_active_observation(&self, paths: &RuntimePaths) -> std::io::Result<()> {
+        AbsorberRecordStore::open(paths)?.mark_active_observed(&self.backing)
+    }
+
     pub(super) fn backing(&self) -> &SwapAbsorber {
         &self.backing
     }
@@ -117,22 +124,193 @@ impl EmergencySwap {
 /// filesystem can hold it. Production roots prefer `/` and exclude `/mnt/c`.
 /// The shared descriptor owner admits only ext-family or XFS backing; mount
 /// names alone never authorize Windows, network, tmpfs or Btrfs storage.
-pub(super) fn create<R: CommandRunner>(runner: &R, shortfall: u64) -> Option<EmergencySwap> {
-    let now_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok());
+pub(super) fn create<R: CommandRunner>(
+    runner: &R,
+    paths: &RuntimePaths,
+    shortfall: u64,
+) -> Option<EmergencySwap> {
+    let store = AbsorberRecordStore::open(paths)
+        .inspect_err(|error| eprintln!("[down] retained absorber record unavailable: {error}"))
+        .ok()?;
     create_for_platform(
         runner,
         shortfall,
         ramshared_block::platform::probe_platform().platform,
         crate::cascade::status_view::current_daemon_instance_id,
         Path::new(crate::cascade::CACHE_STATUS_FILE),
-        now_unix_ms,
+        crate::cascade::unix_time_ms(),
         &candidate_roots(),
         &linux_free_bytes,
         ramshared_block::vhd_identity::observe_directory_vhd,
+        &|backing| store.publish(backing),
     )
+}
+
+/// Read one recorded backing. A differentiated absence proof may clear a
+/// completed record during an exclusive teardown, never in the read-only plan.
+pub(super) fn retained(
+    paths: &RuntimePaths,
+    swaps: &[SwapEntry],
+    reconcile: bool,
+) -> Result<Option<EmergencySwap>, CascadeError> {
+    let invalid = |error: std::io::Error| {
+        CascadeError::UnsafeContainment(format!("retained emergency absorber record: {error}"))
+    };
+    let store = match AbsorberRecordStore::open(paths) {
+        Ok(store) => store,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(invalid(error)),
+    };
+    let Some(held) = store.load_any_boot().map_err(invalid)? else {
+        return Ok(None);
+    };
+    if !held.current_boot().map_err(invalid)? {
+        reconcile_prior_boot(&store, &held, swaps, reconcile).map_err(invalid)?;
+        return Ok(None);
+    }
+    let expected = &held.record.backing;
+    let path = expected.path();
+    let is_present = swaps
+        .iter()
+        .any(|entry| Path::new(&entry.bare_path()) == path);
+    if is_present && held.inactive_verified() {
+        return Err(CascadeError::UnsafeContainment(
+            "retained emergency absorber became active again".into(),
+        ));
+    }
+    if !is_present && held.can_finish_cleanup() {
+        let backing = match SwapAbsorber::reopen_retained(expected) {
+            Ok(backing) => Some(backing),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                expected.prove_absent().map_err(invalid)?;
+                None
+            }
+            Err(error) => return Err(invalid(error)),
+        };
+        if held.inactive_verified()
+            && let Some(backing) = &backing
+        {
+            prove_not_active(backing, swaps).map_err(invalid)?;
+        }
+        if reconcile {
+            // Observe absence again before an exact inode unlink or receipt clear.
+            let fresh = crate::cascade::read_swaps()?;
+            if fresh
+                .iter()
+                .any(|entry| Path::new(&entry.bare_path()) == path)
+            {
+                return Err(CascadeError::UnsafeContainment(
+                    "retained emergency absorber became active again".into(),
+                ));
+            }
+            if let Some(backing) = backing {
+                if held.inactive_verified() {
+                    prove_not_active(&backing, &fresh).map_err(invalid)?;
+                }
+                backing.remove_inactive(|| true).map_err(invalid)?;
+            } else {
+                expected.sync_absence().map_err(invalid)?;
+            }
+            held.clear(&store).map_err(invalid)?;
+        }
+        return Ok(None);
+    }
+    let backing = SwapAbsorber::reopen_retained(expected).map_err(invalid)?;
+    let size_bytes = backing.file().metadata().map_err(invalid)?.len();
+    let swap = EmergencySwap {
+        path: path.to_owned(),
+        size_bytes,
+        backing,
+    };
+    swap.free_bytes(swaps)?;
+    Ok(Some(swap))
+}
+
+fn reconcile_prior_boot(
+    store: &AbsorberRecordStore,
+    held: &HeldRecord,
+    swaps: &[SwapEntry],
+    reconcile: bool,
+) -> std::io::Result<()> {
+    let backing = match SwapAbsorber::reopen_prior_boot(&held.record.backing) {
+        Ok(backing) => backing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            held.prove_prior_boot_absence(
+                store,
+                swaps.iter().map(|row| row.filename.as_str()),
+                false,
+            )?;
+            if reconcile {
+                let fresh = crate::cascade::read_swaps().map_err(std::io::Error::other)?;
+                held.prove_prior_boot_absence(
+                    store,
+                    fresh.iter().map(|row| row.filename.as_str()),
+                    true,
+                )?;
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    prove_not_active(&backing, swaps)?;
+    if !reconcile {
+        return Ok(());
+    }
+    let fresh = crate::cascade::read_swaps().map_err(std::io::Error::other)?;
+    prove_not_active(&backing, &fresh)?;
+    let rebound = store.rebind_inactive(held, &backing)?;
+    // Publication can take time. Re-read the kernel table again before unlink.
+    let final_rows = crate::cascade::read_swaps().map_err(std::io::Error::other)?;
+    prove_not_active(&backing, &final_rows)?;
+    if backing.retained_identity()? != rebound.record.backing {
+        return Err(std::io::Error::other(
+            "retained absorber identity changed before unlink",
+        ));
+    }
+    backing.remove_inactive(|| true)?;
+    rebound.clear(store)
+}
+
+fn prove_not_active(backing: &SwapAbsorber, swaps: &[SwapEntry]) -> std::io::Result<()> {
+    for entry in swaps {
+        let path = entry.bare_path();
+        if backing.matches_file(Path::new(&path))? {
+            return Err(std::io::Error::other(
+                "prior-boot absorber is active in the current kernel",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn can_provision(shortfall: u64) -> bool {
+    let Some(capacity) = capacity_for_platform(
+        ramshared_block::platform::probe_platform().platform,
+        crate::cascade::status_view::current_daemon_instance_id,
+        Path::new(crate::cascade::CACHE_STATUS_FILE),
+        crate::cascade::unix_time_ms(),
+        &linux_free_bytes,
+        ramshared_block::vhd_identity::observe_directory_vhd,
+    ) else {
+        return false;
+    };
+    provisioning_path_exists(
+        shortfall,
+        &candidate_roots(),
+        |root| SwapAbsorber::check_directory_filesystem(root).is_ok(),
+        capacity,
+    )
+}
+
+fn provisioning_path_exists(
+    shortfall: u64,
+    roots: &[PathBuf],
+    filesystem_ok: impl Fn(&Path) -> bool,
+    capacity: impl Fn(&Path) -> Option<u64>,
+) -> bool {
+    roots.iter().any(|root| {
+        filesystem_ok(root) && capacity(root).is_some_and(|free| fits_absorber(shortfall, free))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,34 +324,58 @@ fn create_for_platform<R: CommandRunner>(
     roots: &[PathBuf],
     guest_free: &dyn Fn(&Path) -> Option<u64>,
     observe_dir: fn(&Path) -> Option<ramshared_block::vhd_identity::RootVhdObservation>,
+    before_activation: &dyn Fn(&SwapAbsorber) -> std::io::Result<()>,
 ) -> Option<EmergencySwap> {
-    if ramshared_block::swap_absorber::guest_only_capacity_is_admissible(platform) {
-        return create_in(runner, shortfall, roots, guest_free);
-    }
-    if !matches!(
+    let capacity = capacity_for_platform(
         platform,
-        Some(ramshared_block::platform::PlatformKind::Wsl2)
-    ) {
-        eprintln!("[down] emergency swap refused: host backing capacity is unverified");
-        return None;
-    }
-    let Some(daemon_id) = daemon_id_probe() else {
-        eprintln!(
-            "[down] emergency swap refused: live daemon identity unavailable for host storage proof"
-        );
-        return None;
+        daemon_id_probe,
+        status_path,
+        now_unix_ms,
+        guest_free,
+        observe_dir,
+    )?;
+    create_in_before_activation(
+        runner,
+        shortfall,
+        roots,
+        &|root| capacity(root).filter(|free| fits_absorber(shortfall, *free)),
+        before_activation,
+    )
+}
+
+fn capacity_for_platform<'a>(
+    platform: Option<ramshared_block::platform::PlatformKind>,
+    daemon_id_probe: fn() -> Option<String>,
+    status_path: &'a Path,
+    now_unix_ms: Option<u64>,
+    guest_free: &'a dyn Fn(&Path) -> Option<u64>,
+    observe_dir: fn(&Path) -> Option<ramshared_block::vhd_identity::RootVhdObservation>,
+) -> Option<impl Fn(&Path) -> Option<u64> + 'a> {
+    use ramshared_block::platform::PlatformKind;
+    let daemon_id = match platform {
+        Some(PlatformKind::NativeLinux) => None,
+        Some(PlatformKind::Wsl2) => Some(daemon_id_probe()?),
+        _ => return None,
     };
-    let bounded_probe = |root: &Path| {
-        wsl_bounded_free_bytes(
+    Some(move |root: &Path| match &daemon_id {
+        None => guest_free(root),
+        Some(daemon_id) => wsl_bounded_free_bytes(
             root,
             guest_free(root)?,
             status_path,
-            &daemon_id,
+            daemon_id,
             now_unix_ms,
             observe_dir,
-        )
-    };
-    create_in(runner, shortfall, roots, &bounded_probe)
+        ),
+    })
+}
+
+fn fits_absorber(shortfall: u64, free: u64) -> bool {
+    let allocatable = free.saturating_sub(RESERVE) / MIB * MIB;
+    // Leave room for the swap header inside the size the allocator can prove.
+    shortfall
+        .checked_add(MIB)
+        .is_some_and(|needed| allocatable >= needed)
 }
 
 fn wsl_bounded_free_bytes(
@@ -207,11 +409,22 @@ pub(super) fn candidate_roots() -> Vec<PathBuf> {
 
 /// Injectable body: the roots and the free-space probe are parameters so the
 /// sequence can be tested without touching a real mount.
+#[cfg(test)]
 pub(super) fn create_in<R: CommandRunner>(
     runner: &R,
     shortfall: u64,
     roots: &[PathBuf],
     free_probe: &dyn Fn(&Path) -> Option<u64>,
+) -> Option<EmergencySwap> {
+    create_in_before_activation(runner, shortfall, roots, free_probe, &|_| Ok(()))
+}
+
+fn create_in_before_activation<R: CommandRunner>(
+    runner: &R,
+    shortfall: u64,
+    roots: &[PathBuf],
+    free_probe: &dyn Fn(&Path) -> Option<u64>,
+    before_activation: &dyn Fn(&SwapAbsorber) -> std::io::Result<()>,
 ) -> Option<EmergencySwap> {
     let want = shortfall
         .saturating_add(RESERVE)
@@ -269,6 +482,13 @@ pub(super) fn create_in<R: CommandRunner>(
         if !run("mkswap", &[&path_text]) {
             let _ = backing.remove_inactive(|| true);
             continue;
+        }
+        if let Err(error) = before_activation(&backing) {
+            eprintln!(
+                "[down] retained absorber publication unproven at {}: {error}",
+                path.display()
+            );
+            return None;
         }
         if !run("swapon", &["-p", "0", &path_text]) {
             eprintln!(

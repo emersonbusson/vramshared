@@ -10,6 +10,42 @@
 //! helpers stay decoupled from cascade setup orchestration.
 
 use super::*;
+use crate::runtime::zram_sysfs::ZramError;
+
+fn reset_zram_id(path: &Path) -> Result<u32, CascadeError> {
+    zram_id_from_path(path).ok_or_else(|| CascadeError::Shell {
+        cmd: "zramctl".into(),
+        msg: format!("{} is not a zram device", path.display()),
+    })
+}
+
+fn zram_reset_error(error: ZramError) -> CascadeError {
+    CascadeError::Shell {
+        cmd: "zramctl".into(),
+        msg: error.to_string(),
+    }
+}
+
+fn retry_busy_zram_reset(
+    mut reset: impl FnMut() -> Result<(), ZramError>,
+    mut revalidate: impl FnMut() -> Result<(), CascadeError>,
+    mut delay: impl FnMut(),
+) -> Result<(), CascadeError> {
+    for _ in 0..4 {
+        match reset() {
+            Err(ZramError::Io(error)) if error.raw_os_error() == Some(libc::EBUSY) => {
+                delay();
+                revalidate()?;
+            }
+            result => return result.map_err(zram_reset_error),
+        }
+    }
+    reset().map_err(zram_reset_error)
+}
+
+#[cfg(test)]
+#[path = "command_runner_zram_tests.rs"]
+mod zram_tests;
 
 pub(super) fn command_label(command: &str, args: &[&str]) -> String {
     if args.is_empty() {
@@ -107,6 +143,14 @@ pub(super) trait CommandRunner {
     fn native_zram_reset(&self, path: &Path) -> Result<(), CascadeError> {
         let device = path.display().to_string();
         self.run("zramctl", &["-r", &device]).map(|_| ())
+    }
+
+    fn native_zram_reset_after_swapoff(
+        &self,
+        path: &Path,
+        _revalidate: &mut dyn FnMut() -> Result<(), CascadeError>,
+    ) -> Result<(), CascadeError> {
+        self.native_zram_reset(path)
     }
 
     /// Allocate one uninitialized zram device.
@@ -211,16 +255,27 @@ impl CommandRunner for SystemCommandRunner {
     }
 
     fn native_zram_reset(&self, path: &Path) -> Result<(), CascadeError> {
-        let zram_id = zram_id_from_path(path).ok_or_else(|| CascadeError::Shell {
-            cmd: "zramctl".into(),
-            msg: format!("{} is not a zram device", path.display()),
-        })?;
-        crate::runtime::native_ops::execute_native_zram_reset(zram_id).map_err(|error| {
-            CascadeError::Shell {
-                cmd: "zramctl".into(),
-                msg: error.to_string(),
-            }
-        })
+        crate::runtime::native_ops::execute_native_zram_reset(reset_zram_id(path)?)
+            .map_err(zram_reset_error)
+    }
+
+    fn native_zram_reset_after_swapoff(
+        &self,
+        path: &Path,
+        revalidate: &mut dyn FnMut() -> Result<(), CascadeError>,
+    ) -> Result<(), CascadeError> {
+        let zram_id = reset_zram_id(path)?;
+        retry_busy_zram_reset(
+            || crate::runtime::native_ops::execute_native_zram_reset(zram_id),
+            revalidate,
+            || {
+                eprintln!(
+                    "[down] zram reset busy for {}; rechecking ownership",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            },
+        )
     }
 
     fn native_zram_allocate(&self) -> Result<String, CascadeError> {
