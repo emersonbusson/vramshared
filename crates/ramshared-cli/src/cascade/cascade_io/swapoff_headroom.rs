@@ -17,6 +17,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 
+use ramshared_block::platform::PlatformKind;
+use ramshared_tier::{DrainBudget, DrainDecision, HostDrainMemory};
 use serde::Serialize;
 
 pub(super) const MIN_RESERVE_BYTES: u64 = ramshared_tier::MIN_DRAIN_RESERVE_BYTES;
@@ -89,15 +91,13 @@ pub(super) struct HeadroomDecision {
     pub deficit_bytes: u64,
     pub verdict: HeadroomVerdict,
     pub reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absorber_required_bytes: Option<u64>,
 }
 
 impl HeadroomDecision {
     pub(super) fn is_safe(&self) -> bool {
         self.verdict == HeadroomVerdict::Safe
-    }
-
-    pub(super) fn absorber_can_help(&self) -> bool {
-        self.reason == "managed_swap_exceeds_headroom"
     }
 
     pub(super) fn refusal_message(&self) -> String {
@@ -186,17 +186,24 @@ pub(super) fn evaluate_with_absorber(
     emergency_bytes: u64,
     mem: MemInfo,
 ) -> HeadroomDecision {
-    let decision = ramshared_tier::DrainBudget {
+    let budget = DrainBudget {
         total_bytes: mem.total_bytes,
         available_bytes: mem.available_bytes,
         managed_bytes,
         emergency_bytes,
-    }
-    .evaluate();
+    };
+    project_budget(budget, remaining_free_bytes, budget.evaluate())
+}
+
+fn project_budget(
+    budget: DrainBudget,
+    remaining_free_bytes: u64,
+    decision: Option<DrainDecision>,
+) -> HeadroomDecision {
     HeadroomDecision {
-        managed_bytes,
-        available_bytes: mem.available_bytes,
-        emergency_bytes,
+        managed_bytes: budget.managed_bytes,
+        available_bytes: budget.available_bytes,
+        emergency_bytes: budget.emergency_bytes,
         remaining_free_bytes,
         reserve_bytes: decision
             .map(|d| d.reserve_bytes)
@@ -212,6 +219,55 @@ pub(super) fn evaluate_with_absorber(
         reason: decision
             .map(|d| d.reason)
             .unwrap_or("drain_observation_invalid"),
+        absorber_required_bytes: None,
+    }
+}
+
+pub(super) struct HeadroomSample {
+    pub(super) budget: DrainBudget,
+    pub(super) remaining_free_bytes: u64,
+    pub(super) guest_free_bytes: Option<u64>,
+    pub(super) platform: Option<PlatformKind>,
+    pub(super) has_swapoff: bool,
+    pub(super) host: Option<HostDrainMemory>,
+}
+
+impl HeadroomSample {
+    fn evaluate(&self, budget: DrainBudget) -> Option<DrainDecision> {
+        if !self.has_swapoff
+            || ramshared_block::swap_absorber::guest_only_capacity_is_admissible(self.platform)
+        {
+            return budget.evaluate();
+        }
+        let host = match self.platform {
+            Some(PlatformKind::Wsl1 | PlatformKind::Wsl2) => self.host,
+            _ => None,
+        };
+        budget.evaluate_wsl(self.guest_free_bytes, host)
+    }
+
+    pub(super) fn decide(&self, emergency_bytes: u64) -> HeadroomDecision {
+        let budget = DrainBudget {
+            emergency_bytes,
+            ..self.budget
+        };
+        project_budget(budget, self.remaining_free_bytes, self.evaluate(budget))
+    }
+
+    pub(super) fn required_absorber_bytes(&self) -> Option<u64> {
+        self.budget
+            .minimum_emergency_bytes(|candidate| self.evaluate(candidate))
+            .filter(|bytes| *bytes > 0)
+    }
+
+    pub(super) fn preview(&self, can_provision: impl FnOnce(u64) -> bool) -> HeadroomDecision {
+        let mut decision = self.decide(0);
+        if !decision.is_safe() {
+            decision.absorber_required_bytes = self
+                .required_absorber_bytes()
+                .filter(|bytes| can_provision(*bytes));
+        }
+        decision
     }
 }
 
@@ -299,6 +355,7 @@ pub(super) fn verified_live_host_storage_cap(
 }
 
 /// Evaluate cross-layer WSL drain headroom when a planned swapoff exists.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_for_platform(
     managed_bytes: u64,
@@ -310,42 +367,20 @@ pub(super) fn evaluate_for_platform(
     has_swapoff: bool,
     host: Option<ramshared_tier::HostDrainMemory>,
 ) -> HeadroomDecision {
-    use ramshared_block::platform::PlatformKind;
-
-    if !has_swapoff || ramshared_block::swap_absorber::guest_only_capacity_is_admissible(platform) {
-        return evaluate_with_absorber(managed_bytes, remaining_free_bytes, emergency_bytes, mem);
-    }
-    let wsl_host = match platform {
-        Some(PlatformKind::Wsl1 | PlatformKind::Wsl2) => host,
-        _ => None,
-    };
-    let decision = ramshared_tier::DrainBudget {
-        total_bytes: mem.total_bytes,
-        available_bytes: mem.available_bytes,
-        managed_bytes,
-        emergency_bytes,
-    }
-    .evaluate_wsl(guest_free_bytes, wsl_host);
-    HeadroomDecision {
-        managed_bytes,
-        available_bytes: mem.available_bytes,
-        emergency_bytes,
-        remaining_free_bytes,
-        reserve_bytes: decision
-            .map(|d| d.reserve_bytes)
-            .unwrap_or(MIN_RESERVE_BYTES),
-        margin_bytes: MARGIN_BYTES,
-        required_bytes: decision.map(|d| d.required_bytes).unwrap_or(u64::MAX),
-        deficit_bytes: decision.map(|d| d.deficit_bytes).unwrap_or(u64::MAX),
-        verdict: if decision.is_some_and(|d| d.is_safe()) {
-            HeadroomVerdict::Safe
-        } else {
-            HeadroomVerdict::Blocked
+    HeadroomSample {
+        budget: DrainBudget {
+            total_bytes: mem.total_bytes,
+            available_bytes: mem.available_bytes,
+            managed_bytes,
+            emergency_bytes,
         },
-        reason: decision
-            .map(|d| d.reason)
-            .unwrap_or("drain_observation_invalid"),
+        remaining_free_bytes,
+        guest_free_bytes,
+        platform,
+        has_swapoff,
+        host,
     }
+    .decide(emergency_bytes)
 }
 
 /// Guest-only measurements cannot authorize a WSL drain without verified host telemetry.
@@ -382,7 +417,7 @@ mod tests {
             let blocked = require_native_or_empty_plan(decision.clone(), platform, true);
             assert!(!blocked.is_safe());
             assert_eq!(blocked.reason, "host_memory_unverified");
-            assert!(!blocked.absorber_can_help());
+            assert!(blocked.absorber_required_bytes.is_none());
         }
         assert!(
             require_native_or_empty_plan(decision.clone(), Some(PlatformKind::NativeLinux), true)

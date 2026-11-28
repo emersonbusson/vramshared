@@ -137,12 +137,32 @@ impl DrainObservation {
             }
             None => 0,
         };
-        let budget = ramshared_tier::DrainBudget {
+        self.evaluate(self.budget(emergency_bytes), wsl_host)
+    }
+
+    pub(super) fn required_emergency_bytes(
+        &self,
+        wsl_host: Option<Option<ramshared_tier::HostDrainMemory>>,
+    ) -> Option<u64> {
+        self.budget(0)
+            .minimum_emergency_bytes(|candidate| self.evaluate(candidate, wsl_host))
+            .filter(|bytes| *bytes > 0)
+    }
+
+    fn budget(&self, emergency_bytes: u64) -> ramshared_tier::DrainBudget {
+        ramshared_tier::DrainBudget {
             total_bytes: self.memory.total_bytes,
             available_bytes: self.memory.available_bytes,
             managed_bytes: self.target_used,
             emergency_bytes,
-        };
+        }
+    }
+
+    fn evaluate(
+        &self,
+        budget: ramshared_tier::DrainBudget,
+        wsl_host: Option<Option<ramshared_tier::HostDrainMemory>>,
+    ) -> Option<ramshared_tier::DrainDecision> {
         match wsl_host {
             None => budget.evaluate(),
             Some(host) => budget.evaluate_wsl(self.free_bytes, host),
@@ -200,6 +220,26 @@ pub(super) fn parse_drain_absorbers(
         target: device.to_string(),
         rows,
     })
+}
+
+pub(super) fn drain_absorbers(
+    device: &str,
+    absorber: Option<&SwapAbsorber>,
+    io: &mut impl super::ReleaseIo,
+) -> Option<ramshared_tier::DrainDecision> {
+    let wsl_host = io.wsl_host_memory();
+    observe_drain(device, io)?.decision_with_host(absorber, wsl_host)
+}
+
+pub(super) fn observe_drain(
+    device: &str,
+    io: &mut impl super::ReleaseIo,
+) -> Option<DrainObservation> {
+    parse_drain_absorbers(
+        &io.read_proc("/proc/meminfo")?,
+        &io.read_proc("/proc/swaps")?,
+        device,
+    )
 }
 
 pub(super) fn read_proc(path: &str) -> Option<String> {

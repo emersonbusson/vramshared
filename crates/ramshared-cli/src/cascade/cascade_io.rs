@@ -202,6 +202,7 @@ mod legacy_migration;
 pub use legacy_migration::migrate_legacy_cascade;
 
 // Teardown and rebalance slices.
+mod absorber_record;
 mod emergency_swap;
 mod host_memory_admission;
 mod runtime_cleanup;
@@ -212,7 +213,7 @@ mod teardown;
 use teardown::*;
 pub use teardown::{down, down_plan, down_recover_released_peer};
 #[allow(unused_imports)]
-pub(crate) use teardown::{down_quiet, evaluate_live_down_plan};
+pub(crate) use teardown::{down_quiet, evaluate_live_down_plan, evaluate_live_update_drain_plan};
 
 mod rebalance;
 pub(crate) use rebalance::{swap_rebalance_apply, swap_rebalance_plan};

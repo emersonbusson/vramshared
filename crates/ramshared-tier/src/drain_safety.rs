@@ -69,6 +69,14 @@ pub struct HostDrainMemory {
 pub const MIN_DRAIN_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DRAIN_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Reserve for Windows processes outside the observed guest allocation.
+pub fn host_drain_reserve_bytes(total_host_bytes: u64, total_guest_bytes: u64) -> u64 {
+    total_host_bytes
+        .saturating_sub(total_guest_bytes)
+        .div_ceil(10)
+        .max(MIN_DRAIN_RESERVE_BYTES)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DrainBudget {
     pub total_bytes: u64,
@@ -100,6 +108,40 @@ impl DrainDecision {
 }
 
 impl DrainBudget {
+    /// Smallest prospective absorber that passes the exact platform decision.
+    /// `None` means an absorber cannot satisfy the independent reserves, or
+    /// the authority is unknown. Callers still must prove actual live credit.
+    #[must_use]
+    pub fn minimum_emergency_bytes(
+        self,
+        evaluate: impl Fn(Self) -> Option<DrainDecision>,
+    ) -> Option<u64> {
+        let accepts = |emergency_bytes| {
+            evaluate(Self {
+                emergency_bytes,
+                ..self
+            })
+            .is_some_and(DrainDecision::is_safe)
+        };
+        if accepts(0) {
+            return Some(0);
+        }
+        if !accepts(self.managed_bytes) {
+            return None;
+        }
+        let mut first = 1;
+        let mut last = self.managed_bytes;
+        while first < last {
+            let middle = first + (last - first) / 2;
+            if accepts(middle) {
+                last = middle;
+            } else {
+                first = middle + 1;
+            }
+        }
+        Some(first)
+    }
+
     /// Invalid or overflowed inputs are absence, never a saturated SAFE frame.
     #[must_use]
     pub fn evaluate(self) -> Option<DrainDecision> {
@@ -163,10 +205,7 @@ impl DrainBudget {
         {
             return None;
         }
-        let non_guest_host_bytes = host.total_bytes.saturating_sub(self.total_bytes);
-        let host_reserve = non_guest_host_bytes
-            .div_ceil(10)
-            .max(MIN_DRAIN_RESERVE_BYTES);
+        let host_reserve = host_drain_reserve_bytes(host.total_bytes, self.total_bytes);
         let host_floor = host_reserve.checked_add(DRAIN_MARGIN_BYTES)?;
         let commit_free = host
             .commit_limit_bytes
@@ -268,6 +307,48 @@ mod budget_tests {
             managed_bytes: managed,
             emergency_bytes: emergency,
         }
+    }
+
+    #[test]
+    fn absorber_capacity_covers_guest_and_host_shortfalls_without_replacing_reserves() {
+        let host = HostDrainMemory {
+            total_bytes: 32 * GIB,
+            available_bytes: 3 * GIB - GIB / 4,
+            commit_total_bytes: 30 * GIB,
+            commit_limit_bytes: 34 * GIB,
+        };
+        let frame = budget(3 * GIB, 4 * GIB, 0);
+        let evaluate = |candidate: DrainBudget| candidate.evaluate_wsl(Some(2 * GIB), Some(host));
+        let required = frame.minimum_emergency_bytes(evaluate).unwrap();
+        assert!(required > frame.evaluate().unwrap().deficit_bytes);
+        let with_capacity = |emergency_bytes| DrainBudget {
+            emergency_bytes,
+            ..frame
+        };
+        assert!(evaluate(with_capacity(required)).unwrap().is_safe());
+        assert!(!evaluate(with_capacity(required - 1)).unwrap().is_safe());
+        assert_eq!(
+            frame.minimum_emergency_bytes(|b| b.evaluate_wsl(None, None)),
+            None
+        );
+        assert_eq!(
+            budget(GIB, 4 * GIB, 0).minimum_emergency_bytes(evaluate),
+            None
+        );
+        assert_eq!(
+            frame.minimum_emergency_bytes(|b| b.evaluate_wsl(
+                None,
+                Some(HostDrainMemory {
+                    available_bytes: GIB,
+                    ..host
+                })
+            )),
+            None
+        );
+        assert_eq!(
+            budget(4 * GIB, 0, 0).minimum_emergency_bytes(DrainBudget::evaluate),
+            Some(0)
+        );
     }
 
     #[test]

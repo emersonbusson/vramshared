@@ -150,7 +150,7 @@ impl LifecycleHost for SystemLifecycleHost {
 
     fn evaluate_drain_safety(&self) -> Result<DrainSafetyVerdict, CustomerError> {
         Ok(map_drain_plan_verdict(
-            crate::cascade::evaluate_live_down_plan().map_err(|err| err.to_string()),
+            crate::cascade::evaluate_live_update_drain_plan().map_err(|err| err.to_string()),
         ))
     }
 

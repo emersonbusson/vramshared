@@ -294,8 +294,8 @@ pub use cascade_io::{
     recover_nbd_peer, up_with_args,
 };
 pub(crate) use cascade_io::{
-    down_quiet, evaluate_live_down_plan, observe_leased_host_memory, swap_rebalance_apply,
-    swap_rebalance_plan,
+    down_quiet, evaluate_live_down_plan, evaluate_live_update_drain_plan,
+    observe_leased_host_memory, swap_rebalance_apply, swap_rebalance_plan,
 };
 
 #[cfg(test)]

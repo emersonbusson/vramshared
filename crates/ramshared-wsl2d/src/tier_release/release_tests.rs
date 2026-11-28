@@ -6,6 +6,43 @@
 // File: crates/ramshared-wsl2d/src/tier_release/release_tests.rs
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use super::*;
+
+#[test]
+fn daemon_release_sizes_absorber_for_host_shortfall_and_stale_refusal() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let observed = parse_drain_absorbers(
+        "MemTotal: 16777216 kB\nMemFree: 5242880 kB\nMemAvailable: 8388608 kB\n",
+        "Filename Type Size Used Priority\n/dev/nbd0 partition 4194304 4194304 100\n",
+        "/dev/nbd0",
+    )
+    .unwrap();
+    let host = ramshared_tier::HostDrainMemory {
+        total_bytes: 32 * GIB,
+        available_bytes: 3 * GIB,
+        commit_total_bytes: 40 * GIB,
+        commit_limit_bytes: 56 * GIB,
+    };
+    assert_eq!(
+        observed
+            .decision_with_host(None, Some(Some(host)))
+            .unwrap()
+            .reason,
+        "host_memory_exceeds_headroom"
+    );
+    assert!(
+        observed
+            .required_emergency_bytes(Some(Some(host)))
+            .is_some_and(|bytes| { bytes > 3 * GIB && bytes < 4 * GIB })
+    );
+    assert_eq!(observed.required_emergency_bytes(Some(None)), None);
+    assert_eq!(
+        observed.required_emergency_bytes(Some(Some(ramshared_tier::HostDrainMemory {
+            available_bytes: 2 * GIB,
+            ..host
+        }))),
+        None
+    );
+}
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
