@@ -369,7 +369,7 @@ fn publish_impl(
     before_link()?;
     revalidate_tree(guard, pending, bundle, tree)?;
     before_effect()?;
-    link_anonymous_inode(&prepared.file, &prepared.parent, &prepared.leaf)
+    link_anonymous_inode(&prepared.file, &prepared.parent, OsStr::new(&prepared.leaf))
         .map_err(|_| recovery_refusal("exclusive publication failed; retain journal"))?;
     after_link().map_err(|_| recovery_refusal("publication interrupted; retain evidence"))?;
     finish_publication(
